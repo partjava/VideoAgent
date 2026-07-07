@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# AI / IDE config
+.agents/
+.claude/
+.codex/
+.idea/
+.vscode/
+*.swp
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backend generated assets
+backend/assets/*/videos/
+backend/assets/*/images/
+backend/assets/*/audio/
+backend/outputs/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+
+# MongoDB
+*.log
+
+# Temporary scripts
+*.tmp
