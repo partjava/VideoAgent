@@ -35,7 +35,7 @@
 
 ### 智能体说明
 
-> **没有使用 LangChain、LangGraph 或其他大模型框架。** 13 个智能体由 `pipeline.py` 中的简单串行循环驱动，每个 Agent 直接 HTTP 调用各自 API，代码结构清晰、依赖极少。
+> **使用 LangGraph 编排多智能体流程，LangChain 调用大模型。** 12 个 Agent 注册为 LangGraph StateGraph 节点，串行执行 + 质检条件分支；LLM 调用统一通过 LangChain ChatOpenAI 接口对接 DeepSeek。
 
 | 智能体 | 职责 | 调用服务 |
 |--------|------|---------|

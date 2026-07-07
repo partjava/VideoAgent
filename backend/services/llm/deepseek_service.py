@@ -1,10 +1,11 @@
 import json
 from typing import Any
 
-import httpx
-
 from config import settings
 from services.llm.base import BaseLLMService
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 
 GLOBAL_QUALITY_RULES = """
@@ -56,45 +57,42 @@ class DeepSeekService(BaseLLMService):
         if not settings.deepseek_api_key:
             raise ValueError("未找到 DEEPSEEK_API_KEY，请在环境变量中配置。")
 
-        payload = {
-            "model": settings.deepseek_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "max_tokens": max_tokens,
-            "temperature": 0.65,
-        }
-        headers = {
-            "Authorization": f"Bearer {settings.deepseek_api_key}",
-            "Content-Type": "application/json",
-        }
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post("https://api.deepseek.com/chat/completions", json=payload, headers=headers)
-            response.raise_for_status()
-            result = response.json()
-            
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if not content:
-                print(f"[DeepSeekService] API returned empty content. Full response: {result}")
-                raise ValueError(f"DeepSeek returned an empty response. API response: {result}")
-                
-            # 清理 Markdown 代码块包裹
-            cleaned_content = content.strip()
-            if cleaned_content.startswith("```json"):
-                cleaned_content = cleaned_content[7:]
-            elif cleaned_content.startswith("```"):
-                cleaned_content = cleaned_content[3:]
-            if cleaned_content.endswith("```"):
-                cleaned_content = cleaned_content[:-3]
-            cleaned_content = cleaned_content.strip()
-            
-            try:
-                return json.loads(cleaned_content)
-            except Exception as e:
-                print(f"[DeepSeekService] JSON parse failed. Raw response: {content}")
-                raise ValueError(f"JSON format error: {e}. Raw snippet: {content[:200]}") from e
+        # 使用 LangChain ChatOpenAI 调用 DeepSeek（DeepSeek API 兼容 OpenAI 格式）
+        llm = ChatOpenAI(
+            model=settings.deepseek_model,
+            api_key=settings.deepseek_api_key,
+            base_url="https://api.deepseek.com/v1",
+            temperature=0.65,
+            max_tokens=max_tokens,
+            timeout=60,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+        response = llm.invoke(messages)
+        content = response.content
+
+        if not content:
+            print(f"[DeepSeekService] API returned empty content.")
+            raise ValueError("DeepSeek returned an empty response.")
+
+        # 清理 Markdown 代码块包裹
+        cleaned_content = content.strip()
+        if cleaned_content.startswith("```json"):
+            cleaned_content = cleaned_content[7:]
+        elif cleaned_content.startswith("```"):
+            cleaned_content = cleaned_content[3:]
+        if cleaned_content.endswith("```"):
+            cleaned_content = cleaned_content[:-3]
+        cleaned_content = cleaned_content.strip()
+
+        try:
+            return json.loads(cleaned_content)
+        except Exception as e:
+            print(f"[DeepSeekService] JSON parse failed. Raw: {content[:200]}")
+            raise ValueError(f"JSON format error: {e}. Snippet: {content[:200]}") from e
 
     def plan_task(
         self,
