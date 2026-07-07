@@ -19,7 +19,7 @@
 *系统总体架构：Vue 前端 → FastAPI 后端 → 多智能体协作 → MongoDB 存储 + 本地文件系统*
 
 ![生成流程图](backend/image/流程图.png)
-*13 个智能体串行协作，从用户输入到最终 MP4 成片的完整流程*
+*13 个智能体在 LangGraph StateGraph 中编排执行（串行 + Send 并行分支 + 条件分支）*
 
 ---
 
@@ -43,7 +43,7 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 
 ### 智能体说明
 
-> **使用 LangGraph 编排多智能体流程，LangChain 调用大模型。** 12 个 Agent 注册为 LangGraph StateGraph 节点，串行执行 + 质检条件分支；LLM 调用统一通过 LangChain ChatOpenAI 接口对接 DeepSeek。
+> **使用 LangGraph 编排多智能体流程，LangChain 调用大模型。** 12 个 Agent 注册为 LangGraph StateGraph 节点，Send 并行分支 + 屏障汇聚 + 质检条件分支；LLM 统一通过 LangChain ChatOpenAI 调用 DeepSeek。
 
 | 智能体 | 职责 | 调用服务 |
 |--------|------|---------|
@@ -68,7 +68,7 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 video/
 ├── backend/
 │   ├── agents/           # 13 个智能体
-│   │   ├── pipeline.py   # 串行调度
+│   │   ├── pipeline.py   # LangGraph StateGraph 编排
 │   │   ├── task_planner_agent.py
 │   │   ├── script_agent.py
 │   │   ├── storyboard_agent.py
