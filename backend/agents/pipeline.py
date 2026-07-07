@@ -7,6 +7,7 @@ QualityAgent 之后有条件分支：通过则导出，失败则回 EditorAgent 
 from typing import Any, Optional
 
 from langgraph.graph import END, StateGraph
+from langgraph.types import Send
 from typing_extensions import TypedDict
 
 from agents.editor_agent import EditorAgent
@@ -111,6 +112,22 @@ async def export_node(state: PipelineState) -> dict:
     return _merge_results(state, "export", result)
 
 
+# ── 并行路由 ────────────────────────────────────────────────
+
+
+def route_to_parallel(state: PipelineState) -> list[Send]:
+    """
+    prompts 之后分叉为两条并行分支：
+      分支 A: images → video  (video 依赖 images)
+      分支 B: voice           (配音与画面生成无依赖)
+    Send() 是 LangGraph 的并行启动机制，同时向两个节点发送状态。
+    """
+    return [
+        Send("images", {"task_id": state["task_id"], "results": state.get("results", {})}),
+        Send("voice", {"task_id": state["task_id"], "results": state.get("results", {})}),
+    ]
+
+
 # ── 条件路由：质检通过 → 导出，失败 → 回编辑重试 ─────────────
 
 
@@ -142,16 +159,23 @@ def build_pipeline() -> StateGraph:
     workflow.add_node("quality", quality_node)
     workflow.add_node("export", export_node)
 
-    # 串行边
+    # 第一阶段：串行（任务规划 → 脚本 → 分镜 → 润色 → 提示词）
     workflow.set_entry_point("task_planner")
     workflow.add_edge("task_planner", "script")
     workflow.add_edge("script", "storyboard")
     workflow.add_edge("storyboard", "dialogue")
     workflow.add_edge("dialogue", "prompts")
-    workflow.add_edge("prompts", "images")
+
+    # 第二阶段：并行分叉（LangGraph Send）
+    #   prompts → images → video （分支 A，顺序执行）
+    #   prompts → voice         （分支 B，与 A 并行）
+    #   subtitle 等待两个分支都完成（屏障汇聚 / fan-in）
+    workflow.add_conditional_edges("prompts", route_to_parallel, ["images", "voice"])
     workflow.add_edge("images", "video")
-    workflow.add_edge("video", "voice")
+    workflow.add_edge("video", "subtitle")
     workflow.add_edge("voice", "subtitle")
+
+    # 第三阶段：串行（字幕 → 剪辑 → 质检 → 导出）
     workflow.add_edge("subtitle", "editor")
     workflow.add_edge("editor", "quality")
 

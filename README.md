@@ -25,12 +25,20 @@
 
 ## 系统架构
 
-系统由 13 个智能体串行协作，完成从需求到成片的完整流程：
+系统由 13 个智能体在 LangGraph StateGraph 中编排执行：
 
 ```
-用户输入 → TaskPlanner → Script → Storyboard → DialoguePolish
-  → Prompt → Image → Video → Voice → Subtitle → Editor
-  → Quality → Export → final.mp4
+第一阶段（串行）：
+用户输入 → TaskPlanner → Script → Storyboard → DialoguePolish → Prompt
+
+第二阶段（并行）：
+                  ┌── Image → Video ──┐
+Prompt ──Send()──┼───────────────────┼──→ Subtitle
+                  └── Voice ──────────┘
+
+第三阶段（串行 + 条件分支）：
+Subtitle → Editor → Quality ──成功──→ Export → final.mp4
+                          └──失败──→ Editor（重试）
 ```
 
 ### 智能体说明
