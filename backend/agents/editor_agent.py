@@ -78,11 +78,12 @@ class EditorAgent:
 
             try:
                 try:
-                    from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip
+                    from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips
                 except ImportError:
-                    from moviepy import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip
+                    from moviepy import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips
 
                 clips = []
+                audio_segments: list[AudioFileClip] = []
                 for item in mixed_inputs:
                     scene_id = item["scene_id"]
                     scene_doc = next((s for s in task_scenes if str(s["scene_id"]) == scene_id), {})
@@ -113,6 +114,8 @@ class EditorAgent:
 
                     if item["type"] == "dynamic_video":
                         clip = VideoFileClip(resolved_item_path)
+                        # 去掉视频原声（AI 生成的视频自带环境音效，会和 TTS 串）
+                        clip = clip.without_audio() if hasattr(clip, 'without_audio') else clip.set_audio(None)
                         if clip.duration != duration:
                             end_t = min(clip.duration, duration)
                             clip = clip.subclipped(0, end_t) if hasattr(clip, 'subclipped') else clip.subclip(0, end_t)
@@ -120,7 +123,7 @@ class EditorAgent:
                         clip = ImageClip(resolved_item_path)
                         clip = clip.with_duration(duration) if hasattr(clip, 'with_duration') else clip.set_duration(duration)
 
-                    # 为当前分镜挂载独立配音 (优先使用分镜级配音)
+                    # 收集分镜独立配音片段（不挂到 clip 上，而是单独拼合音轨）
                     if scene_id in scene_audio_map:
                         audio_path_str = scene_audio_map[scene_id]
                         if not Path(audio_path_str).is_absolute():
@@ -130,17 +133,27 @@ class EditorAgent:
                             resolved_audio = Path(audio_path_str)
                         if resolved_audio.exists():
                             try:
-                                audio_clip = AudioFileClip(str(resolved_audio))
-                                clip = clip.with_audio(audio_clip) if hasattr(clip, 'with_audio') else clip.set_audio(audio_clip)
-                                print(f"[EditorAgent] Attached per-scene audio for {scene_id}: {resolved_audio}")
+                                seg = AudioFileClip(str(resolved_audio))
+                                audio_segments.append(seg)
+                                print(f"[EditorAgent] Collected audio for {scene_id}: {resolved_audio}")
                             except Exception as audio_err:
-                                print(f"[EditorAgent] Failed to attach audio for {scene_id}: {audio_err}")
+                                print(f"[EditorAgent] Failed to load audio for {scene_id}: {audio_err}")
 
                     clips.append(clip)
 
                 if clips:
                     final_video = concatenate_videoclips(clips, method="compose")
-                    print(f"[EditorAgent] Final video duration: {final_video.duration:.1f}s (per-scene audio baked into each clip)")
+
+                    # 将各分镜的独立音轨拼成一条完整音轨，挂载到最终视频
+                    if audio_segments:
+                        try:
+                            final_audio = concatenate_audioclips(audio_segments)
+                            final_video = final_video.with_audio(final_audio) if hasattr(final_video, 'with_audio') else final_video.set_audio(final_audio)
+                            print(f"[EditorAgent] Composite audio track: {final_audio.duration:.1f}s, video: {final_video.duration:.1f}s")
+                        except Exception as ae:
+                            print(f"[EditorAgent] Audio composite failed: {ae}")
+                    else:
+                        print(f"[EditorAgent] No per-scene audio segments found, video will be silent")
 
                     write_kwargs = {
                         "fps": 24,
