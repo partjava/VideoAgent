@@ -40,3 +40,9 @@ frontend/dist/
 
 # Temporary scripts
 *.tmp
+
+# ComfyUI generated test history
+backend/data/comfyui/test_history.json
+
+# Temp debug files
+comfyui_*.json

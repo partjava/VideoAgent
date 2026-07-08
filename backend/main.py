@@ -7,6 +7,7 @@ from config import settings
 from core.database import mongodb
 from routes.video_routes import router as video_router
 from routes.settings_routes import router as settings_router
+from routes.comfyui_routes import router as comfyui_router
 
 
 @asynccontextmanager
@@ -25,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(video_router)
 app.include_router(settings_router)
+app.include_router(comfyui_router)
 
 # 静态挂载生成的媒体素材和最终视频
 # 使用基于 main.py 位置的绝对路径，不依赖 CWD

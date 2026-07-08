@@ -4,6 +4,7 @@ import TaskProgress from '../views/TaskProgress.vue'
 import VideoPreview from '../views/VideoPreview.vue'
 import History from '../views/History.vue'
 import Settings from '../views/Settings.vue'
+import ComfyUISettings from '../views/ComfyUISettings.vue'
 
 const routes = [
   {
@@ -35,6 +36,12 @@ const routes = [
     name: 'Settings',
     component: Settings,
     meta: { title: 'API Key 配置' }
+  },
+  {
+    path: '/comfyui',
+    name: 'ComfyUISettings',
+    component: ComfyUISettings,
+    meta: { title: 'ComfyUI Settings' }
   }
 ]
 

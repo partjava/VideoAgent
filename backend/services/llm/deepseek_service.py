@@ -64,8 +64,7 @@ class DeepSeekService(BaseLLMService):
             base_url="https://api.deepseek.com/v1",
             temperature=0.65,
             max_tokens=max_tokens,
-            timeout=60,
-            model_kwargs={"response_format": {"type": "json_object"}},
+            timeout=300,
         )
         messages = [
             SystemMessage(content=system_prompt),
@@ -78,8 +77,16 @@ class DeepSeekService(BaseLLMService):
             print(f"[DeepSeekService] API returned empty content.")
             raise ValueError("DeepSeek returned an empty response.")
 
-        # 清理 Markdown 代码块包裹
+        # 尝试从文本中提取 JSON 对象
         cleaned_content = content.strip()
+
+        # 找第一个 { 和最后一个 }
+        start = cleaned_content.find("{")
+        end = cleaned_content.rfind("}")
+        if start >= 0 and end > start:
+            cleaned_content = cleaned_content[start:end+1]
+
+        # 清理 Markdown 代码块包裹
         if cleaned_content.startswith("```json"):
             cleaned_content = cleaned_content[7:]
         elif cleaned_content.startswith("```"):
@@ -88,11 +95,29 @@ class DeepSeekService(BaseLLMService):
             cleaned_content = cleaned_content[:-3]
         cleaned_content = cleaned_content.strip()
 
+        # 如果 JSON 被截断，尝试修复最后一个不完整的字段
         try:
             return json.loads(cleaned_content)
-        except Exception as e:
-            print(f"[DeepSeekService] JSON parse failed. Raw: {content[:200]}")
-            raise ValueError(f"JSON format error: {e}. Snippet: {content[:200]}") from e
+        except json.JSONDecodeError:
+            # 截断修复：找到最后一个完整的键值对
+            try:
+                # 尝试补 }
+                if not cleaned_content.endswith("}"):
+                    cleaned_content += "}"
+                return json.loads(cleaned_content)
+            except json.JSONDecodeError:
+                # 去掉最后不完整的字段重试
+                for _ in range(3):
+                    last_comma = cleaned_content.rfind(",")
+                    if last_comma < 10:
+                        break
+                    cleaned_content = cleaned_content[:last_comma] + "}"
+                    try:
+                        return json.loads(cleaned_content)
+                    except json.JSONDecodeError:
+                        continue
+                print(f"[DeepSeekService] JSON parse failed. Raw: {content[:300]}")
+                raise ValueError(f"JSON format error. Snippet: {content[:200]}")
 
     def plan_task(
         self,
@@ -404,3 +429,126 @@ video_prompt 要求：
             return prompts
         except Exception as e:
             raise RuntimeError(f"DeepSeek generate_image_prompts failed: {e}") from e
+
+    # ====== 预设故事模板 ======
+
+    STORY_TEMPLATES = {
+        "治愈晚风": {
+            "title": "治愈晚风",
+            "tag": "9:16竖屏 / 温柔氛围感",
+            "scene": "少女蹲在江边石阶，一只橘猫靠近她，她抚摸猫咪后望向落日，心情从委屈变得温暖。",
+            "segments": [
+                "少女蹲在江边石阶，低头揪着裙角抿嘴委屈，眼眶泛红，晚风把碎发吹糊脸颊",
+                "一只橘猫慢慢蹭她手背，少女睫毛颤了颤，缓缓抬头，嘴角轻轻扬起，伸手顺着猫背抚摸",
+                "她侧头望向落日，眉眼舒展，浅浅笑出梨涡，指尖搭在猫咪头顶不动",
+            ],
+            "visual": "暖黄落日余晖，江面波光粼粼，温柔治愈色调",
+            "camera": "开场近景侧拍少女表情，镜头缓慢下摇到橘猫蹭手，然后缓缓上摇到少女远望落日的侧脸",
+        },
+        "都市失落": {
+            "title": "都市失落",
+            "tag": "16:9横屏 / 情绪短片",
+            "scene": "西装男子站在天桥上，反复看手机消息却等不到回复，疲惫失落。",
+            "segments": [
+                "西装男生站天桥，攥紧手机，眉头紧锁，反复刷新聊天框，嘴角往下垮，眼底满是疲惫",
+                "手机屏幕熄灭，他垂下手，低头长叹，肩膀垮下来，双眼无神望着车流",
+                "抬手揉了揉发红的眼尾，侧脸落寞，静静靠着护栏发呆",
+            ],
+            "visual": "冷蓝灰调，城市夜景，天桥路灯昏黄，情绪低落氛围",
+            "camera": "从中景跟拍男生看手机，推进到手机屏幕熄灭特写，拉远到全景他孤独靠在护栏上的剪影",
+        },
+        "少年心动": {
+            "title": "少年心动",
+            "tag": "9:16竖屏 / 短视频爆款",
+            "scene": "走廊里男生偶遇心仪的女生，擦肩而过后的心动反应。",
+            "segments": [
+                "走廊男生转头撞见迎面走来的女生，瞬间僵住，瞳孔微放大，下意识攥紧手里书本，耳根飞快泛红",
+                "女生冲他轻轻笑了下擦肩而过，男生呆呆停在原地，目光跟着她背影，嘴角不受控上扬",
+                "低头偷偷傻笑，用书本挡住半张脸，脚尖轻轻蹭地面",
+            ],
+            "visual": "校园走廊，午后阳光从窗户斜射，暖白明亮色调",
+            "camera": "正反打：先拍男生僵住的表情，摇移到女生擦肩，再切回男生目送背影的镜头",
+        },
+        "微悬疑惊悚": {
+            "title": "微悬疑惊悚",
+            "tag": "9:16竖屏 / 短惊悚",
+            "scene": "女生独自翻旧木箱，发现一张和自己一模一样的照片，身后衣柜突然自动打开。",
+            "segments": [
+                "女生独自翻旧木箱，翻到一张陌生黑白照片，好奇歪头细看，表情平静放松",
+                "看清照片人脸和自己一模一样，她瞳孔骤缩，猛地后仰后退，嘴巴微张露出惊恐",
+                "身后衣柜柜门吱呀自动推开，女生浑身僵硬，不敢回头，浑身微微发抖",
+            ],
+            "visual": "暗调冷色，只有台灯局部照明，阴影强烈，恐怖氛围",
+            "camera": "特写照片和女生表情变化，快速拉远展现衣柜方向，定格在女生僵硬的背影和敞开的衣柜之间",
+        },
+        "热血瞬间": {
+            "title": "热血瞬间",
+            "tag": "16:9横屏 / 燃向",
+            "scene": "少年输掉比赛后心有不甘，在朋友的鼓励下重新燃起斗志。",
+            "segments": [
+                "少年输掉比赛垂头弯腰，咬着下唇，满脸不甘，双拳紧紧攥起",
+                "朋友伸手拍他肩膀鼓励，少年缓缓抬头，眼神从黯淡变得锐利坚定",
+                "松开拳头，挺直脊背，目光望向赛场前方，露出不服输的冷硬神情",
+            ],
+            "visual": "赛场侧光，明暗对比强烈，汗水反光，热血氛围",
+            "camera": "低角度仰拍少年不甘的表情，镜头缓缓推进到朋友拍肩的手，再拉回到少年重新挺直的背影",
+        },
+        "古风离别": {
+            "title": "古风离别",
+            "tag": "9:16竖屏 / 古风情感",
+            "scene": "渡口边女子送别心上人，不舍却无法挽留，最终独自落泪。",
+            "segments": [
+                "女子站渡口，攥着对方袖口不肯松手，眼眶蓄满泪水，鼻头发酸",
+                "对方缓缓抽开衣袖转身登船，女子嘴唇颤抖，强忍眼泪不让落下",
+                "小船离岸，她抬手捂住嘴，终于低头落下眼泪，肩膀轻轻抽动",
+            ],
+            "visual": "黄昏渡口，暖黄带灰调，水面薄雾，古风凄美色调",
+            "camera": "中景双人镜头，缓慢推进到女子攥袖口的手部特写，然后拉远到全景：船远去，女子独自立在渡口",
+        },
+    }
+
+    def generate_story_prompt(self, story_id: str) -> dict[str, str]:
+        """预选故事 → DeepSeek 生成完整提示词"""
+        template = self.STORY_TEMPLATES.get(story_id)
+        if not template:
+            raise ValueError(f"Unknown story: {story_id}")
+
+        segment_text = "\n".join(
+            f"  {i+1}. {seg}" for i, seg in enumerate(template["segments"])
+        )
+        description = (
+            f"场景：{template['scene']}\n"
+            f"分镜：\n{segment_text}\n"
+            f"画面风格：{template['visual']}\n"
+            f"镜头运动：{template['camera']}"
+        )
+        return self.generate_single_prompt(description)
+
+    def generate_single_prompt(self, description: str) -> dict[str, str]:
+        """给 ComfyUI 测试页用：一句话描述 → positive_prompt + negative_prompt"""
+        try:
+            system_prompt = (
+                "你是 Wan2.2 文生视频模型的提示词专家。用户给你一段画面描述，你生成详细的英文正向提示词和反向提示词。\n\n"
+                "========== 正向提示词格式（必须严格照做）==========\n"
+                "按以下 3 段组织，每段对应约 3-4 秒，总共 10 秒：\n\n"
+                "[0-3s: 开场] 建立场景 + 主体第一个动作 → 主体表情、肢体、环境光线。至少 6-8 句。\n\n"
+                "[4-7s: 发展] 关键事件发生 → 主体反应、表情变化、光影变化、镜头推进。至少 6-8 句。\n\n"
+                "[8-10s: 收尾] 情绪收束 → 主体最后的表情/动作定格、镜头拉远或固定。结尾必须加稳定约束 'smooth and stable motion, face remains clear and undistorted, no flickering or stuttering'。至少 4-6 句。\n\n"
+                "========== 绝对不能做的事 ==========\n"
+                "- 不要写画质词：4K、8K、high quality、masterpiece、HDR、ultra HD\n"
+                "- 不要笼统描写，每一句必须写出具体的视觉变化\n\n"
+                "========== 参考示例（复制这个结构，换成用户的内容）==========\n"
+                "[0-3s: Opening] A teenage girl in a white dress squats on stone steps by the river bank at sunset. She looks down, picking at the hem of her skirt with a pout, her eyes rimmed red. The evening breeze blows loose strands of hair across her cheek. She sniffles quietly. The warm golden sunlight casts a soft glow on her face. She hugs her knees tighter, looking small and fragile.\n\n"
+                "[4-7s: Development] A small orange cat slowly approaches, rubbing against the back of her hand. The girl's eyelashes flutter. She slowly lifts her head, tears still clinging to her lashes. The corner of her mouth lifts gently. She reaches out and strokes the cat's back with her fingertips. The cat purrs and leans into her touch. Her breathing gradually steadies.\n\n"
+                "[8-10s: Closure] She turns her head toward the setting sun on the horizon. Her brows relax, a faint dimple appears as she smiles softly. Her fingertips rest still on the cat's head. The golden light wraps around her silhouette. The river sparkles. A quiet warmth fills the frame. Smooth and stable motion, face remains clear and undistorted, no flickering or stuttering.\n\n"
+                "========== 反向提示词 ==========\n"
+                "列出需要避免的画面缺陷，中英文混合。\n\n"
+                "返回 JSON：{\"positive_prompt\": \"...\", \"negative_prompt\": \"...\"}"
+            )
+            result = self._call_api(system_prompt, description, max_tokens=128000)
+            return {
+                "positive_prompt": str(result.get("positive_prompt", description)),
+                "negative_prompt": str(result.get("negative_prompt", "")),
+            }
+        except Exception as e:
+            raise RuntimeError(f"DeepSeek generate_single_prompt failed: {e}") from e

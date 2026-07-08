@@ -1,11 +1,8 @@
 <template>
+  <BasicLayout>
   <div class="settings-page">
     <div class="page-header">
       <h2 class="page-heading">API Key 配置</h2>
-      <el-button text @click="$router.push('/')" size="large">
-        <el-icon size="18"><ArrowLeft /></el-icon>
-        <span style="font-size:16px">返回</span>
-      </el-button>
     </div>
     <p class="page-desc">填写各平台 Key，保存后自动写入 <code>.env</code> 文件。</p>
 
@@ -131,9 +128,11 @@
       </div>
     </el-card>
   </div>
+  </BasicLayout>
 </template>
 
 <script setup>
+import BasicLayout from '../layouts/BasicLayout.vue'
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { settingsApi } from '../api/settings.js'

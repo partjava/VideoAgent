@@ -1,0 +1,9 @@
+{
+  "positive_prompt": {"node": "6", "path": "inputs.text"},
+  "negative_prompt": {"node": "7", "path": "inputs.text"},
+  "seed": {"node": "3", "path": "inputs.seed"},
+  "width": {"node": "55", "path": "inputs.width"},
+  "height": {"node": "55", "path": "inputs.height"},
+  "length": {"node": "55", "path": "inputs.length"},
+  "fps": {"node": "57", "path": "inputs.fps"}
+}

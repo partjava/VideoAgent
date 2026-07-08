@@ -53,32 +53,44 @@
           
           <el-table-column label="操作" min-width="220" fixed="right">
             <template #default="scope">
-              <el-button 
-                type="primary" 
-                link 
-                icon="View"
-                @click="handleViewTask(scope.row)"
-              >
-                {{ scope.row.status === 'success' ? '预览' : '进度' }}
-              </el-button>
+              <template v-if="scope.row.source === 'comfyui_test'">
+                <el-button
+                  type="primary"
+                  link
+                  icon="View"
+                  @click="previewComfyuiTest(scope.row)"
+                >
+                  查看
+                </el-button>
+              </template>
+              <template v-else>
+                <el-button
+                  type="primary"
+                  link
+                  icon="View"
+                  @click="handleViewTask(scope.row)"
+                >
+                  {{ scope.row.status === 'success' ? '预览' : '进度' }}
+                </el-button>
 
-              <el-button 
-                type="warning" 
-                link 
-                icon="Refresh"
-                @click="handleRegenerate(scope.row)"
-              >
-                重新生成
-              </el-button>
+                <el-button
+                  type="warning"
+                  link
+                  icon="Refresh"
+                  @click="handleRegenerate(scope.row)"
+                >
+                  重新生成
+                </el-button>
 
-              <el-button 
-                type="danger" 
-                link 
-                icon="Delete"
-                @click="handleDeleteTask(scope.row)"
-              >
-                删除
-              </el-button>
+                <el-button
+                  type="danger"
+                  link
+                  icon="Delete"
+                  @click="handleDeleteTask(scope.row)"
+                >
+                  删除
+                </el-button>
+              </template>
             </template>
           </el-table-column>
         </el-table>
@@ -93,6 +105,7 @@ import { useRouter } from 'vue-router'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import BasicLayout from '../layouts/BasicLayout.vue'
 import { videoApi } from '../api/video'
+import { comfyuiApi } from '../api/comfyui'
 
 const router = useRouter()
 const loading = ref(true)
@@ -168,6 +181,11 @@ const filteredTasksList = computed(() => {
   })
 })
 
+const previewComfyuiTest = (test) => {
+  const url = '/' + test.asset_path.replace(/^backend\//, '')
+  window.open(url, '_blank')
+}
+
 const handleViewTask = (task) => {
   if (task.status === 'success') {
     router.push(`/preview/${task.task_id}`)
@@ -230,9 +248,25 @@ const handleDeleteTask = (task) => {
 
 const fetchTasks = async () => {
   try {
-    const list = await videoApi.listTasks()
-    list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-    tasksList.value = list
+    const [taskList, comfyuiRes] = await Promise.all([
+      videoApi.listTasks(),
+      comfyuiApi.getTestHistory().catch(() => ({ tests: [] })),
+    ])
+    // 格式化 ComfyUI 测试记录，和任务列表合并
+    const comfyuiTests = (comfyuiRes.tests || []).map(t => ({
+      task_id: t.created_at,
+      source: 'comfyui_test',
+      type: t.type,
+      topic: t.story || 'ComfyUI 测试',
+      user_input: t.prompt,
+      asset_path: t.asset_path,
+      status: t.status,
+      created_at: t.created_at,
+      generation_mode: t.type === 'video' ? 'ComfyUI 视频测试' : 'ComfyUI 图片测试',
+    }))
+    const merged = [...taskList, ...comfyuiTests]
+    merged.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    tasksList.value = merged
   } catch (error) {
     console.error('Failed to load tasks list', error)
   }

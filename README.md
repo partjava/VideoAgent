@@ -52,8 +52,8 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 | StoryboardAgent | 生成分镜（场景、时长、画面描述） | DeepSeek |
 | DialoguePolishAgent | 精修对白，使其口语化适合配音 | DeepSeek |
 | PromptAgent | 生成图片/视频提示词、动作节拍 | DeepSeek |
-| ImageAgent | 生成每个分镜的首帧图片 | Qwen-Image |
-| VideoAgent | 将图片转为动态视频（失败自动降级为静态图） | Wan / Vidu |
+| ImageAgent | 生成每个分镜的首帧图片 | Qwen-Image / **ComfyUI** |
+| VideoAgent | 将图片转为动态视频（失败自动降级为静态图） | Wan / Vidu / Doubao / **ComfyUI** |
 | VoiceAgent | 为每个分镜生成独立配音（不覆盖分镜时长） | edge-tts |
 | SubtitleAgent | 生成 SRT 字幕文件 | 本地生成 |
 | EditorAgent | 合成最终视频（每个分镜挂载独立配音） | MoviePy + FFmpeg |
@@ -87,8 +87,9 @@ video/
 │   ├── routes/           # FastAPI 路由（含 API Key 设置接口）
 │   ├── services/         # 外部服务封装
 │   │   ├── llm/          # DeepSeek
-│   │   ├── image/        # Qwen-Image
-│   │   └── video/        # Wan / Vidu
+│   │   ├── image/        # Qwen-Image / ComfyUI
+│   │   ├── video/        # Wan / Vidu / Doubao / ComfyUI
+│   │   └── comfyui/      # ComfyUI 客户端 + 配置
 │   ├── image/            # 项目截图与说明图片
 │   ├── config.py         # 环境配置
 │   └── main.py           # FastAPI 入口
@@ -97,6 +98,7 @@ video/
 │   ├── 01_项目总体设计.md
 │   ├── 02_智能体与后端设计.md
 │   ├── 03_前端页面与UI设计.md
+│   ├── 04_ComfyUI本地多模态接入需求方案.md
 │   └── 项目整体设计方案.md
 ├── .env.example          # 环境变量模板
 ├── .gitignore

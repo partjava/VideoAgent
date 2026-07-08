@@ -26,6 +26,10 @@
           <el-icon><Setting /></el-icon>
           <span>API 配置</span>
         </el-menu-item>
+        <el-menu-item index="/comfyui">
+          <el-icon><Connection /></el-icon>
+          <span>ComfyUI</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
