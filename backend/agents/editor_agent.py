@@ -78,9 +78,9 @@ class EditorAgent:
 
             try:
                 try:
-                    from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips
+                    from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips, vfx
                 except ImportError:
-                    from moviepy import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips
+                    from moviepy import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips, vfx
 
                 clips = []
                 audio_segments: list[AudioFileClip] = []
@@ -134,11 +134,17 @@ class EditorAgent:
                         if resolved_audio.exists():
                             try:
                                 seg = AudioFileClip(str(resolved_audio))
-                                # 裁掉超出视频时长的音频尾巴，避免音画不同步
-                                if seg.duration > clip.duration:
-                                    seg = seg.subclipped(0, clip.duration) if hasattr(seg, 'subclipped') else seg.subclip(0, clip.duration)
+                                # 如果配音比画面长，加快说话速度匹配视频时长
+                                orig_dur = seg.duration
+                                if orig_dur > clip.duration + 0.3:
+                                    speed = orig_dur / clip.duration
+                                    try:
+                                        seg = seg.fx(vfx.speedx, speed)
+                                    except (AttributeError, TypeError):
+                                        seg = seg.with_effects([vfx.MultiplySpeed(speed)])
+                                    print(f"[EditorAgent] Sped up audio {scene_id} ({orig_dur:.1f}s → {seg.duration:.1f}s, {speed:.2f}x)")
                                 audio_segments.append(seg)
-                                print(f"[EditorAgent] Collected audio for {scene_id}: {resolved_audio} (audio={seg.duration:.1f}s, clip={clip.duration:.1f}s)")
+                                print(f"[EditorAgent] Collected audio for {scene_id}: {resolved_audio} (audio={seg.duration:.1f}s, clip={seg.duration:.1f}s)")
                             except Exception as audio_err:
                                 print(f"[EditorAgent] Failed to load audio for {scene_id}: {audio_err}")
 

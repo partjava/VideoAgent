@@ -69,9 +69,11 @@ def validate_storyboard_scenes(
     if not scenes:
         raise ValueError("Storyboard is empty")
 
-    # 如果有目标时长，尝试进行自动微调
+    # 如果总时长超出范围，再尝试微调
     if target_duration is not None:
-        adjust_durations_to_target(scenes, target_duration)
+        total = sum(int(s.get("duration") or 0) for s in scenes)
+        if total < target_duration or total > target_duration + 30:
+            adjust_durations_to_target(scenes, target_duration)
 
     total_duration = 0
     for scene in scenes:
@@ -89,8 +91,9 @@ def validate_storyboard_scenes(
         if len(voiceover) < 2:
             raise ValueError(f"Storyboard voiceover is too short: {scene_id}")
         if enforce_voiceover_density:
+            count = _spoken_char_count(voiceover)
             min_voiceover_chars = _minimum_voiceover_chars(float(duration))
-            if _spoken_char_count(voiceover) < min_voiceover_chars:
+            if count < min_voiceover_chars:
                 raise ValueError(
                     f"Storyboard voiceover is too short for duration: "
                     f"{scene_id} needs at least {min_voiceover_chars} spoken chars"
@@ -107,9 +110,9 @@ def validate_storyboard_scenes(
             raise ValueError(f"Storyboard transition_note is too short: {scene_id}")
         total_duration += int(scene.get("duration") or 0)
 
-    if target_duration is not None and abs(total_duration - target_duration) > 8:
+    if target_duration is not None and (total_duration < target_duration or total_duration > target_duration + 30):
         raise ValueError(
-            f"Storyboard duration mismatch: expected about {target_duration}, got {total_duration}"
+            f"Storyboard duration mismatch: expected {target_duration}~{target_duration + 30}s, got {total_duration}s"
         )
 
 

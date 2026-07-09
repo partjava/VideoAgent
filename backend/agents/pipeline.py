@@ -202,7 +202,7 @@ def build_pipeline() -> StateGraph:
     workflow.add_conditional_edges("prompts", route_to_parallel, ["images", "voice"])
     workflow.add_edge("images", "video")
     workflow.add_edge("video", "subtitle")
-    workflow.add_edge("voice", "subtitle")
+    # voice 独立运行，不触发 subtitle（避免时序错乱）
 
     # 第三阶段：串行（字幕 → 剪辑 → 质检 → 导出）
     workflow.add_edge("subtitle", "editor")

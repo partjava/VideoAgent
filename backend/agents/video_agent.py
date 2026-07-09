@@ -57,6 +57,10 @@ class VideoAgent:
 
             assets_in_db = await mongodb.find_many(ASSETS_COLLECTION, {"task_id": task_id}, limit=200)
             image_assets = {
+                asset["scene_id"]: asset["path"]
+                for asset in assets_in_db
+                if asset.get("asset_type") == "image"
+            }
 
             video_service = get_video_service()
             assets: list[dict[str, object]] = []
@@ -174,14 +178,15 @@ class VideoAgent:
                     print(f"[VideoAgent] Scene {scene_id} non-sensitive error: {e}")
                     return None
 
-            async def _rewrite_prompt(original_prompt: str) -> str:
+            async def _rewrite_prompt(original_prompt: str, aspect: str = "9:16") -> str:
                 """调用 DeepSeek 将提示词改写为更温和的版本"""
                 try:
                     llm = get_llm_service()
+                    ratio_hint = "竖屏9:16" if aspect == "9:16" else "横屏16:9"
                     new_prompt = await anyio.to_thread.run_sync(
                         lambda _p=original_prompt: llm._call_api(
-                            system_prompt="你是一个视频提示词安全改写专家。用户给你一段可能触发内容审核的视频运动描述，你把它改写得温和、中性、不包含任何暴力或敏感词汇，但保留镜头运动和画面变化的核心动作。只输出改写后的文本，不要输出解释。",
-                            user_prompt=f"原文：{_p}\n\n请改写成温和版本，保持镜头运动、角色动作和环境变化，去掉所有暴力、战争、武器、流血相关的描述。",
+                            system_prompt="你是一个视频提示词安全改写专家。用户给你一段可能触发内容审核的视频运动描述，你把它改写得温和、中性、不包含任何暴力或敏感词汇，但保留镜头运动、画面比例（宽高比）和画面变化的核心动作。只输出改写后的文本，不要输出解释。",
+                            user_prompt=f"原文：{_p}\n\n请改写成温和版本，保持{ratio_hint}比例、镜头运动、角色动作和环境变化，去掉所有暴力、战争、武器、流血相关的描述。",
                             max_tokens=500,
                         )
                     )
@@ -206,7 +211,7 @@ class VideoAgent:
                 # 被审核拦截 → 用 AI 重写提示词再试（最多 2 次重写）
                 for attempt in range(2):
                     print(f"[VideoAgent] Scene {scene_id} sensitive content detected, rewriting prompt (attempt {attempt+1})...")
-                    new_prompt = await _rewrite_prompt(prompts_to_try[-1])
+                    new_prompt = await _rewrite_prompt(prompts_to_try[-1], task_ratio)
                     if new_prompt == prompts_to_try[-1]:
                         print(f"[VideoAgent] Prompt unchanged after rewrite, giving up.")
                         break

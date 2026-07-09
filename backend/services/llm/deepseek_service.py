@@ -8,8 +8,10 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 
-GLOBAL_QUALITY_RULES = """
-统一画质规格：1080P高清竖屏9:16，30fps，标准短视频发布画质。
+def _quality_rules(ratio: str = "9:16") -> str:
+    aspect = "竖屏9:16，1080x1920构图" if ratio == "9:16" else "横屏16:9，1920x1080构图"
+    return f"""
+统一画质规格：1080P高清{aspect}，30fps，标准短视频发布画质。
 画面清晰自然、主体明确、背景干净，满足抖音/视频号正常播放即可。
 禁止写入这些高成本词：4K、8K、超高清、极致细节、超高解析度、超采样、细节增强。
 不要追求复杂纹理和昂贵光影，优先保证画面稳定、动作清楚、镜头衔接自然。
@@ -144,7 +146,7 @@ class DeepSeekService(BaseLLMService):
 画面比例：{ratio}
 生成模式：{generation_mode}
 
-{GLOBAL_QUALITY_RULES}
+{_quality_rules(ratio)}
 
 风格参考：
 画面：{style_rules["visual"]}
@@ -258,7 +260,7 @@ class DeepSeekService(BaseLLMService):
 {dynamic_hint}
 
 分镜要求：
-- 生成 6-10 个连续分镜，所有 duration 相加接近 {target_duration or 60} 秒，误差不超过 5 秒。
+- 生成 6-12 个连续分镜，所有 duration 相加在 {target_duration or 60} 秒到 {(target_duration or 60) + 30} 秒之间。
 - 每个分镜时长至少 4 秒，不足 4 秒的补到 4 秒。
 - 每个分镜服务同一条剧情线，按故事时间顺序推进。
 - visual_description 必须写具体可见画面：角色的表情、动作、姿态、所处场景、关键道具。
@@ -269,8 +271,8 @@ class DeepSeekService(BaseLLMService):
 - shot_type 用影视镜头语言：特写、近景、中景、全景、过肩、俯拍、仰拍等。
 - voiceover 写这个镜头对应的旁白或角色台词，这是直接送入 TTS 配音的文本。
 - voiceover 禁止出现“李白：”“旁白：”“某某说：”这类角色标签或朗读提示，不能让 TTS 把说话人名字读出来。
-- voiceover 按 duration 控制密度：每秒约 2.5-4 个中文字符，每个分镜至少 4 秒，至少 10 个可朗读中文字符。
-- subtitle 可以比 voiceover 更短，但 voiceover 必须能撑住该镜头的配音时长。
+- voiceover 控制字数，确保能在对应 duration 秒内自然读完，中文语速约 3-5 字/秒。
+- subtitle 直接使用 voiceover 原文，不再缩写。
 - 禁止空泛词：震撼、电影感、高质量、氛围感、未来感大片、引发思考。
 
 每个分镜返回字段：
@@ -330,8 +332,8 @@ class DeepSeekService(BaseLLMService):
 - 每个输入分镜都必须返回一条结果，scene_id 必须保持不变。
 - speaker 单独填写说话人，例如“李白”“旁白”“考官”；不确定时填“旁白”。
 - voiceover 是直接送入 TTS 的文本，禁止出现“李白：”“旁白：”“某某说：”等会被朗读出来的标签。
-- voiceover 按 duration 控制密度：每秒约 2.5-4 个中文字符，4 秒镜头至少 10 个可朗读中文字符，3 秒至少 8 个，2 秒至少 6 个。
-- 不要把每条都写很长；只补足节奏，避免“快答题！”这种撑不起镜头时长的极短句。
+- voiceover 控制字数，确保能在对应 duration 秒内自然读完，中文语速约 3-5 字/秒。
+- subtitle 直接使用 voiceover 原文，不再缩写。
 - subtitle 可以与 voiceover 相同，也可以更短，但不能丢失关键剧情。
 - 不要新增角色、不要改剧情事实、不要解释输出。
 
@@ -382,7 +384,7 @@ class DeepSeekService(BaseLLMService):
             user_prompt = f"""\
 分镜列表：{json.dumps(clean_scenes, ensure_ascii=False, default=str)}
 
-{GLOBAL_QUALITY_RULES}
+{_quality_rules(ratio)}
 
 内容类型：{resolved_style}
 画面风格：{style_hint}

@@ -40,24 +40,9 @@ class SubtitleAgent:
             relative_path = f"backend/outputs/{task_id}/subtitle.srt"
             output_file = backend_dir / "outputs" / task_id / "subtitle.srt"
 
-            existing_subtitle = await mongodb.find_one(ASSETS_COLLECTION, {"task_id": task_id, "asset_type": "subtitle"})
-            if existing_subtitle and output_file.exists():
-                await mark_agent_success(
-                    task_id,
-                    self.agent_name,
-                    progress=93,
-                    status=VideoTaskStatus.SUBTITLE_GENERATING,
-                    message="Skipped SubtitleAgent (subtitle already exists)",
-                    extra_fields={
-                        "metadata.subtitle_status": "success",
-                        "metadata.subtitle_path": relative_path,
-                    },
-                )
-                return {
-                    "source": "system",
-                    "status": "success",
-                    "path": relative_path,
-                }
+            # 始终重新生成字幕，保证 voiceover 和字幕一致
+            if output_file.exists():
+                output_file.unlink()
 
             # 1. 读取分镜
             scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
@@ -72,7 +57,7 @@ class SubtitleAgent:
             srt_lines = []
             for idx, scene in enumerate(task_scenes, start=1):
                 duration = float(scene.get("duration") or 5)
-                subtitle_text = scene.get("subtitle") or scene.get("voiceover") or ""
+                subtitle_text = scene.get("voiceover") or scene.get("subtitle") or ""
                 start_str = format_srt_time(current_time)
                 end_str = format_srt_time(current_time + duration)
                 current_time += duration

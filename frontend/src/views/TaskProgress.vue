@@ -373,22 +373,30 @@ const taskDetail = ref(null)
 const scriptData = ref(null)
 const storyboardData = ref([])
 
+// 预缓存：智能体完成时提前拉数据，点击时直接显示
+const agentCache = reactive({
+  taskDetail: null,
+  scriptData: null,
+  storyboardData: [],
+  ready: {}  // { agentName: true }
+})
+
 let pollInterval = null
 const errorMessage = ref('')
 
 const agentsList = [
   { name: 'TaskPlannerAgent', threshold: 20, description: '解析用户输入，规划视频的主题、时长、画风风格、输出比例和平台配置。' },
-  { name: 'ScriptAgent', threshold: 30, description: '根据规划主题，调用生成适合配音的高质量口播文本及发布文案。' },
-  { name: 'StoryboardAgent', threshold: 50, description: '将口播脚本文本智能切分为连续分镜，生成画面描述和镜头运动方式。' },
-  { name: 'DialoguePolishAgent', threshold: 60, description: '调用 DeepSeek 校准每个分镜的说话人、配音文本和字幕密度。' },
-  { name: 'PromptAgent', threshold: 70, description: '根据每个镜头描述，生成图片提示词、负面提示词和视频运动提示词。' },
-  { name: 'ImageAgent', threshold: 85, description: '通过图片提示词，调用 Qwen-Image 生成每个镜头的底图素材。' },
-  { name: 'VideoAgent', threshold: 90, description: '根据已生成底图和运动提示词，调用配置的视频模型生成动态片段。' },
-  { name: 'VoiceAgent', threshold: 93, description: '提取口播脚本文本，调用 edge-tts 免费语音合成服务合成完整配音。' },
-  { name: 'SubtitleAgent', threshold: 95, description: '根据配音时长，自动计算并生成适配的 SRT 格式字幕文件。' },
-  { name: 'EditorAgent', threshold: 96, description: '拼接素材，添加配音、字幕，并调用 MoviePy 导出最终的 mp4 视频。' },
-  { name: 'QualityAgent', threshold: 98, description: '自动校验 final.mp4 视频文件的尺寸、时长与播放可读性。' },
-  { name: 'ExportAgent', threshold: 100, description: '保存最终生成资产，打包最终下载链接和元数据入库。' }
+  { name: 'ScriptAgent', threshold: 30, description: '根据规划主题，调用 DeepSeek 生成口播文本和发布文案。' },
+  { name: 'StoryboardAgent', threshold: 50, description: '将口播脚本文本拆分为连续分镜，每个分镜包含配音文本和字幕文本。' },
+  { name: 'DialoguePolishAgent', threshold: 60, description: 'DeepSeek 精修每个分镜的配音文本和字幕文本。' },
+  { name: 'PromptAgent', threshold: 70, description: '根据每个镜头描述，生成图片提示词和视频运动提示词。' },
+  { name: 'ImageAgent', threshold: 85, description: '调用图片模型（Doubao / Qwen / ComfyUI）生成每个镜头的底图素材。' },
+  { name: 'VideoAgent', threshold: 90, description: '根据底图和运动提示词，调用视频模型生成动态片段（3路并发，审核自动重试）。' },
+  { name: 'VoiceAgent', threshold: 93, description: '提取每个分镜的配音文本，调用 edge-tts 生成独立配音文件。' },
+  { name: 'SubtitleAgent', threshold: 95, description: '按分镜时间轴组装 SRT 字幕文件（使用配音原文）。' },
+  { name: 'EditorAgent', threshold: 96, description: '拼接视频/图片素材，挂载独立配音音轨，烧录字幕，导出 final.mp4。' },
+  { name: 'QualityAgent', threshold: 98, description: '校验 final.mp4 文件是否存在。' },
+  { name: 'ExportAgent', threshold: 100, description: '保存结果到数据库。' }
 ]
 
 const getAgentStatus = (agent) => {
@@ -398,19 +406,26 @@ const getAgentStatus = (agent) => {
     if (failedAgent && agent.threshold < failedAgent.threshold) return 'success'
     return 'waiting'
   }
-  
+
   if (progressInfo.status === 'success') {
     return 'success'
   }
-  
+
+  // 优先级1：进度超过阈值 +2，说明已经过了该智能体阶段
+  if (progressInfo.progress > agent.threshold + 2) {
+    return 'success'
+  }
+
+  // 优先级2：正好是当前正在执行的智能体
   if (progressInfo.current_agent === agent.name) {
     return 'running'
   }
-  
+
+  // 优先级3：进度刚好达到阈值（边界情况）
   if (progressInfo.progress >= agent.threshold) {
     return 'success'
   }
-  
+
   return 'waiting'
 }
 
@@ -453,13 +468,30 @@ const downloadVideo = () => {
   document.body.removeChild(link)
 }
 
+// 预拉取某个智能体的数据并缓存
+async function prefetchAgentData(agentName) {
+  if (agentCache.ready[agentName]) return // 已缓存
+  try {
+    if (agentName === 'TaskPlannerAgent' || agentName === 'EditorAgent' || agentName === 'QualityAgent' || agentName === 'ExportAgent') {
+      agentCache.taskDetail = await videoApi.getTask(taskId)
+    } else if (agentName === 'ScriptAgent') {
+      agentCache.scriptData = await videoApi.getScript(taskId)
+    } else if (['StoryboardAgent', 'DialoguePolishAgent', 'PromptAgent', 'ImageAgent', 'VideoAgent', 'SubtitleAgent'].includes(agentName)) {
+      agentCache.storyboardData = await videoApi.getStoryboard(taskId)
+    }
+    agentCache.ready[agentName] = true
+  } catch (e) {
+    // 预拉取失败无所谓，点击时再拉
+  }
+}
+
 // Handle card click to open Dialog Modal
 const handleAgentClick = async (agent) => {
   const status = getAgentStatus(agent)
   if (status !== 'success') {
     return // Only allow checking detail if it has successfully run
   }
-  
+
   activeAgentName.value = agent.name
   const titles = {
     TaskPlannerAgent: '任务规划策划案',
@@ -467,35 +499,35 @@ const handleAgentClick = async (agent) => {
     StoryboardAgent: '分镜镜头划分清单',
     DialoguePolishAgent: 'DeepSeek 台词润色',
     PromptAgent: '图片与视频提示词',
-    ImageAgent: 'Qwen-Image 底图素材',
+    ImageAgent: '底图素材',
     VoiceAgent: '音频旁白配音文件',
-    SubtitleAgent: 'SRT 对齐字幕',
+    SubtitleAgent: 'SRT 字幕文件',
     VideoAgent: '图生视频片段',
-    EditorAgent: 'MoviePy 混合视频合成信息',
-    QualityAgent: '自动视频质量自检报告',
+    EditorAgent: 'MoviePy 视频合成信息',
+    QualityAgent: '视频质量自检报告',
     ExportAgent: '生成资产导出打包'
   }
   currentDialogTitle.value = titles[agent.name] || agent.name
   dialogVisible.value = true
-  dialogLoading.value = true
-  taskDetail.value = null
-  scriptData.value = null
-  storyboardData.value = []
+  dialogLoading.value = false  // 不再加载状态，直接用缓存或即时拉取
 
   try {
+    // 先尝试用缓存
     if (agent.name === 'TaskPlannerAgent') {
+      if (agentCache.ready[agent.name]) { taskDetail.value = agentCache.taskDetail; return }
       taskDetail.value = await videoApi.getTask(taskId)
     } else if (agent.name === 'ScriptAgent') {
+      if (agentCache.ready[agent.name]) { scriptData.value = agentCache.scriptData; return }
       scriptData.value = await videoApi.getScript(taskId)
     } else if (['StoryboardAgent', 'DialoguePolishAgent', 'PromptAgent', 'ImageAgent', 'VideoAgent', 'SubtitleAgent'].includes(agent.name)) {
+      if (agentCache.ready[agent.name]) { storyboardData.value = agentCache.storyboardData; return }
       storyboardData.value = await videoApi.getStoryboard(taskId)
     } else if (['EditorAgent', 'QualityAgent', 'ExportAgent'].includes(agent.name)) {
+      if (agentCache.ready[agent.name]) { taskDetail.value = agentCache.taskDetail; return }
       taskDetail.value = await videoApi.getTask(taskId)
     }
   } catch (err) {
     console.error('Failed loading agent detail dialog:', err)
-  } finally {
-    dialogLoading.value = false
   }
 }
 
@@ -505,7 +537,14 @@ const fetchProgress = async () => {
     progressInfo.progress = data.progress
     progressInfo.current_agent = data.current_agent
     progressInfo.message = data.message
-    
+
+    // 预拉取已完成智能体的数据
+    for (const agent of agentsList) {
+      if (data.progress >= agent.threshold && !agentCache.ready[agent.name]) {
+        prefetchAgentData(agent.name)
+      }
+    }
+
     if (data.task_status === 'success') {
       progressInfo.status = 'success'
       clearInterval(pollInterval)
