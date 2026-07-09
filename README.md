@@ -19,24 +19,24 @@
 *系统总体架构：Vue 前端 → FastAPI 后端 → 多智能体协作 → MongoDB 存储 + 本地文件系统*
 
 ![生成流程图](backend/image/流程图.png)
-*13 个智能体在 LangGraph StateGraph 中编排执行（串行 + Send 并行分支 + 条件分支）*
+*12 个智能体在 LangGraph StateGraph 中编排执行（串行 + Send 并行分支 + 条件分支）*
 
 ---
 
 ## 系统架构
 
-系统由 13 个智能体在 LangGraph StateGraph 中编排执行：
+系统由 12 个智能体在 LangGraph StateGraph 中编排执行：
 
 ```
 第一阶段（串行）：
-用户输入 → TaskPlanner → Script → Storyboard → DialoguePolish → Prompt
+TaskPlanner → Script → Storyboard → DialoguePolish → Prompt
 
-第二阶段（并行）：
-                  ┌── Image → Video ──┐
-Prompt ──Send()──┼───────────────────┼──→ Subtitle
-                  └── Voice ──────────┘
+第二阶段（并行，LangGraph Send）：
+                ┌── Image → Video → Subtitle ──┐
+Prompt ──Send()─┼──────────────────────────────┤
+                └── Voice（独立运行，不触发后续）──┘
 
-第三阶段（串行 + 条件分支）：
+第三阶段（串行）：
 Subtitle → Editor → Quality ──成功──→ Export → final.mp4
                           └──失败──→ Editor（重试）
 ```
@@ -48,17 +48,17 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 | 智能体 | 职责 | 调用服务 |
 |--------|------|---------|
 | TaskPlannerAgent | 解析用户需求，生成任务规划 | DeepSeek |
-| ScriptAgent | 生成视频脚本 | DeepSeek |
-| StoryboardAgent | 生成分镜（场景、时长、画面描述） | DeepSeek |
-| DialoguePolishAgent | 精修对白，使其口语化适合配音 | DeepSeek |
-| PromptAgent | 生成图片/视频提示词、动作节拍 | DeepSeek |
-| ImageAgent | 生成每个分镜的首帧图片（4路并发） | **Doubao Seedream** / Qwen-Image / ComfyUI |
-| VideoAgent | 将图片转为动态视频（3路并发，审核拦截自动AI重写重试） | **Doubao Seedance** / Wan / Vidu / ComfyUI |
-| VoiceAgent | 为每个分镜生成独立配音（不覆盖分镜时长） | edge-tts |
-| SubtitleAgent | 生成 SRT 字幕文件 | 本地生成 |
-| EditorAgent | 合成最终视频（分镜独立配音，音画自动对齐） | MoviePy + FFmpeg |
-| QualityAgent | 检查最终视频文件 | 文件检查 |
-| ExportAgent | 导出最终结果到数据库 | — |
+| ScriptAgent | 生成视频脚本和发布文案 | DeepSeek |
+| StoryboardAgent | 拆分为连续分镜，每段≥4秒 | DeepSeek |
+| DialoguePolishAgent | 精修对白和字幕文本 | DeepSeek |
+| PromptAgent | 生成图片/视频提示词、运动节拍 | DeepSeek |
+| ImageAgent | 生成底图（4路并发） | **Doubao Seedream** / Qwen / ComfyUI |
+| VideoAgent | 图生视频（3路并发，审核AI重写重试） | **Doubao Seedance** / Wan / Vidu / ComfyUI |
+| VoiceAgent | 每个分镜独立配音文件 | edge-tts |
+| SubtitleAgent | 组装SRT字幕（使用voiceover原文） | 本地 |
+| EditorAgent | 合成视频+字幕，配音超长时加速语音 | MoviePy + FFmpeg |
+| QualityAgent | 检查final.mp4是否存在 | 文件检查 |
+| ExportAgent | 保存结果到数据库 | — |
 
 ---
 
@@ -67,7 +67,7 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 ```
 video/
 ├── backend/
-│   ├── agents/           # 13 个智能体
+│   ├── agents/           # 12 个智能体
 │   │   ├── pipeline.py   # LangGraph StateGraph 编排
 │   │   ├── task_planner_agent.py
 │   │   ├── script_agent.py
