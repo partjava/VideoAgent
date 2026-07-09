@@ -25,6 +25,10 @@ def get_image_service() -> BaseImageService:
         from services.image.qwen_image_service import QwenImageService
 
         return QwenImageService()
+    if provider == "doubao":
+        from services.image.doubao_image_service import DoubaoImageService
+
+        return DoubaoImageService()
     if provider == "comfyui":
         from services.image.comfyui_image_service import ComfyUIImageService
 

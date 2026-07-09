@@ -34,7 +34,10 @@ class Settings:
     vidu_api_token: str | None = os.getenv("VIDU_API_TOKEN")
     vidu_model: str = os.getenv("VIDU_MODEL", "viduq3-turbo")
     volcengine_api_key: str | None = os.getenv("VOLCENGINE_API_KEY")
-    volcengine_model: str = os.getenv("VOLCENGINE_MODEL", "doubao-seedance-2-0")
+    volcengine_model: str = os.getenv("VOLCENGINE_MODEL", "doubao-seedance-1-5-pro-251215")
+    volcengine_image_model: str = os.getenv(
+        "VOLCENGINE_IMAGE_MODEL", "doubao-seedream-5-0-lite-260128"
+    )
 
 
 settings = Settings()

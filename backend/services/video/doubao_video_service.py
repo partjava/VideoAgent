@@ -1,4 +1,5 @@
 import base64
+import re
 import time
 import httpx
 from pathlib import Path
@@ -19,6 +20,55 @@ class DoubaoVideoService(BaseVideoService):
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
+
+    @staticmethod
+    def _sanitize_prompt(prompt: str) -> str:
+        """替换可能触发内容审核的敏感词为温和描述"""
+        if not prompt:
+            return prompt
+        replacements = [
+            # 武器与攻击动作
+            (r"挥剑斩向", "手臂猛地一挥"),
+            (r"拔剑出鞘", "右手快速抬起"),
+            (r"一剑刺向", "迅速向前逼近"),
+            (r"挥剑砍向", "手臂大力挥出"),
+            (r"挥剑", "抬手"),
+            (r"长剑出鞘", "做出战斗姿态"),
+            (r"拔剑", "握紧剑柄"),
+            (r"剑指", "指向"),
+            (r"剑上还挂着", "衣袍上沾着"),
+            (r"斩将", "制伏对手"),
+            (r"斩杀", "制服"),
+            (r"斩", "击倒"),
+            # 射箭
+            (r"一箭射穿", "一箭命中"),
+            (r"箭已离弦", "箭矢飞出"),
+            (r"箭尾还在颤动", "弓弦还在颤动"),
+            (r"拉弓", "引弓"),
+            (r"持弓", "握弓"),
+            # 火与破坏
+            (r"纵火焚", "点燃"),
+            (r"冲天大火", "升起的火光"),
+            (r"火焰吞没", "火光照亮"),
+            (r"燃烧", "着火"),
+            (r"焚", "烧"),
+            # 战争与冲突
+            (r"敌军", "对方"),
+            (r"敌将", "对方首领"),
+            (r"敌营", "对方营地"),
+            (r"厮杀", "交锋"),
+            (r"激战", "对战"),
+            (r"打斗", "交手"),
+            # 流血与受伤
+            (r"受伤", "受创"),
+            (r"流血", "带伤"),
+            (r"捂着伤口", "捂着肩膀"),
+            (r"捂着受伤的", "捂着"),
+        ]
+        result = prompt
+        for pattern, replacement in replacements:
+            result = re.sub(pattern, replacement, result)
+        return result
 
     @staticmethod
     def _image_to_base64_url(file_path: str) -> str:
@@ -46,6 +96,7 @@ class DoubaoVideoService(BaseVideoService):
         image_path: str,
         video_prompt: str | None = None,
         duration: int = 5,
+        ratio: str = "9:16",
     ) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError(
@@ -67,6 +118,12 @@ class DoubaoVideoService(BaseVideoService):
             image_data_uri = self._image_to_base64_url(resolved_image_path)
 
             # 3. 提交图生视频任务
+            # Seedance 最低支持 4 秒，最高 12 秒
+            clamped_duration = max(4, min(duration, 12))
+            # 自动替换可能触发审核的敏感词
+            safe_prompt = self._sanitize_prompt(video_prompt or "")
+            if safe_prompt != video_prompt:
+                print(f"[DoubaoVideoService] Sanitized video_prompt for {scene_id}")
             submit_url = f"{self.API_BASE}/contents/generations/tasks"
             payload: dict[str, Any] = {
                 "model": settings.volcengine_model,
@@ -80,12 +137,12 @@ class DoubaoVideoService(BaseVideoService):
                     },
                     {
                         "type": "text",
-                        "text": video_prompt or "smooth movement, high quality, consistent with character"
+                        "text": safe_prompt or "smooth movement, high quality, consistent with character"
                     }
                 ],
                 "resolution": "1080p",
-                "ratio": "9:16",
-                "duration": duration,
+                "ratio": ratio,
+                "duration": clamped_duration,
                 "watermark": False
             }
 

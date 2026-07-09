@@ -1,3 +1,4 @@
+import anyio
 from datetime import UTC, datetime
 
 from core.database import mongodb
@@ -52,7 +53,10 @@ class ScriptAgent:
                     "generation_mode": task.get("generation_mode") or "full_dynamic",
                 }
 
-            script_data = get_llm_service().generate_script(task_plan)
+            llm_service = get_llm_service()
+            script_data = await anyio.to_thread.run_sync(
+                lambda _plan=task_plan: llm_service.generate_script(_plan)
+            )
             now = datetime.now(UTC)
             script = Script(
                 script_id=f"script_{task_id}",

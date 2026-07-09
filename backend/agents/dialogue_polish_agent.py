@@ -1,3 +1,4 @@
+import anyio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,8 +29,8 @@ class DialoguePolishAgent:
                 status=VideoTaskStatus.STORYBOARD_DONE,
             )
 
-            scenes = await mongodb.find_many(SCENES_COLLECTION, limit=100)
-            task_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            task_scenes = [scene for scene in scenes]
             task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
@@ -53,9 +54,11 @@ class DialoguePolishAgent:
                 )
                 return task_scenes
 
-            dialogues = get_llm_service().polish_dialogue(
-                task_scenes,
-                target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
+            llm_service = get_llm_service()
+            _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else None
+            dialogues = await anyio.to_thread.run_sync(
+                lambda _scenes=task_scenes, _td=_target_duration:
+                    llm_service.polish_dialogue(_scenes, target_duration=_td)
             )
             dialogue_by_scene_id = {str(item.get("scene_id")): item for item in dialogues}
 

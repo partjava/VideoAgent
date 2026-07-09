@@ -49,10 +49,12 @@ async def list_video_tasks() -> ApiResponse | JSONResponse:
 
 
 async def run_pipeline_wrapper(task_id: str) -> None:
+    print(f"[Pipeline Wrapper] Starting pipeline for {task_id}")
     try:
-        await run_pipeline(task_id)
+        result = await run_pipeline(task_id)
+        print(f"[Pipeline Wrapper] Pipeline finished: {result.get('status')}")
     except Exception as exc:
-        print(f"[BackgroundTasks] Pipeline failed for task {task_id}: {exc}")
+        print(f"[Pipeline Wrapper] Pipeline failed for task {task_id}: {exc}")
         try:
             await task_service.update_task_fields(
                 task_id,
@@ -119,8 +121,8 @@ async def get_video_task_script(task_id: str) -> ApiResponse | JSONResponse:
 @router.get("/{task_id}/storyboard", response_model=ApiResponse)
 async def get_video_task_storyboard(task_id: str) -> ApiResponse | JSONResponse:
     try:
-        scenes = await mongodb.find_many("scenes", limit=100)
-        task_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+        scenes = await mongodb.find_many("scenes", {"task_id": task_id}, limit=100)
+        task_scenes = [scene for scene in scenes]
         task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
         for scene in task_scenes:
             if "_id" in scene:

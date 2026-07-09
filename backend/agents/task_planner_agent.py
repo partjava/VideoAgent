@@ -1,3 +1,5 @@
+import anyio
+
 from models.task_model import VideoTaskStatus
 from services.provider_factory import get_llm_service
 
@@ -35,13 +37,23 @@ class TaskPlannerAgent:
                 status=VideoTaskStatus.PLANNING,
             )
 
-            task_plan = get_llm_service().plan_task(
-                user_input=str(task["user_input"]),
-                duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
-                style=task.get("style") if isinstance(task.get("style"), str) else None,
-                platform=task.get("platform") if isinstance(task.get("platform"), str) else None,
-                ratio=str(task.get("ratio") or "9:16"),
-                generation_mode=str(task.get("generation_mode") or "full_dynamic"),
+            llm_service = get_llm_service()
+            _user_input = str(task["user_input"])
+            _duration = task.get("duration") if isinstance(task.get("duration"), int) else None
+            _style = task.get("style") if isinstance(task.get("style"), str) else None
+            _platform = task.get("platform") if isinstance(task.get("platform"), str) else None
+            _ratio = str(task.get("ratio") or "9:16")
+            _generation_mode = str(task.get("generation_mode") or "full_dynamic")
+            task_plan = await anyio.to_thread.run_sync(
+                lambda _u=_user_input, _d=_duration, _s=_style, _p=_platform, _r=_ratio, _g=_generation_mode:
+                    llm_service.plan_task(
+                        user_input=_u,
+                        duration=_d,
+                        style=_s,
+                        platform=_p,
+                        ratio=_r,
+                        generation_mode=_g,
+                    )
             )
 
             await mark_agent_success(

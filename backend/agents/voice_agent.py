@@ -84,8 +84,8 @@ class VoiceAgent:
             if not script_doc:
                 raise ValueError(f"Script not found for task: {task_id}")
 
-            scenes = await mongodb.find_many(SCENES_COLLECTION, limit=100)
-            task_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            task_scenes = [scene for scene in scenes]
             task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
 
             scene_voiceovers = []

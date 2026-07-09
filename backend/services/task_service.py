@@ -104,15 +104,13 @@ class TaskService:
         
         # 删除所有资产和分镜
         # 使用 find_many 获取并批量删除，因为 mongo 没有 delete_many，但我们有 delete_one 循环或直接在底层处理
-        assets = await mongodb.find_many("assets", limit=500)
+        assets = await mongodb.find_many("assets", {"task_id": task_id}, limit=500)
         for a in assets:
-            if a.get("task_id") == task_id:
-                await mongodb.delete_one("assets", {"_id": a["_id"]})
-                
-        scenes = await mongodb.find_many("scenes", limit=200)
+            await mongodb.delete_one("assets", {"_id": a["_id"]})
+
+        scenes = await mongodb.find_many("scenes", {"task_id": task_id}, limit=200)
         for s in scenes:
-            if s.get("task_id") == task_id:
-                await mongodb.delete_one("scenes", {"_id": s["_id"]})
+            await mongodb.delete_one("scenes", {"_id": s["_id"]})
                 
         await mongodb.delete_one("render_outputs", {"task_id": task_id})
 

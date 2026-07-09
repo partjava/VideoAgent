@@ -60,8 +60,8 @@ class SubtitleAgent:
                 }
 
             # 1. 读取分镜
-            scenes = await mongodb.find_many(SCENES_COLLECTION, limit=100)
-            task_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            task_scenes = [scene for scene in scenes]
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
             

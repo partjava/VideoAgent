@@ -1,3 +1,4 @@
+import anyio
 import re
 from datetime import UTC, datetime
 
@@ -53,7 +54,7 @@ def adjust_durations_to_target(scenes: list[dict[str, object]], target_duration:
         for _ in range(100):  # 避免死循环
             for scene in scenes:
                 curr = int(scene.get("duration") or 0)
-                if curr > 3:
+                if curr > 4:
                     scene["duration"] = curr - 1
                     reduced += 1
                     if reduced == to_reduce:
@@ -82,11 +83,13 @@ def validate_storyboard_scenes(
         transition_note = str(scene.get("transition_note") or "").strip()
         if not scene_id:
             raise ValueError("Storyboard scene_id is empty")
+        duration = int(scene.get("duration") or 0)
+        if duration < 4:
+            raise ValueError(f"Storyboard duration too short: {scene_id} has {duration}s, minimum is 4s")
         if len(voiceover) < 2:
             raise ValueError(f"Storyboard voiceover is too short: {scene_id}")
         if enforce_voiceover_density:
-            duration = float(scene.get("duration") or 0)
-            min_voiceover_chars = _minimum_voiceover_chars(duration)
+            min_voiceover_chars = _minimum_voiceover_chars(float(duration))
             if _spoken_char_count(voiceover) < min_voiceover_chars:
                 raise ValueError(
                     f"Storyboard voiceover is too short for duration: "
@@ -118,8 +121,8 @@ class StoryboardAgent:
             task = await get_required_task(task_id)
             
             # 检查分镜是否已生成
-            scenes = await mongodb.find_many(SCENES_COLLECTION, limit=100)
-            existing_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            existing_scenes = [scene for scene in scenes]
             if existing_scenes:
                 existing_scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
                 # 清除 MongoDB 的 _id 字段保证返回纯字典
@@ -142,12 +145,18 @@ class StoryboardAgent:
             if script is None:
                 raise ValueError(f"Script not found for task: {task_id}")
 
-            scenes_data = get_llm_service().generate_storyboard(
-                script,
-                target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
-                generation_mode=str(task.get("generation_mode", "full_dynamic")),
+            llm_service = get_llm_service()
+            _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else None
+            _generation_mode = str(task.get("generation_mode", "full_dynamic"))
+            scenes_data = await anyio.to_thread.run_sync(
+                lambda _script=script, _td=_target_duration, _gm=_generation_mode:
+                    llm_service.generate_storyboard(
+                        _script,
+                        target_duration=_td,
+                        generation_mode=_gm,
+                    )
             )
-            target_duration = task.get("duration") if isinstance(task.get("duration"), int) else None
+            target_duration = _target_duration
             validate_storyboard_scenes(
                 scenes_data,
                 target_duration=target_duration,

@@ -29,13 +29,13 @@ class EditorAgent:
 
             # 1. 查询分镜和素材，用于后续合成
             from agents.agent_utils import SCENES_COLLECTION
-            scenes = await mongodb.find_many(SCENES_COLLECTION, limit=100)
-            task_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            task_scenes = [scene for scene in scenes]
             # 按 scene_index 排序，保证最终视频场景顺序正确
             task_scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
 
-            assets_in_db = await mongodb.find_many(ASSETS_COLLECTION, limit=200)
-            task_assets = [a for a in assets_in_db if a.get("task_id") == task_id]
+            assets_in_db = await mongodb.find_many(ASSETS_COLLECTION, {"task_id": task_id}, limit=200)
+            task_assets = [a for a in assets_in_db]
             assert_no_mock_assets(task_assets)
 
             # 建立分镜素材映射
@@ -134,8 +134,11 @@ class EditorAgent:
                         if resolved_audio.exists():
                             try:
                                 seg = AudioFileClip(str(resolved_audio))
+                                # 裁掉超出视频时长的音频尾巴，避免音画不同步
+                                if seg.duration > clip.duration:
+                                    seg = seg.subclipped(0, clip.duration) if hasattr(seg, 'subclipped') else seg.subclip(0, clip.duration)
                                 audio_segments.append(seg)
-                                print(f"[EditorAgent] Collected audio for {scene_id}: {resolved_audio}")
+                                print(f"[EditorAgent] Collected audio for {scene_id}: {resolved_audio} (audio={seg.duration:.1f}s, clip={clip.duration:.1f}s)")
                             except Exception as audio_err:
                                 print(f"[EditorAgent] Failed to load audio for {scene_id}: {audio_err}")
 

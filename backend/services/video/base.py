@@ -11,5 +11,6 @@ class BaseVideoService(ABC):
         image_path: str,
         video_prompt: str | None = None,
         duration: int = 5,
+        ratio: str = "9:16",
     ) -> dict[str, Any]:
         raise NotImplementedError

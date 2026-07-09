@@ -25,6 +25,7 @@ class ComfyUIVideoService(BaseVideoService):
         image_path: str,
         video_prompt: str | None = None,
         duration: int = 5,
+        ratio: str = "9:16",
     ) -> dict[str, Any]:
         try:
             data = self.workflow_store.load_workflow("video")

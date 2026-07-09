@@ -53,12 +53,13 @@ class MongoDatabase:
     async def find_many(
         self,
         collection_name: str,
+        filter: dict[str, Any] | None = None,
         limit: int = 50,
         sort_field: str = "created_at",
         sort_direction: int = -1,
     ) -> list[dict[str, Any]]:
         collection = self.get_collection(collection_name)
-        cursor = collection.find().sort(sort_field, sort_direction).limit(limit)
+        cursor = collection.find(filter or {}).sort(sort_field, sort_direction).limit(limit)
         return await cursor.to_list(length=limit)
 
     async def update_one(

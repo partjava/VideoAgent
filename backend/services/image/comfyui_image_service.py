@@ -24,6 +24,7 @@ class ComfyUIImageService(BaseImageService):
         scene_id: str,
         image_prompt: str,
         negative_prompt: str | None = None,
+        ratio: str = "9:16",
     ) -> dict[str, Any]:
         try:
             data = self.workflow_store.load_workflow("image")

@@ -52,11 +52,11 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 | StoryboardAgent | 生成分镜（场景、时长、画面描述） | DeepSeek |
 | DialoguePolishAgent | 精修对白，使其口语化适合配音 | DeepSeek |
 | PromptAgent | 生成图片/视频提示词、动作节拍 | DeepSeek |
-| ImageAgent | 生成每个分镜的首帧图片 | Qwen-Image / **ComfyUI** |
-| VideoAgent | 将图片转为动态视频（失败自动降级为静态图） | Wan / Vidu / Doubao / **ComfyUI** |
+| ImageAgent | 生成每个分镜的首帧图片（4路并发） | **Doubao Seedream** / Qwen-Image / ComfyUI |
+| VideoAgent | 将图片转为动态视频（3路并发，审核拦截自动AI重写重试） | **Doubao Seedance** / Wan / Vidu / ComfyUI |
 | VoiceAgent | 为每个分镜生成独立配音（不覆盖分镜时长） | edge-tts |
 | SubtitleAgent | 生成 SRT 字幕文件 | 本地生成 |
-| EditorAgent | 合成最终视频（每个分镜挂载独立配音） | MoviePy + FFmpeg |
+| EditorAgent | 合成最终视频（分镜独立配音，音画自动对齐） | MoviePy + FFmpeg |
 | QualityAgent | 检查最终视频文件 | 文件检查 |
 | ExportAgent | 导出最终结果到数据库 | — |
 
@@ -86,10 +86,13 @@ video/
 │   ├── models/           # Pydantic 数据模型
 │   ├── routes/           # FastAPI 路由（含 API Key 设置接口）
 │   ├── services/         # 外部服务封装
-│   │   ├── llm/          # DeepSeek
-│   │   ├── image/        # Qwen-Image / ComfyUI
-│   │   ├── video/        # Wan / Vidu / Doubao / ComfyUI
-│   │   └── comfyui/      # ComfyUI 客户端 + 配置
+│   │   ├── llm/          # DeepSeek（LangChain ChatOpenAI）
+│   │   ├── image/        # Doubao Seedream / Qwen-Image / ComfyUI
+│   │   ├── video/        # Doubao Seedance / Wan / Vidu / ComfyUI
+│   │   ├── comfyui/      # ComfyUI 客户端 + 配置
+│   │   ├── provider_factory.py  # 模型路由工厂
+│   │   ├── task_service.py
+│   │   └── tts_service.py
 │   ├── image/            # 项目截图与说明图片
 │   ├── config.py         # 环境配置
 │   └── main.py           # FastAPI 入口
@@ -238,24 +241,38 @@ curl http://localhost:8000/api/video/task_xxx
 
 | 变量 | 说明 | 必填 |
 |------|------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek API 密钥 | 是 |
-| `DASHSCOPE_API_KEY` | 阿里通义（Qwen-Image + Wan） | 是 |
-| `VIDU_API_TOKEN` | Vidu 视频 API | 否 |
-| `MONGODB_URI` | MongoDB 连接地址 | 否（默认 localhost） |
-| `ENABLE_PAID_API` | 是否启用付费 API | 开发时建议 false |
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥（脚本/分镜/提示词） | 是 |
+| `VOLCENGINE_API_KEY` | 火山引擎方舟 API Key（豆包模型） | 使用 Doubao 时必填 |
+| `DASHSCOPE_API_KEY` | 阿里通义 DashScope（Qwen/Wan） | 使用 Qwen/Wan 时必填 |
+| `MONGODB_URI` | MongoDB 连接地址 | 否（默认 `localhost:27017`） |
+| `ENABLE_PAID_API` | 是否启用付费 API | 开发建议 `false` |
 
-也可以在前端页面 **API 配置** 中填写 Key，保存后自动写入 `.env` 文件。
+### 模型选择
+
+通过 `IMAGE_PROVIDER` 和 `VIDEO_PROVIDER` 切换：
+
+```bash
+# .env
+IMAGE_PROVIDER=doubao     # doubao / qwen / comfyui
+VIDEO_PROVIDER=doubao     # doubao / wan / vidu / comfyui
+```
+
+火山引擎方舟配置步骤：
+1. 在[火山引擎方舟控制台](https://console.volcengine.com/ark)开通模型
+2. 为 API Key 勾选对应模型的访问权限
+3. 在 `.env` 中填入 `VOLCENGINE_API_KEY`
+4. 模型 ID 使用带日期后缀的完整 ID（如 `doubao-seedream-5-0-lite-260128`）
 
 ---
 
 ## 设计文档
 
-详见 [VideoAgent_项目设计拆分版/](./VideoAgent_项目设计拆分版/) 目录：
+详见 [VideoAgent_项目设计/](./VideoAgent_项目设计/) 目录：
 
-- [01_项目总体设计.md](./VideoAgent_项目设计拆分版/01_项目总体设计.md) — 总体架构、技术栈、开发计划
-- [02_智能体与后端设计.md](./VideoAgent_项目设计拆分版/02_智能体与后端设计.md) — 各智能体详细设计
-- [03_前端页面与UI设计.md](./VideoAgent_项目设计拆分版/03_前端页面与UI设计.md) — 前端界面设计
-- [项目整体设计方案.md](./VideoAgent_项目设计拆分版/项目整体设计方案.md) — 完整设计方案
+- [01_项目总体设计.md](./VideoAgent_项目设计/01_项目总体设计.md) — 总体架构、技术栈
+- [02_智能体与后端设计.md](./VideoAgent_项目设计/02_智能体与后端设计.md) — 各智能体详细设计
+- [03_前端页面与UI设计.md](./VideoAgent_项目设计/03_前端页面与UI设计.md) — 前端界面设计
+- [项目整体设计方案.md](./VideoAgent_项目设计/项目整体设计方案.md) — 完整设计方案
 
 ---
 

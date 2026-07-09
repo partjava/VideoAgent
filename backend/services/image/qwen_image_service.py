@@ -13,6 +13,7 @@ class QwenImageService(BaseImageService):
         scene_id: str,
         image_prompt: str,
         negative_prompt: str | None = None,
+        ratio: str = "9:16",
     ) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true 开启。")

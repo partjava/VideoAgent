@@ -1,3 +1,4 @@
+import anyio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,8 +21,8 @@ class PromptAgent:
     async def run(self, task_id: str) -> list[dict[str, Any]]:
         try:
             task = await get_required_task(task_id)
-            scenes = await mongodb.find_many(SCENES_COLLECTION, limit=100)
-            task_scenes = [scene for scene in scenes if scene.get("task_id") == task_id]
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            task_scenes = [scene for scene in scenes]
             task_scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
@@ -41,10 +42,11 @@ class PromptAgent:
             await mark_agent_start(task_id, self.agent_name, progress=60)
             ratio = str(task.get("ratio", "9:16"))
             style = str(task.get("style") or task.get("metadata", {}).get("style") or "")
-            prompts = get_llm_service().generate_image_prompts(
-                task_scenes,
-                ratio=ratio,
-                style=style or None,
+            llm_service = get_llm_service()
+            _style = str(task.get("style") or task.get("metadata", {}).get("style") or "") or None
+            prompts = await anyio.to_thread.run_sync(
+                lambda _scenes=task_scenes, _ratio=ratio, _style=_style:
+                    llm_service.generate_image_prompts(_scenes, ratio=_ratio, style=_style)
             )
             now = datetime.now(UTC)
             for prompt in prompts:

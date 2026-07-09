@@ -4,7 +4,7 @@ Pipeline 调度 — 使用 LangGraph StateGraph 编排 13 个智能体。
 每个 Agent 封装为图中的一个 Node，状态在节点间传递。
 QualityAgent 之后有条件分支：通过则导出，失败则回 EditorAgent 重试。
 """
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from langgraph.graph import END, StateGraph
 from langgraph.types import Send
@@ -24,12 +24,17 @@ from agents.video_agent import VideoAgent
 from agents.voice_agent import VoiceAgent
 
 
+def _merge_results_dict(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """合并两个 results 字典，b 覆盖 a 的同名 key"""
+    return {**a, **b}
+
+
 class PipelineState(TypedDict):
     """LangGraph 状态：整个 pipeline 中传递的数据"""
     task_id: str
     status: str
     error: Optional[str]
-    results: dict[str, Any]
+    results: Annotated[dict[str, Any], _merge_results_dict]
 
 
 # ── Node 函数：每个 Agent 封装为一个节点 ──────────────────────
@@ -41,74 +46,98 @@ def _merge_results(state: PipelineState, key: str, value: Any) -> dict:
 
 
 async def task_planner_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering task_planner_node")
     agent = TaskPlannerAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting task_planner_node")
     return _merge_results(state, "task_plan", result)
 
 
 async def script_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering script_node")
     agent = ScriptAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting script_node")
     return _merge_results(state, "script", result)
 
 
 async def storyboard_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering storyboard_node")
     agent = StoryboardAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting storyboard_node")
     return _merge_results(state, "storyboard", result)
 
 
 async def dialogue_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering dialogue_node")
     agent = DialoguePolishAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting dialogue_node")
     return _merge_results(state, "dialogue", result)
 
 
 async def prompts_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering prompts_node")
     agent = PromptAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting prompts_node")
     return _merge_results(state, "prompts", result)
 
 
 async def images_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering images_node for task {state['task_id']}")
     agent = ImageAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting images_node, result type: {type(result).__name__}")
     return _merge_results(state, "images", result)
 
 
 async def video_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering video_node for task {state['task_id']}")
     agent = VideoAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting video_node")
     return _merge_results(state, "video", result)
 
 
 async def voice_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering voice_node")
     agent = VoiceAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting voice_node")
     return _merge_results(state, "voice", result)
 
 
 async def subtitle_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering subtitle_node")
     agent = SubtitleAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting subtitle_node")
     return _merge_results(state, "subtitle", result)
 
 
 async def editor_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering editor_node")
     agent = EditorAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting editor_node")
     return _merge_results(state, "editor", result)
 
 
 async def quality_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering quality_node")
     agent = QualityAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting quality_node")
     return _merge_results(state, "quality", result)
 
 
 async def export_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering export_node")
     agent = ExportAgent()
     result = await agent.run(state["task_id"])
+    print(f"[Pipeline] Exiting export_node")
     return _merge_results(state, "export", result)
 
 
@@ -195,6 +224,7 @@ def build_pipeline() -> StateGraph:
 
 
 async def run_pipeline(task_id: str) -> dict[str, Any]:
+    print(f"[Pipeline] Starting pipeline for task {task_id}")
     workflow = build_pipeline()
     app = workflow.compile()
 
@@ -207,6 +237,9 @@ async def run_pipeline(task_id: str) -> dict[str, Any]:
 
     try:
         final_state = await app.ainvoke(initial_state)
+        # 所有节点跑完即为成功
+        final_state["status"] = "success"
+        print(f"[Pipeline] Pipeline completed, status: {final_state.get('status')}")
         return {
             "task_id": task_id,
             "status": final_state.get("status", "success"),
@@ -214,6 +247,9 @@ async def run_pipeline(task_id: str) -> dict[str, Any]:
             "results": final_state.get("results", {}),
         }
     except Exception as exc:
+        import traceback
+        print(f"[Pipeline] Pipeline FAILED with exception: {exc}")
+        traceback.print_exc()
         return {
             "task_id": task_id,
             "status": "failed",
