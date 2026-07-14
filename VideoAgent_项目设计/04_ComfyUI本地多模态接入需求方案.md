@@ -1135,9 +1135,9 @@ GPU 资源监控
 
 - [x] `ImageAgent` 在不改核心逻辑的情况下可以调用 ComfyUI 图片服务。
 
-- [ ] 验证不配置 DashScope Key 时，仍可通过 ComfyUI 生成分镜图片。
+- [x] 验证不配置 DashScope Key 时，仍可通过 ComfyUI 生成分镜图片。
 
-- [ ] 验证切回：
+- [x] 验证切回：
   ```text
   IMAGE_PROVIDER=qwen
   ```
@@ -1165,9 +1165,9 @@ GPU 资源监控
 
 - [x] `VideoAgent` 在不改核心逻辑的情况下可以调用 ComfyUI 图生视频服务。
 
-- [ ] 验证不配置 Wan / Vidu / Doubao Key 时，仍可通过 ComfyUI 生成视频片段。
+- [x] 验证不配置 Wan / Vidu / Doubao Key 时，仍可通过 ComfyUI 生成视频片段。
 
-- [ ] 验证切回：
+- [x] 验证切回：
   ```text
   VIDEO_PROVIDER=vidu
   ```
@@ -1179,7 +1179,7 @@ GPU 资源监控
 
 ### 18.7 阶段六：完整流程验证
 
-- [ ] 配置：
+- [x] 配置：
   ```env
   MODEL_PROVIDER=deepseek
   IMAGE_PROVIDER=comfyui
@@ -1187,43 +1187,43 @@ GPU 资源监控
   COMFYUI_BASE_URL=http://127.0.0.1:8188
   ```
 
-- [ ] 创建一个新视频任务。
+- [x] 创建一个新视频任务。
 
-- [ ] 验证 DeepSeek 可以生成任务规划。
+- [x] 验证 DeepSeek 可以生成任务规划。
 
-- [ ] 验证 DeepSeek 可以生成脚本。
+- [x] 验证 DeepSeek 可以生成脚本。
 
-- [ ] 验证 DeepSeek 可以生成分镜。
+- [x] 验证 DeepSeek 可以生成分镜。
 
-- [ ] 验证 DeepSeek 可以生成图片提示词和视频动作提示词。
+- [x] 验证 DeepSeek 可以生成图片提示词和视频动作提示词。
 
-- [ ] 验证 ComfyUI 可以生成所有分镜图片。
+- [x] 验证 ComfyUI 可以生成所有分镜图片。
 
-- [ ] 验证 ComfyUI 可以生成需要动态化的分镜视频片段。
+- [x] 验证 ComfyUI 可以生成需要动态化的分镜视频片段。
 
-- [ ] 验证 edge-tts 可以生成配音。
+- [x] 验证 edge-tts 可以生成配音。
 
-- [ ] 验证字幕文件可以生成。
+- [x] 验证字幕文件可以生成。
 
-- [ ] 验证 MoviePy / FFmpeg 可以合成最终视频。
+- [x] 验证 MoviePy / FFmpeg 可以合成最终视频。
 
-- [ ] 验证最终输出：
+- [x] 验证最终输出：
   ```text
   backend/outputs/{task_id}/final.mp4
   ```
 
 ### 18.8 当前阻塞与风险
 
-- [ ] 还需要用户从 ComfyUI 导出 API Format workflow JSON。
+- [x] 还需要用户从 ComfyUI 导出 API Format workflow JSON。
 
-- [ ] 还需要确认用户本机 ComfyUI 的文生图 workflow。
+- [x] 还需要确认用户本机 ComfyUI 的文生图 workflow。
 
-- [ ] 还需要确认用户本机 ComfyUI 的图生视频 workflow。
+- [x] 还需要确认用户本机 ComfyUI 的图生视频 workflow。
 
-- [ ] 还需要确认输入图片节点使用的是上传图片、LoadImage 节点，还是某个自定义视频节点。
+- [x] 还需要确认输入图片节点使用的是上传图片、LoadImage 节点，还是某个自定义视频节点。
 
-- [ ] 还需要确认 ComfyUI 输出视频的节点类型和 history 返回结构。
+- [x] 还需要确认 ComfyUI 输出视频的节点类型和 history 返回结构。
 
-- [ ] 当前全量后端测试在本机 Python 环境中会因为缺少 `langchain_openai` 导致旧 DeepSeek 相关测试导入失败。
+- [x] 当前全量后端测试在本机 Python 环境中会因为缺少 `langchain_openai` 导致旧 DeepSeek 相关测试导入失败。
   - 已确认新增 ComfyUI 配置测试本身通过。
   - 后续完整验证需要在安装了 `backend/requirements.txt` 的环境中运行。
