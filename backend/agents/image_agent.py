@@ -129,7 +129,12 @@ class ImageAgent:
                     created_at=now,
                     updated_at=now,
                 )
-                await mongodb.insert_one(ASSETS_COLLECTION, with_document_id(asset.model_dump(), asset.asset_id))
+                await mongodb.replace_one(
+                    ASSETS_COLLECTION,
+                    {"_id": asset.asset_id},
+                    with_document_id(asset.model_dump(), asset.asset_id),
+                    upsert=True,
+                )
                 await mongodb.update_one(
                     SCENES_COLLECTION,
                     {"_id": f"{task_id}_{scene_id}"},

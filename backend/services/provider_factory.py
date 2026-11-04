@@ -21,7 +21,9 @@ def get_llm_service() -> BaseLLMService:
 
 
 def get_image_service() -> BaseImageService:
-    provider = "qwen" if "image" in saved_models() else _runtime_provider("IMAGE_PROVIDER", settings.image_provider)
+    provider = _runtime_provider("IMAGE_PROVIDER", settings.image_provider)
+    if provider != "comfyui" and "image" in saved_models():
+        provider = "qwen"
     if provider == "qwen":
         from services.image.qwen_image_service import QwenImageService
 
@@ -38,7 +40,9 @@ def get_image_service() -> BaseImageService:
 
 
 def get_video_service() -> BaseVideoService:
-    provider = "wan" if "video" in saved_models() else _runtime_provider("VIDEO_PROVIDER", settings.video_provider)
+    provider = _runtime_provider("VIDEO_PROVIDER", settings.video_provider)
+    if provider != "comfyui" and "video" in saved_models():
+        provider = "wan"
     if provider == "vidu":
         from services.video.vidu_video_service import ViduVideoService
 

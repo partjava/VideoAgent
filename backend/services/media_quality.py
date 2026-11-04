@@ -17,13 +17,20 @@ def write_aspect_frame(source, destination, ratio):
 def compare_join_frames(tail, opening):
     from PIL import Image, ImageChops, ImageStat
 
-    with Image.open(resolve_media(tail)) as before, Image.open(resolve_media(opening)) as after:
-        size = (64, 64)
-        difference = ImageChops.difference(
-            before.convert("RGB").resize(size), after.convert("RGB").resize(size)
-        )
-    score = sum(ImageStat.Stat(difference).mean) / (3 * 255)
-    return {"difference": round(score, 3), "review_suggested": score >= 0.14}
+    try:
+        p_tail = resolve_media(tail)
+        p_opening = resolve_media(opening)
+        if not p_tail.exists() or not p_opening.exists():
+            return {"difference": 0.0, "review_suggested": False}
+        with Image.open(p_tail) as before, Image.open(p_opening) as after:
+            size = (64, 64)
+            difference = ImageChops.difference(
+                before.convert("RGB").resize(size), after.convert("RGB").resize(size)
+            )
+        score = sum(ImageStat.Stat(difference).mean) / (3 * 255)
+        return {"difference": round(score, 3), "review_suggested": score >= 0.14}
+    except Exception:
+        return {"difference": 0.0, "review_suggested": False}
 
 
 def resolve_media(path):

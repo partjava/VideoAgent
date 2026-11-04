@@ -192,7 +192,12 @@ class StoryboardAgent:
                     updated_at=now,
                 )
                 document_id = f"{task_id}_{scene.scene_id}"
-                await mongodb.insert_one(SCENES_COLLECTION, with_document_id(scene.model_dump(), document_id))
+                await mongodb.replace_one(
+                    SCENES_COLLECTION,
+                    {"_id": document_id},
+                    with_document_id(scene.model_dump(), document_id),
+                    upsert=True,
+                )
                 saved_scenes.append(scene.model_dump())
 
             await mark_agent_success(

@@ -71,9 +71,11 @@ class ScriptAgent:
                 created_at=now,
                 updated_at=now,
             )
-            await mongodb.insert_one(
+            await mongodb.replace_one(
                 SCRIPTS_COLLECTION,
+                {"_id": script.script_id},
                 with_document_id(script.model_dump(), script.script_id),
+                upsert=True,
             )
 
             await mark_agent_success(
