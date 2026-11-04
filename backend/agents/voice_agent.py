@@ -1,3 +1,6 @@
+import anyio
+from services.provider_factory import get_llm_service
+from services.generation_contract import MAX_VOICE_SPEED
 import os
 import re
 from datetime import UTC, datetime
@@ -5,7 +8,7 @@ from pathlib import Path
 from models.task_model import VideoTaskStatus
 from models.voice_model import Voice
 from models.asset_model import Asset
-from services.tts_service import tts_service
+from services.tts_service import resolve_voice_for_speaker, tts_service
 from core.database import mongodb
 
 from agents.agent_utils import (
@@ -20,6 +23,7 @@ from agents.agent_utils import (
 )
 
 
+STAGE_DIRECTIONS_RE = re.compile(r"[（\(【\[][^）\)】\]]{1,30}[）\)】\]]")
 SPEAKER_PREFIX_RE = re.compile(
     r"^\s*(?:[【\[\(（][^】\]\)）]{1,12}[】\]\)）]\s*[:：,，]?\s*|"
     r"[一-鿿A-Za-z0-9_]{1,12}(?:说|道)\s*[,，]\s*|"
@@ -33,7 +37,10 @@ def clean_tts_text(text: str) -> str:
         cleaned = line.strip()
         for _ in range(2):
             cleaned = SPEAKER_PREFIX_RE.sub("", cleaned).strip()
-        cleaned = cleaned.strip("\"'“”‘’ ")
+        cleaned = STAGE_DIRECTIONS_RE.sub("", cleaned).strip()
+        for _ in range(2):
+            cleaned = SPEAKER_PREFIX_RE.sub("", cleaned).strip()
+        cleaned = cleaned.strip("\"'“”‘’（）()【】[] ")
         if cleaned:
             cleaned_lines.append(cleaned)
     return "\n".join(cleaned_lines)
@@ -55,7 +62,39 @@ class VoiceAgent:
             backend_dir = Path(__file__).resolve().parents[1]
             existing_voice = await mongodb.find_one(VOICES_COLLECTION, {"task_id": task_id})
             combined_voice_path = backend_dir / "assets" / task_id / "audio" / "voice.mp3"
-            if existing_voice and combined_voice_path.exists():
+            # 1. 从 scripts 集合读取脚本
+            script_doc = await mongodb.find_one(SCRIPTS_COLLECTION, {"_id": f"script_{task_id}"})
+            if not script_doc:
+                script_doc = await mongodb.find_one(SCRIPTS_COLLECTION, {"task_id": task_id})
+
+            if not script_doc:
+                raise ValueError(f"Script not found for task: {task_id}")
+
+            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
+            task_scenes = [scene for scene in scenes]
+            task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
+
+            scene_voiceovers = []
+            for scene in task_scenes:
+                voiceover = clean_tts_text(str(scene.get("voiceover") or ""))
+                if voiceover:
+                    scene_voiceovers.append(voiceover)
+
+            from services.generation_contract import voice_speed, voice_window
+            from services.media_quality import resolve_media
+            can_reuse = bool(task_scenes) and all(
+                not clean_tts_text(str(s.get("voiceover") or "")) or (
+                    s.get("audio_text") == clean_tts_text(str(s.get("voiceover") or ""))
+                    and s.get("audio_path") and 0 < float(s.get("audio_duration") or 0) <= voice_window(s)[1] * MAX_VOICE_SPEED
+                    and resolve_media(s["audio_path"]).is_file()
+                ) for s in task_scenes
+            )
+            combined_text = "\n".join(scene_voiceovers).strip()
+            if (existing_voice and combined_voice_path.exists() and can_reuse
+                    and existing_voice.get("text") == combined_text):
+                for scene in task_scenes:
+                    if clean_tts_text(str(scene.get("voiceover") or "")):
+                        voice_speed(scene["scene_id"], float(scene["audio_duration"]), voice_window(scene)[1])
                 await mark_agent_success(
                     task_id,
                     self.agent_name,
@@ -76,24 +115,6 @@ class VoiceAgent:
                     "voice_id": existing_voice.get("voice_id"),
                 }
 
-            # 1. 从 scripts 集合读取脚本
-            script_doc = await mongodb.find_one(SCRIPTS_COLLECTION, {"_id": f"script_{task_id}"})
-            if not script_doc:
-                script_doc = await mongodb.find_one(SCRIPTS_COLLECTION, {"task_id": task_id})
-
-            if not script_doc:
-                raise ValueError(f"Script not found for task: {task_id}")
-
-            scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
-            task_scenes = [scene for scene in scenes]
-            task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
-
-            scene_voiceovers = []
-            for scene in task_scenes:
-                voiceover = clean_tts_text(str(scene.get("voiceover") or ""))
-                if voiceover:
-                    scene_voiceovers.append(voiceover)
-
             # 2. 为每个分镜生成独立的配音文件 (不改变分镜时长)
             audio_dir = backend_dir / "assets" / task_id / "audio"
             os.makedirs(str(audio_dir), exist_ok=True)
@@ -109,21 +130,64 @@ class VoiceAgent:
                 scene_audio_relative = f"backend/assets/{task_id}/audio/voice_{scene_id}.mp3"
                 scene_audio_path = backend_dir / "assets" / task_id / "audio" / f"voice_{scene_id}.mp3"
 
+                speaker = str(scene.get("speaker") or "").strip()
+                scene_voice = resolve_voice_for_speaker(speaker)
+
                 # 跳过已存在的分镜配音
                 existing_asset = await mongodb.find_one(
                     ASSETS_COLLECTION,
                     {"task_id": task_id, "scene_id": scene_id, "asset_type": "audio"}
                 )
-                if existing_asset and scene_audio_path.exists():
-                    scene_duration = existing_asset.get("duration", 0)
+                _, slot = voice_window(scene)
+                cached = (existing_asset and scene_audio_path.exists() and scene.get("audio_text") == voiceover
+                          and scene.get("audio_duration") and scene.get("voice") == scene_voice)
+                scene_duration = float(scene["audio_duration"]) if cached else await tts_service.generate_voice(
+                    text=voiceover, output_path=str(scene_audio_path), voice=scene_voice
+                )
+
+                # 原生语速优化：若音频略长于分镜时长，通过 edge-tts 原生 rate 微调，避免 MoviePy 变调失真
+                if not cached and slot < scene_duration <= slot * MAX_VOICE_SPEED:
+                    rate_pct = min(20, max(5, int(round((scene_duration / slot - 1.0) * 100))))
+                    try:
+                        adjusted_duration = await tts_service.generate_voice(
+                            text=voiceover, output_path=str(scene_audio_path), voice=scene_voice, rate=f"+{rate_pct}%"
+                        )
+                        scene_duration = adjusted_duration
+                    except Exception:
+                        pass
+
+                if cached and 0 < scene_duration <= slot * MAX_VOICE_SPEED:
                     total_duration += scene_duration
                     continue
 
-                scene_duration = await tts_service.generate_voice(
-                    text=voiceover,
-                    output_path=str(scene_audio_path),
-                    voice="zh-CN-XiaoxiaoNeural"
-                )
+                repaired = False
+                if scene_duration > slot * MAX_VOICE_SPEED:
+                    # Ask for a shorter line using the measured reading rate, then measure again.
+                    budget = max(1, int(slot * len(voiceover) / scene_duration * 0.8))
+                    llm = get_llm_service()
+                    shorter = await anyio.to_thread.run_sync(
+                        llm.shorten_voiceover, voiceover, budget
+                    )
+                    shorter = clean_tts_text(shorter)
+                    if len(shorter) < 2 or len(shorter) >= len(voiceover):
+                        raise ValueError(f"Could not shorten voice for scene {scene_id}")
+                    candidate = scene_audio_path.with_suffix(".repair.mp3")
+                    try:
+                        scene_duration = await tts_service.generate_voice(
+                            text=shorter, output_path=str(candidate), voice=scene_voice
+                        )
+                        if slot < scene_duration <= slot * MAX_VOICE_SPEED:
+                            rate_pct = min(20, max(5, int(round((scene_duration / slot - 1.0) * 100))))
+                            scene_duration = await tts_service.generate_voice(
+                                text=shorter, output_path=str(candidate), voice=scene_voice, rate=f"+{rate_pct}%"
+                            )
+                        voice_speed(scene_id, scene_duration, slot)
+                        candidate.replace(scene_audio_path)
+                    finally:
+                        candidate.unlink(missing_ok=True)
+                    voiceover = shorter
+                    repaired = True
+                voice_speed(scene_id, scene_duration, slot)
 
                 # 保存分镜配音到 assets 集合 (带有 scene_id)
                 asset = Asset(
@@ -150,16 +214,23 @@ class VoiceAgent:
                     SCENES_COLLECTION,
                     {"_id": f"{task_id}_{scene_id}"},
                     {
+                        **({"voiceover": voiceover, "subtitle": voiceover, "voiceover_repaired": True} if repaired else {}),
                         "audio_path": scene_audio_relative,
                         "audio_duration": scene_duration,
+                        "audio_text": voiceover,
+                        "speaker": speaker or "旁白",
+                        "voice": scene_voice,
                         "updated_at": now,
                     },
                 )
 
+                scene["voiceover"] = voiceover
+                scene["speaker"] = speaker or "旁白"
+                scene["voice"] = scene_voice
                 total_duration += scene_duration
 
             # 3. 生成完整的配音文件 (voice.mp3)，用于前端预览等
-            text = "\n".join(scene_voiceovers).strip()
+            text = "\n".join(filter(None, (clean_tts_text(s.get("voiceover") or "") for s in task_scenes)))
             if not text:
                 text = clean_tts_text(script_doc.get("content", ""))
             if not text:
@@ -171,7 +242,7 @@ class VoiceAgent:
             duration = await tts_service.generate_voice(
                 text=text,
                 output_path=str(output_file),
-                voice="zh-CN-XiaoxiaoNeural"
+                voice=resolve_voice_for_speaker("旁白")
             )
 
             # 不再覆盖分镜时长 —— 视频时长以分镜规划的原始时长为准

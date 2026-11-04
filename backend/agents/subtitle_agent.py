@@ -1,4 +1,7 @@
 import os
+from hashlib import sha256
+
+import anyio
 from datetime import UTC, datetime
 from pathlib import Path
 from models.task_model import VideoTaskStatus
@@ -15,12 +18,7 @@ from agents.agent_utils import (
 )
 
 
-def format_srt_time(seconds: float) -> str:
-    hrs = int(seconds // 3600)
-    mins = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds - int(seconds)) * 1000)
-    return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+from services.generation_contract import render_srt
 
 
 class SubtitleAgent:
@@ -52,19 +50,28 @@ class SubtitleAgent:
             
             task_scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
 
-            # 2. 组装 SRT 字幕内容
-            current_time = 0.0
-            srt_lines = []
-            for idx, scene in enumerate(task_scenes, start=1):
-                duration = float(scene.get("duration") or 5)
-                subtitle_text = scene.get("voiceover") or scene.get("subtitle") or ""
-                start_str = format_srt_time(current_time)
-                end_str = format_srt_time(current_time + duration)
-                current_time += duration
-                
-                srt_lines.append(f"{idx}\n{start_str} --> {end_str}\n{subtitle_text}\n")
-
-            srt_content = "\n".join(srt_lines)
+            from services.video_vision import align_scene_audio, review_enabled
+            from services.media_quality import resolve_media
+            if review_enabled():
+                for scene in task_scenes:
+                    video_path = scene.get("video_path")
+                    if not video_path or not ((scene.get("voice_cue") and not scene.get("voice_start_locked"))
+                                              or scene.get("sound_cues")):
+                        continue
+                    path = resolve_media(video_path)
+                    if not path.is_file():
+                        continue
+                    digest = sha256(path.read_bytes()).hexdigest()
+                    if scene.get("audio_alignment_digest") == digest:
+                        continue
+                    try:
+                        fields = await anyio.to_thread.run_sync(align_scene_audio, scene)
+                    except Exception:
+                        continue
+                    fields["audio_alignment_digest"] = digest
+                    await mongodb.update_one(SCENES_COLLECTION, {"_id": scene["_id"]}, fields)
+                    scene.update(fields)
+            srt_content = render_srt(task_scenes)
 
             # 3. 保存 SRT 文件
             backend_dir = Path(__file__).resolve().parents[1]

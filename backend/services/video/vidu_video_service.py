@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
-from services.video.base import BaseVideoService
+from services.video.base import BaseVideoService, VideoRenderRejected
 
 
 class ViduVideoService(BaseVideoService):
@@ -72,7 +72,12 @@ class ViduVideoService(BaseVideoService):
                 resolved_image_path = str(backend_dir / clean_path)
 
             # 2. 将图片编码为 base64 data-URI
-            image_data_uri = self._image_to_base64_url(resolved_image_path)
+            from tempfile import TemporaryDirectory
+            from services.media_quality import write_aspect_frame
+            with TemporaryDirectory(prefix="vidu_frame_") as tmp:
+                normalized = Path(tmp) / "first_frame.png"
+                write_aspect_frame(resolved_image_path, normalized, ratio)
+                image_data_uri = self._image_to_base64_url(str(normalized))
 
             # 3. 提交图生视频任务
             submit_url = f"{self.API_BASE}/img2video"
@@ -90,6 +95,9 @@ class ViduVideoService(BaseVideoService):
                 res = client.post(
                     submit_url, json=payload, headers=self._get_headers()
                 )
+                if res.status_code == 429:
+                    time.sleep(2)
+                    res = client.post(submit_url, json=payload, headers=self._get_headers())
                 res.raise_for_status()
                 res_data = res.json()
 
@@ -119,7 +127,7 @@ class ViduVideoService(BaseVideoService):
                         break
                     elif state == "failed":
                         err_msg = poll_data.get("err_code", "unknown error")
-                        raise ValueError(
+                        raise VideoRenderRejected(
                             f"Vidu 视频生成失败: {err_msg}"
                         )
                     # state 为 processing / pending 则继续等待

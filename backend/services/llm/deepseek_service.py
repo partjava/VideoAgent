@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from config import settings
+from services.model_config import model_config
 from services.llm.base import BaseLLMService
 
 from langchain_openai import ChatOpenAI
@@ -56,14 +57,15 @@ class DeepSeekService(BaseLLMService):
     def _call_api(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true。")
-        if not settings.deepseek_api_key:
+        profile = model_config("prompt", settings)
+        if not profile["key"]:
             raise ValueError("未找到 DEEPSEEK_API_KEY，请在环境变量中配置。")
 
         # 使用 LangChain ChatOpenAI 调用 DeepSeek（DeepSeek API 兼容 OpenAI 格式）
         llm = ChatOpenAI(
-            model=settings.deepseek_model,
-            api_key=settings.deepseek_api_key,
-            base_url="https://api.deepseek.com/v1",
+            model=profile["model"],
+            api_key=profile["key"],
+            base_url=profile["url"],
             temperature=0.65,
             max_tokens=max_tokens,
             timeout=300,
@@ -134,14 +136,14 @@ class DeepSeekService(BaseLLMService):
             resolved_style = style if style in STYLE_TEMPLATES else DEFAULT_STYLE
             style_rules = _style_template(resolved_style)
             system_prompt = (
-                "你是短剧/漫剧编剧导演。你的任务是把用户的一句话创意扩展成一个完整的剧情方案，"
-                "包含角色设定、冲突线、情节节拍和视觉世界观。"
-                "你必须输出严格 JSON，不要输出解释文字。"
+                "你是爆款短视频金牌导演与创意总监。你的任务是把用户的一句话需求转化为极具戏剧张力、"
+                "充满反差感、节奏紧凑、绝不枯燥乏味的视频方案。坚决拒绝平铺直叙和平庸AI流水账。必须输出严格 JSON。"
             )
             user_prompt = f"""\
 用户原始需求：{user_input}
-目标时长：{duration or 60} 秒
-内容类型：{resolved_style}（漫剧=漫画插画风格剧情，短剧=写实影视风格剧情）
+目标时长：{str(duration) + " 秒（固定）" if duration is not None else "从原句提取；未指定则自行选择"}
+若生成模式为 paired_5s，自动时长选 10 的整数倍，未指定则 30 秒。
+画面风格：{style or "自动选择"}（漫剧=漫画插画，短剧=写实影视）
 发布平台：{platform or "抖音/视频号"}
 画面比例：{ratio}
 生成模式：{generation_mode}
@@ -153,22 +155,25 @@ class DeepSeekService(BaseLLMService):
 配音：{style_rules["voice"]}
 字幕：{style_rules["subtitle"]}
 
-请把用户需求优化成一个完整的剧情项目设定，要求：
-- 必须有明确的故事主线：起因->发展->冲突/高潮->结局（或悬念/反转）。
-- 必须设定 1-3 个角色，每个角色有名字、外貌描述（发型、服装、体型特征）、性格标签。
-- 角色设定必须具体到可以画出来，禁止"一个年轻人""一位女子"这种模糊描述。
-- 场景世界观统一：所有场景必须在同一个视觉世界里，不能前一秒古代后一秒现代。
-- 冲突和转折要具体：不要写"遇到了困难"，要写具体发生了什么事。
-- 情绪节奏明确：标注哪里紧张、哪里舒缓、哪里爆发、哪里收束。
-- 结尾要有悬念钩子或情绪高点，让观众想看下一集或想点赞转发。
-- 不要空泛鸡汤，不要写"震撼、治愈、引发思考"。
+创意与叙事原则（反乏味、反套路）：
+- 强化【核心戏剧冲突】与【身份/认知反差】：拒绝白开水流水账！主角面对困境必须有戏剧化错位或反转，情绪起伏要有过山车般的冲击力。
+- 黄金前3秒抓人：开篇首秒直接抛出最具视觉冲击力或最具冲突性的情境，拒绝长篇大论的慢热铺垫。
+- 结尾有力：给出一个意想不到的爆笑反转、深刻共鸣或悬念钩子。
+
+先识别 video_type，只能选 story（剧情）、explainer（科普/教程）、product（产品介绍）。
+- story：铺垫、发展、解决，角色与道具保持一致。
+- explainer：展示现象、逐步解释、回答开头的问题。可无角色，不编造事实。
+- product：使用场景、功能演示、总结。只使用用户提供的产品事实，不捏造规格、效果或承诺。
+- plot_beats 依次列出开头、核心内容、结尾。每段写明观众应看到或听到什么。短片首秒直接出现可见的事件、现象或演示结果，把背景交代放进随后动作或旁白。结尾给出结果及主体反应。
+- 用户明确指定的题材、时长、风格优先。未指定时默认约30秒，可按内容调整。
 
 返回 JSON 字段：
-- topic: 剧情主题（一句话概括核心冲突）
+- video_type: story、explainer 或 product
+- topic: 视频主题
 - optimized_brief: 完整剧情梗概（200字以内的故事大纲）
 - characters: 数组，每个角色包含 name, appearance（具体外貌描述）, personality, role_in_story
 - duration: 整数秒
-- style: "{resolved_style}"
+- style: 漫剧或短剧，用户未指定时按内容选择
 - platform: 发布平台
 - ratio: 画面比例
 - generation_mode: 生成模式
@@ -186,25 +191,57 @@ class DeepSeekService(BaseLLMService):
             result = self._call_api(system_prompt, user_prompt, max_tokens=2500)
             result["source"] = "deepseek"
             result["user_input"] = user_input
-            result.setdefault("duration", duration or 60)
-            result.setdefault("style", resolved_style)
+            planned_duration = result.get("duration")
+            result["duration"] = duration if duration is not None else (
+                planned_duration if type(planned_duration) is int and 4 <= planned_duration <= 90 else 30
+            )
+            if generation_mode == "wan3_whole":
+                if duration is not None and not 4 <= duration <= 30:
+                    raise ValueError("Wan 3.0 whole mode supports 4–30 seconds")
+                result["duration"] = min(30, result["duration"])
+            if generation_mode == "paired_5s":
+                if duration is not None and (duration < 10 or duration % 10):
+                    raise ValueError("Paired mode requires a duration divisible by 10 seconds")
+                if duration is None:
+                    result["duration"] = max(10, min(90, (result["duration"] + 5) // 10 * 10))
+            if result.get("video_type") not in {"story", "explainer", "product"}:
+                result["video_type"] = "story"
+            if style:
+                result["style"] = resolved_style
+            if result.get("style") not in STYLE_TEMPLATES:
+                result["style"] = resolved_style
             result.setdefault("platform", platform or "抖音")
-            result.setdefault("ratio", ratio)
-            result.setdefault("generation_mode", generation_mode)
+            result["ratio"] = ratio
+            result["generation_mode"] = generation_mode
             return result
         except Exception as e:
             raise RuntimeError(f"DeepSeek plan_task failed: {e}") from e
+
+    def shorten_voiceover(self, text: str, max_chars: int) -> str:
+        result = self._call_api(
+            "压缩配音句子。保留关键信息、语气和事实，不增加新信息。返回JSON对象，字段voiceover。",
+            f"目标最多{max_chars}字。原句：{text}",
+            max_tokens=300,
+        )
+        return str(result.get("voiceover") or "")
+
+    def review_story_coverage(self, user_input, beats, scenes):
+        return self._call_api(
+            "检查短视频制作方案是否回应原始需求，开头、关键信息和结尾是否有画面或声音承载。"
+            "静态图片不能承载必须看到运动才能理解的信息。只审查提供的文字与素材类型，不声称看过实际画面。返回JSON对象，字段 verdict 为 pass 或 needs_review，issues 为字符串数组。",
+            json.dumps({"request": user_input, "planned_beats": beats, "scenes": scenes},
+                       ensure_ascii=False, default=str),
+            max_tokens=650,
+        )
 
     def generate_script(self, task_plan: dict[str, Any]) -> dict[str, Any]:
         try:
             target_duration = int(task_plan.get("duration") or 60)
             resolved_style = str(task_plan.get("style") or DEFAULT_STYLE)
             characters_json = json.dumps(task_plan.get("characters", []), ensure_ascii=False, default=str)
-            min_chars = max(100, int(target_duration * 5.0))
-            max_chars = max(min_chars + 30, int(target_duration * 6.6))
             system_prompt = (
-                "你是短剧/漫剧编剧。你要把导演的剧情方案写成具体的角色对白和旁白脚本，"
-                "每句台词都要推动剧情，每个场景都要能被画面表达。必须输出严格 JSON。"
+                "你是爆款短视频金牌编剧。你的剧本以戏剧张力强、反差感拉满、台词有梗生动著称。"
+                "你坚决唾弃平铺直叙的流水账和假大空的AI说教。每句台词都要推动剧情与情绪，每个场景都要有强烈视觉冲突。必须输出严格 JSON。"
             )
             user_prompt = f"""\
 项目方案：{json.dumps(task_plan, ensure_ascii=False, default=str)}
@@ -213,17 +250,17 @@ class DeepSeekService(BaseLLMService):
 
 内容类型：{resolved_style}
 
+剧本核心原则（反平庸、反乏味规则）：
+- 拒绝白开水流水账：故事必须包含【反差错位（Irony）】与【情绪过山车】。不要写角色坐下看书背诵然后离开这种平淡故事，必须设计荒诞激烈的戏剧碰撞（例如古今认知巨大错位、把考试当科举渡劫、遭遇降维打击当场破防、中二自信燃起）。
+- 黄金3秒视觉钩子：开篇第一秒直接抛出最具视觉冲击或身份错位的画面，禁止慢热铺垫。
+- 角色台词必须有性格、有灵魂、有爆梗：台词要口语化、接地气、情绪饱满，体现人物性格色彩，融入角色标志性金句但必须产生搞笑或热血化学反应，严禁枯燥说教与空洞抒情。
+
 脚本要求：
-- 这是一个{resolved_style}剧本，不是口播旁白。
-- content 是完整剧本，包含旁白叙述和角色对白，总长度控制在 {min_chars} 到 {max_chars} 个中文字符。
-- 角色对白格式：【角色名】："台词内容"
-- 旁白叙述格式：（旁白）内容
-- 全片必须围绕核心冲突推进：铺垫->升级->爆发->收束。
-- 每 1-2 句必须推动一个剧情事件或情绪变化，禁止水词和重复信息。
-- 角色说话要符合性格：狠角色说话要狠，弱势角色说话要带犹豫或恐惧。
-- 关键转折点要有力度：突然的反转、意外的信息、情绪爆发。
-- 结尾必须有钩子：悬念、反转、或情绪高点，让人想看下一集。
-- 不要写空泛鸡汤，不要说教，不要喊口号。
+- 按项目方案的 video_type 编写。剧情用角色行动和对白推进，科普按现象、解释、结论展开，产品介绍按场景、演示、总结展开。
+- 保留原始需求中的关键信息。每一段都写出画面和对应的台词或旁白，结尾必须完成开头提出的叙事或说明目标。
+- 先写画面推进：首秒动作钩子 → 行动让局面发生变化 → 清晰结果和反应。10秒以内的短片尽量围绕一个事件，不用多秒站立、凝视或慢慢准备来铺垫。
+- 配音文字总量建议不超过 {int(target_duration * 3.5)} 字，为自然停顿留时间。旁白补充观众看不到的信息或反应，不逐句复述画面。
+- 科普避免虚构事实，产品介绍不添加未提供的规格与功效。
 
 返回 JSON 字段：
 - title: 本集标题（吸引眼球的短句）
@@ -246,7 +283,15 @@ class DeepSeekService(BaseLLMService):
     ) -> list[dict[str, Any]]:
         try:
             dynamic_hint = {
+                "wan3_whole": "返回唯一一段动态视频，时长等于目标。可以在这段内部按事件推进、转移视线和调整景别，不拆分外部片段。",
                 "full_dynamic": "所有分镜 need_dynamic_video 都设为 true。",
+                "paired_5s": (
+                    "成片按10秒一部分组织，每部分恰好两段各5秒，所有段 need_dynamic_video=true。"
+                    "奇数段 transition_type=cut，偶数段 transition_type=continue_action。"
+                    "同一部分是同一场景、同一机位里的一个连续事件。前5秒触发并推进，后5秒继续并交代结果和反应。"
+                    "第一段尾部停在可辨识的交接状态，第二段从该状态立即继续，不重播开头动作。"
+                    "两段中间不得换场、切景别或改变方向。只在每10秒完成事件后切换场景或机位。"
+                ),
                 "key_scenes": "选择 2-4 个最适合动起来的关键分镜设为 true，其余 false。",
             }.get(generation_mode, "默认只在必要分镜设为 true，静态也能表达的分镜设为 false。")
             system_prompt = (
@@ -260,18 +305,24 @@ class DeepSeekService(BaseLLMService):
 {dynamic_hint}
 
 分镜要求：
-- 生成 6-12 个连续分镜，所有 duration 相加在 {target_duration or 60} 秒到 {(target_duration or 60) + 30} 秒之间。
+- 按生成模式决定分段。wan3_whole 必须只有一段，最多30秒；其它模式每段4至12秒。所有 duration 相加必须严格等于 {target_duration or 60} 秒。
+- 分镜呼吸感与镜头时长：优先保证每个分镜有充足的叙事与视觉沉浸感，严禁把视频切得过于细碎（如把30秒切成5~6个短促走马灯镜头）。30秒视频优先规划 3~4 个镜头（单镜 7~10 秒），60秒视频优先规划 5~7 个镜头（单镜 8~12 秒），让镜头有足够的时间完成动作起手、爆发和定格。
+- 单镜头单一焦点律（Single Focal Subject）：每个分镜只能选定一个主行动角色，镜头和动能严格围绕该角色展开。配角只作为静态背景或环境衬托，严禁在同一个分镜内反复切换不同角色的动作与面部反应。
+- transition_type 为 cut（切镜或换机位）、continue_action（同机位同构图连续动作，必须继承上一镜尾帧）、scene_change（明确换场）。首镜必须为 cut。
+- start_state 和 end_state 写明角色位置、朝向、持物手、道具位置及动作阶段；连续动作必须使本镜 start_state 与上镜 end_state 一致。
 - 每个分镜时长至少 4 秒，不足 4 秒的补到 4 秒。
-- 每个分镜服务同一条剧情线，按故事时间顺序推进。
-- visual_description 必须写具体可见画面：角色的表情、动作、姿态、所处场景、关键道具。
+- 每个分镜服务同一条内容主线。第一镜首帧构图就要看清动作对象，首秒发生可见变化。每个镜头须推进事件，保留结果和反应的时长。
+- 景别由内容决定。道具接触、按钮按下等细节要让主体和接触点清晰可见。需要换景别时在镜头之间切；用户要求同机位或继续动作时，靠清晰的主体位移和反应做出节奏。
+- visual_description 必须写具体、有戏剧张力的动作与画面：拒绝角色原地木讷呆立或无意义注视，必须设计宏观可见的行为动量（如猛拍桌面震飞笔筒、挥毫狂草在试卷上画符、仰天大笑破防），让人物动作处处有戏。
 - visual_description 必须包含角色的外貌特征（发型、服装、体型），确保每个镜头角色可识别。
-- character_state 写角色此刻的情绪状态、身体姿态和面部表情。
+- character_state 饱满且具情绪冲击力：写出角色此刻强烈的心理反差与表情爆发（如从迷之自信到怀疑人生、从极度错愕到热血中二）。
 - scene_continuity 必须说明如何继承上一镜头的角色位置、表情、道具、场景和色调。
 - transition_note 必须说明最后一帧怎么接下一镜头（动作延续/切景/表情变化）。
 - shot_type 用影视镜头语言：特写、近景、中景、全景、过肩、俯拍、仰拍等。
+- voice_start 写台词相对本段开始的秒数，台词在所描述的动作之后出现，必须留够朗读时间。sound_cues 写发生时间和音效名，仅支持 footstep、impact、water、paper、wind，没有就返回空数组。
 - voiceover 写这个镜头对应的旁白或角色台词，这是直接送入 TTS 配音的文本。
-- voiceover 禁止出现“李白：”“旁白：”“某某说：”这类角色标签或朗读提示，不能让 TTS 把说话人名字读出来。
-- voiceover 控制字数，确保能在对应 duration 秒内自然读完，中文语速约 3-5 字/秒。
+- voiceover 禁止出现“李白：”“旁白：”“某某说：”这类角色标签，禁止包含括号、音效或动作指示（如“（大笑）”、“【音效】”）。
+- voiceover 控制字数，确保能在对应 duration 秒内自然读完，单个分镜汉字数必须在 duration * 2.5 到 duration * 3.8 字之间，严禁超长。
 - subtitle 直接使用 voiceover 原文，不再缩写。
 - 禁止空泛词：震撼、电影感、高质量、氛围感、未来感大片、引发思考。
 
@@ -281,6 +332,9 @@ class DeepSeekService(BaseLLMService):
 - duration
 - shot_type
 - voiceover
+- voice_cue（台词应该落在的可见动作，比如抬眼直视镜头）
+- voice_start
+- sound_cues（每条 name 与 start）
 - subtitle
 - visual_description
 - character_state
@@ -289,6 +343,9 @@ class DeepSeekService(BaseLLMService):
 - audio_hint
 - camera_motion
 - need_dynamic_video
+- transition_type
+- start_state
+- end_state
 
 返回 JSON：{{"scenes": [...]}}
 """
@@ -311,6 +368,7 @@ class DeepSeekService(BaseLLMService):
                     "scene_id": scene.get("scene_id"),
                     "scene_index": scene.get("scene_index"),
                     "duration": scene.get("duration"),
+                    "voice_start": scene.get("voice_start", 0),
                     "speaker": scene.get("speaker"),
                     "voiceover": scene.get("voiceover"),
                     "subtitle": scene.get("subtitle"),
@@ -320,19 +378,22 @@ class DeepSeekService(BaseLLMService):
                 for scene in scenes
             ]
             system_prompt = (
-                "你是短视频台词润色导演。你只负责把每个分镜的配音文本调整成可直接朗读、节奏自然、"
-                "时长匹配的 voiceover/subtitle，不改分镜顺序、画面描述、镜头时长或剧情事实。"
-                "必须输出严格 JSON。"
+                "你是金牌台词精修导演。你的任务是把每个分镜的配音文本润色成极具感染力、情绪饱满、"
+                "有梗且富有角色灵魂的对白/旁白。坚决拒绝平淡无味的AI假大空说教腔。必须输出严格 JSON。"
             )
             user_prompt = f"""\
 分镜列表：{json.dumps(clean_scenes, ensure_ascii=False, default=str)}
 目标总时长：{target_duration or "跟随分镜 duration"} 秒
 
 润色要求：
+- 台词必须鲜活口语化、有情绪张力与戏剧色彩：融入人物特有的性格语气与反差梗，朗朗上口、节奏有力，严禁干瘪平淡的书面语与正经说教。
+- 以实际可配音时长（duration 减 voice_start）编排朗读节奏。普通五秒镜头的旁白尽量读到约四秒至四秒半，留半秒给表情或环境声。按正常朗读速度估算，不能靠省略号堆出时长。
+- 原句明显偏短时，补一层画面看不出的情感、人物记忆或因果。转折前可以安排一次自然停顿。不要复述已经看得见的动作。只有剧情明确需要沉默时才让旁白提早收住。
 - 每个输入分镜都必须返回一条结果，scene_id 必须保持不变。
+- 根据 duration 减去 voice_start 的剩余时长写台词。台词用一口气能念完的短句。
 - speaker 单独填写说话人，例如“李白”“旁白”“考官”；不确定时填“旁白”。
-- voiceover 是直接送入 TTS 的文本，禁止出现“李白：”“旁白：”“某某说：”等会被朗读出来的标签。
-- voiceover 控制字数，确保能在对应 duration 秒内自然读完，中文语速约 3-5 字/秒。
+- voiceover 是直接送入 TTS 的文本，禁止出现“李白：”“旁白：”等角色标签，严禁包含括号、音效或动作指示词（如“（兴奋地）”）。
+- voiceover 控制字数，确保能在对应 duration 秒内自然读完，单个分镜汉字数必须在 duration * 2.5 到 duration * 3.8 字之间，严禁超长。
 - subtitle 直接使用 voiceover 原文，不再缩写。
 - subtitle 可以与 voiceover 相同，也可以更短，但不能丢失关键剧情。
 - 不要新增角色、不要改剧情事实、不要解释输出。
@@ -354,6 +415,7 @@ class DeepSeekService(BaseLLMService):
         scenes: list[dict[str, Any]],
         ratio: str = "9:16",
         style: str | None = None,
+        visual_bible: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         try:
             resolved_style = style if style in STYLE_TEMPLATES else DEFAULT_STYLE
@@ -373,6 +435,11 @@ class DeepSeekService(BaseLLMService):
                     "transition_note": scene.get("transition_note"),
                     "audio_hint": scene.get("audio_hint"),
                     "camera_motion": scene.get("camera_motion"),
+                    "camera_section_number": scene.get("camera_section_number"),
+                    "camera_section_offset": scene.get("camera_section_offset"),
+                    "start_state": scene.get("start_state"),
+                    "end_state": scene.get("end_state"),
+                    "transition_type": scene.get("transition_type"),
                 }
                 for scene in scenes
             ]
@@ -386,6 +453,7 @@ class DeepSeekService(BaseLLMService):
 
 {_quality_rules(ratio)}
 
+全片角色与世界设定（仅使用该镜头实际出现的角色）：{json.dumps(visual_bible or {}, ensure_ascii=False, default=str)}
 内容类型：{resolved_style}
 画面风格：{style_hint}
 风格模板：
@@ -405,11 +473,32 @@ image_prompt 要求：
 - 不要出现 4K、8K、超高清、极致细节、超高解析度。
 - 不要要求图片里生成大段文字；如需要文字，只允许短词、标签、数字或图标。
 
-video_prompt 要求：
-- 这是给图生视频模型的动作提示词，必须基于首帧图片继续运动。
-- 每 0.5-1 秒必须有一个明确小变化，不能让一个画面静止超过 1 秒。
-- 动作来自角色表情变化、肢体动作、镜头运动、环境变化（风吹、光影、物体移动）。
-- 必须包含"首帧继承、动作节拍、镜头运动、结尾衔接"。
+全片叙事与动作编排：
+- 在 continuity_note 中重复固定角色造型、主道具状态和场景方向。每个10秒部分的第一段写明上一部分留下的线索如何引出本部分，使用视线、动作结果或声音引导切换。
+- 每5秒只设计一个主动作，安排起势、变化、落点。逐秒描述可见变化，衣摆、雾气、光影只作为持续的辅助变化，镜头跟随动作重心。
+- 续接边界用前段最后一拍的 end_state 写清左右手和道具接触点、视线、身体运动方向及镜头是否仍在移动。后段第一拍的 start_state 承接这些状态，action 推进到下一步。
+
+camera_plan 要求（仅 camera_section_offset=0 的双段续接分镜输出）：
+- 一组10秒只设计一条相机运动。先说明观众要看清的事件与接触点，再选视角和运动。接触细节优先稳住机位，揭示环境时可沿一个方向移动。
+- 输出 camera_plan 对象：purpose（镜头任务）、focus（全程必须可见的对象/接触点）、framing（景别）、viewpoint（起始机位和轴线）、opening（首帧构图）、closing（10秒结束构图）、handoff（5秒时人物、道具、构图和动作方向）。
+- movement 只能是 fixed/track/pan/tilt/push/pull。direction 是移动方向和跟随目标。move_start 和 move_end 是整组内的秒数，固定机位填0和0。续接段继承前段计划，不能自定相机运动。
+- 双段组的 video_prompt 和逐秒 action 只描述可见动作及连续状态，不夹带运镜。逐秒 camera 填“沿用分组运镜计划”。image_prompt 只描述首帧，按同一机位让关键接触点入画。
+- 古风剧情优先保留人物、道具与空间方向；产品展示优先保持产品字样和接触点可见；科普优先留出读图空间，一次突出一个信息。
+
+video_prompt 要求（参考 video-shotcraft 与 Seedance 2.0 工业级运镜规范）：
+- 这是给图生视频模型的动作提示词，必须基于首帧图片（@首帧）自然演进，严格保持人物面孔、服装颜色及光影一致。
+- 非双段续接分镜运用专业镜头配方（Shotcraft Recipe）：明确摄影机运镜动词（如“摄影机平缓向前推进 Dolly In”、“平视跟随主体向右平移 Tracking Pan”、“低角度仰拍微摇 Low-Angle Tilt”、“环绕半周 Orbit”），景别（特写/中景/全景）与运动幅度匹配。
+- 经典三段式动作弧（Action Arc）因果推进：
+  * 起手蓄势（前 1/3 时长）：重心转移、肢体发力起势；
+  * 核心爆发与交互（中 1/3 时长）：动作峰值、肢体与物体剧烈接触、力与形变清晰可见；
+  * 动量余波与定格（后 1/3 时长）：动作自然收止结算、最终姿态稳定定格。
+- 严禁不可见的微表情：把“惊讶、专注、眨眼、眼神微动、若有所思”全部替换为肉眼清晰可见的宏观物理位移与肢体动作（身体大幅前倾/后仰、双臂猛然挥展、双掌重拍桌面、手指用力撕扯或按压）。
+- 环境物理联动（Environmental Physics）：主体动作必须带动环境反馈，如宽大衣袍/袖口随动作扬起翻飞、气流掀起桌面纸张、水面泛起涟漪、光影随身体移动产生动态明暗变化。
+- 单镜头单一焦点律（Single Focal Subject）：每个分镜只能选定一个主行动角色，镜头和动能严格围绕该角色展开。配角只作为静态背景或环境衬托，严禁在同一个分镜内反复切换不同角色的动作与面部反应。
+- 逐秒 action 描述从哪里到哪里、哪一侧肢体发力、接触点、速度和方向、接触后的道具反馈、视线或重心如何变化。没有接触的动作写清位移或姿态变化。
+- start_state/end_state 写出画面内位置、朝向、支撑脚或持物手，以及重要道具的位置与状态。下一秒延用上一秒的结束状态。
+- continue_action 的首秒延续上一段尾部的姿态、运动方向、光线和机位，从未完成的动作继续。已经落下、打开或离开画面的东西保持其结果，不要复位。
+- video_prompt 只概括首帧继承、镜头运动、关键动作目标与结尾衔接。逐秒时间和动作只写在 motion_beats，避免同一时间轴在两个字段里重复或冲突。
 - 不要只写"缓慢运动、自然运动、画面更生动"。
 - 不要突然换场景、换主体、换服装、换道具，不要加入无关角色。
 - **动作描述必须委婉、暗示性**，禁用暴力/战争词汇："杀"、"斩"、"刺"、"砍"、"箭穿"、"纵火"、"焚烧"、"挥剑"、"拔剑"、"打斗"、"激战"、"厮杀"、"受伤"、"流血"。用"手势变化"、"快速转身"、"高举手臂"、"用力投出"、"握紧拳头"、"抬手示意"、"身体前倾"等中性动作描述代替。
@@ -419,14 +508,16 @@ video_prompt 要求：
 - image_prompt
 - negative_prompt
 - video_prompt
-- motion_beats: 数组，至少 3 条，格式如"0-1秒：......"
+- motion_beats: 对象数组，每条包含 start（起始秒）、end（结束秒）、subject、action（具体可见动作）、start_state、end_state、camera。每一秒必须单独写一条，5秒镜头必须严格给出 [0,1]、[1,2]、[2,3]、[3,4]、[4,5]。同一个连续动作分秒写进展，比如抬爪、伸近、接触、纸团越过桌沿、视线追向桌下。停顿也单独写明保持的姿态、视线和道具位置。每条只安排一个主要变化。
+- 画面中要看清什么，先在 video_prompt 指明接触点和景别；每秒写清入画侧、接触面的相对位置、力的方向、动作结果和可见反应。不要用气氛词代替位移。
+- 图片只能画出动作开始状态，不得提前呈现动作结果；末段结果必须符合 end_state。
 - first_frame_focus: 首帧最重要的可见主体
 - last_frame_for_transition: 最后一帧停在哪里，方便接下一镜
 - continuity_note: 需要保持一致的角色外貌/道具/场景/色调说明
 
 返回 JSON：{{"prompts": [...]}}
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=9000)
+            result = self._call_api(system_prompt, user_prompt, max_tokens=14000)
             prompts = result.get("prompts", [])
             for prompt in prompts:
                 prompt["source"] = "deepseek"

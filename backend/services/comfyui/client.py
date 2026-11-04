@@ -4,6 +4,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import websocket
@@ -150,13 +151,16 @@ class ComfyUIClient:
     def upload_image(self, image_path: Path) -> str:
         if not image_path.exists():
             raise FileNotFoundError(f"Input image not found: {image_path}")
+        name = f"videoagent_{uuid4().hex}{image_path.suffix.lower()}"
         with httpx.Client(timeout=min(self.timeout_seconds, 120)) as client:
             with image_path.open("rb") as image_file:
                 response = client.post(
                     f"{self.base_url}/upload/image",
-                    files={"image": (image_path.name, image_file, "image/png")},
-                    data={"overwrite": "true"},
+                    files={"image": (name, image_file, "application/octet-stream")},
+                    data={"overwrite": "false"},
                 )
             response.raise_for_status()
             data = response.json()
-        return str(data.get("name") or image_path.name)
+        uploaded = str(data.get("name") or name)
+        subfolder = str(data.get("subfolder") or "").strip("/")
+        return f"{subfolder}/{uploaded}" if subfolder else uploaded

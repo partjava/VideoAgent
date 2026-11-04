@@ -42,6 +42,131 @@
         </div>
 
         <!-- Right: Detail Info & Script/Storyboard download actions -->
+      <div v-if="taskDetail && storyboardData.length > 0" class="studio-editing-section">
+        <el-card class="detail-card studio-card" shadow="never">
+          <template #header>
+            <div class="card-header studio-header">
+              <span class="card-title">分镜精修</span>
+              <span class="header-tip">沿时间轴选择片段，查看画面并局部调整</span>
+            </div>
+          </template>
+
+          <nav class="section-timeline" aria-label="分镜时间轴">
+            <div v-for="(group, index) in timelineGroups" :key="group[0].scene.scene_id" class="timeline-group">
+              <small>{{ taskDetail.generation_mode === 'paired_5s' ? '段落' : '片段' }} {{ index + 1 }} · {{ group[0].start }}–{{ group.at(-1).end }} 秒</small>
+              <div class="timeline-clips">
+                <button v-for="item in group" :key="item.scene.scene_id" type="button"
+                  :aria-pressed="item.scene.scene_id === currentScene?.scene_id" @click="selectClip(item)">
+                  {{ item.start }}–{{ item.end }} 秒
+                  <span v-if="item.scene.stale_tail"> · 待续接</span>
+                </button>
+              </div>
+            </div>
+          </nav>
+          <div class="scenes-edit-list">
+            <div
+              v-for="scene in currentScene ? [currentScene] : []"
+              :key="scene.scene_id"
+              class="scene-edit-item"
+              v-loading="retryingSceneId === scene.scene_id"
+            >
+              <div class="clip-overview">
+                <img v-if="scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path"
+                  :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path)" alt="当前片段首帧" />
+                <div><strong>镜头 {{ scene.scene_index }} · {{ scene.duration }} 秒</strong>
+                  <p>{{ scene.motion_beats?.[0]?.action || scene.visual_description || '查看下方的动作与配音细节' }}</p>
+                </div>
+              </div>
+              <details class="clip-dialogue">
+                <summary>编辑角色与台词</summary>
+              <div class="scene-item-header">
+                <div class="scene-meta-left">
+                  <span class="scene-badge">{{ taskDetail?.generation_mode === 'paired_5s'
+                    ? `第 ${Math.ceil(scene.scene_index / 2)} 部分 · ${scene.scene_index % 2 ? '前段' : '后段'}`
+                    : `镜头 ${scene.scene_index}` }}</span>
+                  <el-tag v-if="scene.stale_tail" type="warning" size="small">待续接</el-tag>
+                  <span class="scene-time">{{ scene.duration }} 秒</span>
+                </div>
+                <div class="scene-meta-right">
+                  <span class="speaker-label">角色：</span>
+                  <el-input
+                    v-model="scene.speaker"
+                    size="small"
+                    style="width: 120px"
+                    placeholder="说话人/角色"
+                  />
+                </div>
+              </div>
+
+              <div class="scene-item-body">
+                <el-input
+                  v-model="scene.voiceover"
+                  type="textarea"
+                  :rows="2"
+                  placeholder="分镜台词/口播文案"
+                  class="voiceover-input"
+                />
+              </div>
+
+              <label>台词起点（段内秒数）
+                <el-input-number v-model="scene.voice_start" :min="0" :max="Math.max(0, scene.duration - 0.1)" :step="0.1" size="small" />
+                <el-button size="small" plain :loading="polishingSceneId === scene.scene_id"
+                  :disabled="polishingSceneId !== null || retryingSceneId !== null"
+                  @click="polishDialogue(scene)">重新优化旁白</el-button>
+              </label>
+              </details>
+              <div v-if="scene.transition_type === 'continue_action'" class="handoff-frames">
+                <figure v-if="storyboardData.find(item => item.scene_index === scene.scene_index - 1)?.last_frame_path">
+                  <img :src="mediaUrl(storyboardData.find(item => item.scene_index === scene.scene_index - 1).last_frame_path)" alt="上一段实际尾帧" />
+                  <figcaption>上一段当前尾帧</figcaption>
+                </figure>
+                <figure v-if="scene.actual_first_frame_path || scene.continuity_input_path">
+                  <img :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path)" :alt="scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧'" />
+                  <figcaption>{{ scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧' }}</figcaption>
+                </figure>
+              </div>
+              <p v-if="scene.join_review?.review_suggested" class="scene-markers">
+                首尾帧画面差异较大，建议对照检查姿态和构图。
+              </p>
+              <details v-if="scene.video_path || scene.camera_plan" class="scene-markers">
+                <summary>运镜计划和动作时间点</summary>
+                <p v-if="scene.camera_plan">{{ scene.camera_plan.purpose }} · {{ scene.camera_plan.framing }} · {{ scene.camera_plan.focus }}</p>
+                <p v-if="scene.opening_frame_review?.reason">首帧检查：{{ scene.opening_frame_review.reason }}</p>
+                <video v-if="scene.video_path" :id="'clip-' + scene.scene_id" :src="mediaUrl(scene.video_path)" controls playsinline preload="none" />
+                <div v-for="beat in scene.observed_handoff?.plan?.motion_beats || scene.motion_beats || []" :key="beat.start" class="cue-row">
+                  <button type="button" @click="seekScene(scene, beat.start)">{{ beat.start }} 秒</button>
+                  <span>{{ beat.action }}</span>
+                </div>
+                <div v-if="scene.voiceover" class="cue-row">
+                  <button type="button" @click="seekScene(scene, scene.voice_start ?? 0)">{{ scene.voice_start ?? 0 }} 秒</button>
+                  <span>台词 · {{ scene.voice_cue || scene.voiceover }}</span>
+                </div>
+                <div v-for="(cue, index) in scene.sound_cues || []" :key="'sfx-' + index" class="cue-row">
+                  <button type="button" @click="seekScene(scene, cue.start)">{{ cue.start }} 秒</button>
+                  <span>音效 · {{ cue.name }}</span>
+                </div>
+              </details>
+              <p v-if="pendingClip === scene.scene_id" class="rerun-impact">{{ impactText(scene) }}</p>
+              <div class="scene-item-actions">
+                <details class="secondary-actions">
+                  <summary>更多操作</summary>
+                  <el-button size="small" :disabled="retryingSceneId !== null" @click="handleRerunScene(scene, 'voice')">重录配音</el-button>
+                  <el-button v-if="scene.transition_type !== 'continue_action'" size="small"
+                    :disabled="retryingSceneId !== null" @click="handleRerunScene(scene, 'image')">重生底图</el-button>
+                </details>
+                <el-button
+                  size="small"
+                  type="primary"
+                  :disabled="retryingSceneId !== null"
+                  @click="confirmClip(scene)"
+                >
+                  {{ pendingClip === scene.scene_id ? "确认重拍" : "重拍视频" }}
+                </el-button>
+              </div>
+            </div>
+          </div>
+        </el-card>
+      </div>
         <div class="detail-wrapper">
           <!-- Info Details Card -->
           <el-card class="detail-card info-card" shadow="never">
@@ -129,13 +254,16 @@
           </el-card>
         </div>
       </div>
+
+      <!-- OpenCut / OpenMontage: 分镜工作台与局部重生成 -->
     </div>
   </BasicLayout>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import BasicLayout from '../layouts/BasicLayout.vue'
 import VideoPlayerCard from '../components/VideoPlayerCard.vue'
 import { videoApi } from '../api/video'
@@ -148,6 +276,101 @@ const loading = ref(true)
 const taskDetail = ref(null)
 const scriptData = ref(null)
 const storyboardData = ref([])
+const retryingSceneId = ref(null)
+const polishingSceneId = ref(null)
+async function polishDialogue(scene) {
+  const draft = { voiceover: scene.voiceover || '', speaker: scene.speaker || '旁白', voice_start: scene.voice_start ?? 0 }
+  polishingSceneId.value = scene.scene_id
+  try {
+    const result = await videoApi.polishSceneDialogue(taskId, scene.scene_id, draft)
+    if ((scene.voiceover || '') !== draft.voiceover || (scene.speaker || '旁白') !== draft.speaker ||
+        (scene.voice_start ?? 0) !== draft.voice_start || !storyboardData.value.includes(scene)) {
+      ElMessage.warning('编辑内容已变动，请重新优化。')
+      return
+    }
+    scene.voiceover = result.voiceover
+    ElMessage.success('已填入新旁白，确认后可重录配音。')
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    polishingSceneId.value = null
+  }
+}
+const selectedClip = ref(null)
+const pendingClip = ref(null)
+const currentScene = computed(() => storyboardData.value.find(scene =>
+  scene.scene_id === selectedClip.value) || storyboardData.value[0])
+const timelineGroups = computed(() => {
+  const size = taskDetail.value?.generation_mode === 'paired_5s' ? 2 : 1
+  let end = 0
+  const items = storyboardData.value.map(scene => {
+    const start = end
+    end += Number(scene.duration) || 0
+    return { scene, start, end }
+  })
+  return Array.from({ length: Math.ceil(items.length / size) }, (_, i) =>
+    items.slice(i * size, (i + 1) * size))
+})
+const selectClip = ({ scene, start }) => {
+  selectedClip.value = scene.scene_id
+  pendingClip.value = null
+  const player = document.querySelector('.player-wrapper video')
+  if (player) player.currentTime = start
+}
+const impactText = scene => {
+  const next = storyboardData.value.find(item =>
+    Number(item.scene_index) === Number(scene.scene_index) + 1 &&
+    item.transition_type === 'continue_action')
+  return next
+    ? `将重拍镜头 ${scene.scene_index}。镜头 ${next.scene_index} 依赖它的尾帧，随后需要单独重拍才能合成。`
+    : `只重拍镜头 ${scene.scene_index}，其余片段沿用。`
+}
+const confirmClip = scene => {
+  if (pendingClip.value !== scene.scene_id) {
+    pendingClip.value = scene.scene_id
+    return
+  }
+  pendingClip.value = null
+  handleRerunScene(scene, 'video')
+}
+const seekScene = (scene, second) => {
+  const player = document.getElementById('clip-' + scene.scene_id)
+  if (player && Number.isFinite(Number(second))) player.currentTime = Number(second)
+}
+const mediaUrl = path => "/" + path.replace(/^backend\//, "")
+
+const handleRerunScene = async (scene, type) => {
+  retryingSceneId.value = scene.scene_id
+  const typeText = type === 'voice' ? '配音' : type === 'image' ? '底图' : '视频'
+  try {
+    ElMessage.info(`正在重新生成镜头 ${scene.scene_index} 的${typeText}...`)
+    const res = await videoApi.rerunScene(taskId, scene.scene_id, {
+      rerun_type: type,
+      voiceover: scene.voiceover,
+      speaker: scene.speaker,
+      voice_start: scene.voice_start ?? 0,
+    })
+    if (res?.pending_scenes?.length) {
+      ElMessage.warning(res.message)
+    } else {
+      ElMessage.success(`镜头 ${scene.scene_index} ${typeText}生成成功并已重新合成！`)
+    }
+    storyboardData.value = await videoApi.getStoryboard(taskId)
+    // 重新获取任务详情以刷新播放器
+    const data = await videoApi.getTask(taskId)
+    taskDetail.value = data
+    if (res?.scene) {
+      const idx = storyboardData.value.findIndex(s => s.scene_id === scene.scene_id)
+      if (idx !== -1) {
+        storyboardData.value[idx] = { ...storyboardData.value[idx], ...res.scene }
+      }
+    }
+  } catch (err) {
+    ElMessage.error(`镜头生成失败: ${err.message}`)
+  } finally {
+    retryingSceneId.value = null
+  }
+}
 
 const getModeText = (mode) => {
   const modes = {
@@ -398,4 +621,144 @@ onMounted(async () => {
 .main-action-btn:hover {
   background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
 }
+
+/* OpenCut / OpenMontage Studio Editing */
+.studio-editing-section {
+  margin-top: 32px;
+}
+
+.studio-card {
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.studio-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-tip {
+  font-size: 13px;
+  color: #64748b;
+  font-weight: normal;
+}
+
+.scenes-edit-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+  gap: 16px;
+}
+
+.scene-edit-item {
+  min-width: 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 14px;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: all 0.2s ease;
+}
+
+.scene-edit-item:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+.scene-item-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.scene-meta-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scene-badge {
+  background: #4f46e5;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.scene-time {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.scene-meta-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.speaker-label {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.scene-item-body {
+  width: 100%;
+}
+
+.voiceover-input {
+  font-size: 13px;
+}
+
+.scene-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.scene-item-actions :deep(.el-button) {
+  margin: 0;
+  max-width: 100%;
+  height: auto;
+  min-height: 24px;
+  white-space: normal;
+}
+.handoff-frames { display: flex; gap: 8px; }
+.handoff-frames figure { min-width: 0; flex: 1; margin: 0; font-size: 12px; }
+.handoff-frames img { width: 100%; height: 110px; object-fit: contain; background: #e2e8f0; }
+.scene-markers { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.scene-markers summary { cursor: pointer; }
+.scene-markers video { display: block; width: 100%; max-height: 220px; margin: 8px 0; background: #17253b; }
+.cue-row { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; }
+.cue-row button { flex: 0 0 auto; border: 1px solid #d7e3f4; border-radius: 5px; background: #eaf1fc; cursor: pointer; padding: 2px 5px; }
+
+.preview-grid { display:grid; grid-template-columns:minmax(0, 0.85fr) minmax(0, 1.15fr); align-items:start; gap:20px; }
+.preview-grid > * { min-width:0; }
+.preview-grid .detail-wrapper { grid-column:1 / -1; }
+.preview-grid .studio-editing-section { margin:0; }
+.player-wrapper :deep(.player-container) { background:#111827; border-radius:14px; }
+.player-wrapper :deep(video) { max-height:65vh; }
+.studio-header { flex-wrap:wrap; gap:8px; }
+.section-timeline { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%, 130px),1fr)); gap:8px; margin-bottom:16px; }
+.timeline-group { background:#f1f4fa; padding:10px; border-radius:10px; }
+.timeline-group small { color:#475569; }
+.timeline-clips { display:flex; flex-wrap:wrap; gap:5px; margin-top:6px; }
+.timeline-clips button { border:1px solid #cbd5e1; background:white; border-radius:6px; color:#334155; padding:5px 8px; cursor:pointer; }
+.timeline-clips button[aria-pressed="true"] { background:#4338ca; border-color:#4338ca; color:white; }
+.studio-card .scenes-edit-list { display:block; }
+.clip-overview { display:flex; gap:12px; align-items:center; margin-bottom:14px; overflow-wrap:anywhere; }
+.clip-overview img { width:64px; height:82px; flex:none; object-fit:cover; border-radius:8px; }
+.clip-overview p { margin-top:6px; color:#475569; }
+.clip-dialogue summary, .secondary-actions summary { cursor:pointer; color:#334155; padding:6px 0; }
+.scene-item-header, .scene-meta-right, .scene-item-actions { flex-wrap:wrap; }
+.scene-item-actions .el-button { margin:0; }
+.rerun-impact { background:#fff7ed; color:#9a3412; border-radius:8px; padding:10px; }
+@media (max-width: 850px) { .preview-grid { grid-template-columns:minmax(0,1fr); } }
 </style>

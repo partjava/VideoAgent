@@ -77,7 +77,8 @@
       "height": 704,
       "length": 160,
       "batch_size": 1,
-      "vae": ["39", 0]
+      "vae": ["39", 0],
+      "start_image": ["60", 0]
     },
     "class_type": "Wan22ImageToVideoLatent",
     "_meta": {"title": "Wan22ImageToVideoLatent"}
@@ -101,5 +102,10 @@
     },
     "class_type": "SaveVideo",
     "_meta": {"title": "Save Video"}
+  },
+  "60": {
+    "inputs": {"image": ""},
+    "class_type": "LoadImage",
+    "_meta": {"title": "Scene first frame"}
   }
 }

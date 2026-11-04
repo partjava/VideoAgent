@@ -35,7 +35,7 @@ class DialoguePolishAgent:
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
             if all(
-                scene.get("status") == "dialogue_done"
+                (scene.get("dialogue_polished") or scene.get("status") == "dialogue_done")
                 and scene.get("speaker")
                 and scene.get("voiceover")
                 for scene in task_scenes
@@ -43,6 +43,8 @@ class DialoguePolishAgent:
                 validate_storyboard_scenes(
                     task_scenes,
                     target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
+                    enforce_voiceover_density=False,
+                    whole=task.get("generation_mode") == "wan3_whole",
                 )
                 await mark_agent_success(
                     task_id,
@@ -75,6 +77,7 @@ class DialoguePolishAgent:
                     "voiceover": str(dialogue.get("voiceover") or "").strip(),
                     "subtitle": str(dialogue.get("subtitle") or dialogue.get("voiceover") or "").strip(),
                     "status": "dialogue_done",
+                    "dialogue_polished": True,
                     "updated_at": now,
                 }
                 scene.update(values)
@@ -84,6 +87,8 @@ class DialoguePolishAgent:
             validate_storyboard_scenes(
                 updated_scenes,
                 target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
+                enforce_voiceover_density=False,
+                whole=task.get("generation_mode") == "wan3_whole",
             )
 
             await mark_agent_success(

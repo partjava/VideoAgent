@@ -6,6 +6,7 @@ from core.database import mongodb
 from models.scene_model import Scene
 from models.task_model import VideoTaskStatus
 from services.provider_factory import get_llm_service
+from services.generation_contract import PAIRED_GENERATION_MODE, build_timeline, validate_paired_scenes, validate_scene_durations, voice_window, scene_event_offset
 
 from agents.agent_utils import (
     SCENES_COLLECTION,
@@ -29,54 +30,32 @@ def _minimum_voiceover_chars(duration: float) -> int:
     return max(6, int(duration * 2.5))
 
 
-def adjust_durations_to_target(scenes: list[dict[str, object]], target_duration: int) -> None:
-    if not scenes or not target_duration:
-        return
-    total = sum(int(s.get("duration") or 0) for s in scenes)
-    if total == target_duration:
-        return
-        
-    diff = target_duration - total
-    
-    # 仅在误差合理（<= 12秒）的情况下自动微调，过大则直接报错
-    if abs(diff) > 12:
-        return
-
-    if diff > 0:
-        # 需要加时间，依次加给前几个分镜
-        for i in range(diff):
-            idx = i % len(scenes)
-            scenes[idx]["duration"] = int(scenes[idx].get("duration") or 0) + 1
-    elif diff < 0:
-        # 需要减时间，依次扣减时长大于3秒的分镜，保持每个分镜至少3秒
-        to_reduce = abs(diff)
-        reduced = 0
-        for _ in range(100):  # 避免死循环
-            for scene in scenes:
-                curr = int(scene.get("duration") or 0)
-                if curr > 4:
-                    scene["duration"] = curr - 1
-                    reduced += 1
-                    if reduced == to_reduce:
-                        return
+def _maximum_voiceover_chars(duration: float) -> int:
+    return max(18, int(duration * 4.2))
 
 
 def validate_storyboard_scenes(
     scenes: list[dict[str, object]],
     target_duration: int | None = None,
     enforce_voiceover_density: bool = True,
+    whole: bool = False,
 ) -> None:
     if not scenes:
         raise ValueError("Storyboard is empty")
 
-    # 如果总时长超出范围，再尝试微调
-    if target_duration is not None:
-        total = sum(int(s.get("duration") or 0) for s in scenes)
-        if total < target_duration or total > target_duration + 30:
-            adjust_durations_to_target(scenes, target_duration)
-
-    total_duration = 0
-    for scene in scenes:
+    validate_scene_durations(scenes, target_duration, whole=whole)
+    build_timeline(scenes)
+    if [int(scene.get("scene_index", 0)) for scene in scenes] != list(range(1, len(scenes) + 1)):
+        raise ValueError("Storyboard indexes must be consecutive from 1")
+    for i, scene in enumerate(scenes):
+        transition = scene.get("transition_type") or "cut"
+        if transition not in {"cut", "continue_action", "scene_change"}:
+            raise ValueError(f"Invalid scene transition: {transition}")
+        if transition == "continue_action":
+            if i == 0 or not scenes[i - 1].get("end_state"):
+                raise ValueError("Continuous action requires a previous scene end state")
+            # Reuse one written state rather than separately inventing two sides of a cut.
+            scene["start_state"] = scenes[i - 1]["end_state"]
         scene_id = str(scene.get("scene_id") or "")
         voiceover = str(scene.get("voiceover") or "").strip()
         visual_description = str(scene.get("visual_description") or "").strip()
@@ -85,18 +64,25 @@ def validate_storyboard_scenes(
         transition_note = str(scene.get("transition_note") or "").strip()
         if not scene_id:
             raise ValueError("Storyboard scene_id is empty")
+        voice_window(scene)
+        for cue in scene.get("sound_cues") or []:
+            scene_event_offset(scene, cue["start"])
         duration = int(scene.get("duration") or 0)
-        if duration < 4:
-            raise ValueError(f"Storyboard duration too short: {scene_id} has {duration}s, minimum is 4s")
         if len(voiceover) < 2:
             raise ValueError(f"Storyboard voiceover is too short: {scene_id}")
-        if enforce_voiceover_density:
+        if enforce_voiceover_density and not scene.get("voiceover_repaired"):
             count = _spoken_char_count(voiceover)
             min_voiceover_chars = _minimum_voiceover_chars(float(duration))
+            max_voiceover_chars = _maximum_voiceover_chars(float(duration))
             if count < min_voiceover_chars:
                 raise ValueError(
                     f"Storyboard voiceover is too short for duration: "
                     f"{scene_id} needs at least {min_voiceover_chars} spoken chars"
+                )
+            if count > max_voiceover_chars:
+                raise ValueError(
+                    f"Storyboard voiceover is too long for duration: "
+                    f"{scene_id} exceeds {max_voiceover_chars} spoken chars (got {count})"
                 )
         if len(visual_description) < 6:
             raise ValueError(f"Storyboard visual_description is too short: {scene_id}")
@@ -108,12 +94,6 @@ def validate_storyboard_scenes(
             raise ValueError(f"Storyboard scene_continuity is too short: {scene_id}")
         if len(transition_note) < 2:
             raise ValueError(f"Storyboard transition_note is too short: {scene_id}")
-        total_duration += int(scene.get("duration") or 0)
-
-    if target_duration is not None and (total_duration < target_duration or total_duration > target_duration + 30):
-        raise ValueError(
-            f"Storyboard duration mismatch: expected {target_duration}~{target_duration + 30}s, got {total_duration}s"
-        )
 
 
 class StoryboardAgent:
@@ -149,10 +129,14 @@ class StoryboardAgent:
                 raise ValueError(f"Script not found for task: {task_id}")
 
             llm_service = get_llm_service()
-            _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else None
+            _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else 60
+            plan = task.get("metadata", {}).get("task_plan") or {}
+            storyboard_context = {**script, "video_type": plan.get("video_type", "story"),
+                                  "content_beats": plan.get("plot_beats", []), "characters": plan.get("characters", []),
+                                  "visual_world": plan.get("visual_world", "")}
             _generation_mode = str(task.get("generation_mode", "full_dynamic"))
             scenes_data = await anyio.to_thread.run_sync(
-                lambda _script=script, _td=_target_duration, _gm=_generation_mode:
+                lambda _script=storyboard_context, _td=_target_duration, _gm=_generation_mode:
                     llm_service.generate_storyboard(
                         _script,
                         target_duration=_td,
@@ -164,7 +148,11 @@ class StoryboardAgent:
                 scenes_data,
                 target_duration=target_duration,
                 enforce_voiceover_density=False,
+                whole=_generation_mode == "wan3_whole",
             )
+
+            if _generation_mode == PAIRED_GENERATION_MODE:
+                validate_paired_scenes(scenes_data, target_duration)
 
             saved_scenes: list[dict[str, object]] = []
             for item in scenes_data:
@@ -174,6 +162,12 @@ class StoryboardAgent:
                     task_id=task_id,
                     scene_index=int(item["scene_index"]),
                     duration=int(item["duration"]),
+                    voice_cue=item.get("voice_cue"),
+                    voice_start=item.get("voice_start", 0),
+                    sound_cues=item.get("sound_cues") or [],
+                    transition_type=str(item.get("transition_type") or "cut"),
+                    start_state=item.get("start_state"),
+                    end_state=item.get("end_state"),
                     speaker=item.get("speaker") if isinstance(item.get("speaker"), str) else None,
                     voiceover=item.get("voiceover") if isinstance(item.get("voiceover"), str) else None,
                     subtitle=item.get("subtitle") if isinstance(item.get("subtitle"), str) else None,

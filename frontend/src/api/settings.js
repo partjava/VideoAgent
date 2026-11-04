@@ -13,12 +13,24 @@ client.interceptors.response.use(
     return response.data
   },
   (error) => {
-    const msg = error.response?.data?.message || error.message || '请求失败'
+    const msg = (typeof error.response?.data?.detail === "string" && error.response.data.detail) || error.response?.data?.message || error.message || '请求失败'
     return Promise.reject(new Error(msg))
   }
 )
 
 export const settingsApi = {
+  getModels() {
+    return client.get('/models')
+  },
+  queryModels(kind, payload) {
+    return client.post(`/models/${kind}/catalog`, payload)
+  },
+  saveModel(kind, payload) {
+    return client.put(`/models/${kind}`, payload)
+  },
+  testModel(kind, payload) {
+    return client.post(`/models/${kind}/test`, payload)
+  },
   getKeys() {
     return client.get('/keys')
   },

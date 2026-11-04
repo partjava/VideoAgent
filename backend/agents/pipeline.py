@@ -2,7 +2,7 @@
 Pipeline 调度 — 使用 LangGraph StateGraph 编排 13 个智能体。
 
 每个 Agent 封装为图中的一个 Node，状态在节点间传递。
-QualityAgent 之后有条件分支：通过则导出，失败则回 EditorAgent 重试。
+QualityAgent 通过后导出；失败由任务记录具体原因。
 """
 from typing import Annotated, Any, Optional
 
@@ -147,25 +147,15 @@ async def export_node(state: PipelineState) -> dict:
 def route_to_parallel(state: PipelineState) -> list[Send]:
     """
     prompts 之后分叉为两条并行分支：
-      分支 A: images → video  (video 依赖 images)
-      分支 B: voice           (配音与画面生成无依赖)
+      分支 A: images
+      分支 B: voice
+    两条分支就绪后再提交视频生成。
     Send() 是 LangGraph 的并行启动机制，同时向两个节点发送状态。
     """
     return [
         Send("images", {"task_id": state["task_id"], "results": state.get("results", {})}),
         Send("voice", {"task_id": state["task_id"], "results": state.get("results", {})}),
     ]
-
-
-# ── 条件路由：质检通过 → 导出，失败 → 回编辑重试 ─────────────
-
-
-def route_after_quality(state: PipelineState) -> str:
-    quality_result = state["results"].get("quality", {})
-    if quality_result.get("status") == "success":
-        return "export"
-    print(f"[Pipeline] Quality check failed, retrying editor...")
-    return "editor"
 
 
 # ── 构建 LangGraph ──────────────────────────────────────────
@@ -196,24 +186,17 @@ def build_pipeline() -> StateGraph:
     workflow.add_edge("dialogue", "prompts")
 
     # 第二阶段：并行分叉（LangGraph Send）
-    #   prompts → images → video （分支 A，顺序执行）
-    #   prompts → voice         （分支 B，与 A 并行）
-    #   subtitle 等待两个分支都完成（屏障汇聚 / fan-in）
+    # 首帧与配音并行准备，确认配音能装进时间轴后再提交视频。
     workflow.add_conditional_edges("prompts", route_to_parallel, ["images", "voice"])
-    workflow.add_edge("images", "video")
+    workflow.add_edge(["images", "voice"], "video")
     workflow.add_edge("video", "subtitle")
-    # voice 独立运行，不触发 subtitle（避免时序错乱）
+
 
     # 第三阶段：串行（字幕 → 剪辑 → 质检 → 导出）
     workflow.add_edge("subtitle", "editor")
     workflow.add_edge("editor", "quality")
 
-    # 条件分支：质检通过→导出，失败→回编辑重试
-    workflow.add_conditional_edges(
-        "quality",
-        route_after_quality,
-        {"export": "export", "editor": "editor"},
-    )
+    workflow.add_edge("quality", "export")
 
     workflow.add_edge("export", END)
 

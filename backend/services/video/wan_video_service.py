@@ -1,17 +1,33 @@
+import json
+from hashlib import sha256
+import base64
+from io import BytesIO
 import os
 import time
 import httpx
 from pathlib import Path
 from typing import Any
 from config import settings
-from services.video.base import BaseVideoService
+from services.model_config import model_config, saved_models
+from services.video.base import BaseVideoService, VideoRenderRejected
 
 
 class WanVideoService(BaseVideoService):
+    def __init__(self, model=None, storage_root=None):
+        profile = model_config("video", settings)
+        self.model = profile["model"] if "video" in saved_models() else model or profile["model"]
+        self.api_key = profile["key"]
+        self.api_url = profile["url"]
+        self.storage_root = Path(storage_root) if storage_root is not None else Path(__file__).resolve().parents[2]
+
+    @property
+    def api_base(self):
+        return self.api_url
+
     def _upload_file(self, file_path: str) -> str:
-        upload_url = "https://dashscope.aliyuncs.com/api/v1/files"
+        upload_url = f"{self.api_base}/api/v1/files"
         headers = {
-            "Authorization": f"Bearer {settings.dashscope_api_key}"
+            "Authorization": f"Bearer {self.api_key}"
         }
         
         # 1. 上传本地文件，获取 file_id
@@ -20,7 +36,7 @@ class WanVideoService(BaseVideoService):
                 "purpose": "file-extract"
             }
             
-            with httpx.Client(timeout=45.0) as client:
+            with httpx.Client(timeout=60.0) as client:
                 res_data = None
                 max_retries = 5
                 retry_delay = 2.0
@@ -31,15 +47,22 @@ class WanVideoService(BaseVideoService):
                     files = {
                         "files": (os.path.basename(file_path), f, "image/png")
                     }
-                    res = client.post(upload_url, headers=headers, files=files, data=data)
-                    if res.status_code == 429:
-                        print(f"[WanVideoService] Received 429 during upload, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
+                    try:
+                        res = client.post(upload_url, headers=headers, files=files, data=data)
+                        if res.status_code == 429:
+                            print(f"[WanVideoService] Received 429 during upload, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        res.raise_for_status()
+                        res_data = res.json()
+                        break
+                    except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+                        if attempt == max_retries - 1:
+                            raise
+                        print(f"[WanVideoService] Upload network warning: {exc}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        retry_delay *= 2
-                        continue
-                    res.raise_for_status()
-                    res_data = res.json()
-                    break
+                        retry_delay *= 1.5
                 
                 if not res_data:
                     raise ValueError(f"File upload failed after retries.")
@@ -53,20 +76,27 @@ class WanVideoService(BaseVideoService):
                     raise ValueError(f"File upload response missing file_id: {res_data}")
 
                 # 2. 获取文件详情，拿到临时下载 URL
-                detail_url = f"https://dashscope.aliyuncs.com/api/v1/files/{file_id}"
+                detail_url = f"{self.api_base}/api/v1/files/{file_id}"
                 detail_data = None
                 retry_delay = 2.0
                 
                 for attempt in range(max_retries):
-                    detail_res = client.get(detail_url, headers=headers)
-                    if detail_res.status_code == 429:
-                        print(f"[WanVideoService] Received 429 during detail check, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
+                    try:
+                        detail_res = client.get(detail_url, headers=headers)
+                        if detail_res.status_code == 429:
+                            print(f"[WanVideoService] Received 429 during detail check, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        detail_res.raise_for_status()
+                        detail_data = detail_res.json()
+                        break
+                    except (httpx.TransportError, httpx.HTTPStatusError) as net_err:
+                        if attempt == max_retries - 1:
+                            raise
+                        print(f"[WanVideoService] Detail check network warning: {net_err}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        retry_delay *= 2
-                        continue
-                    detail_res.raise_for_status()
-                    detail_data = detail_res.json()
-                    break
+                        retry_delay *= 1.5
                 
                 if not detail_data:
                     raise ValueError(f"Failed to query file details after retries.")
@@ -88,67 +118,118 @@ class WanVideoService(BaseVideoService):
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true 开启。")
 
-        if not settings.dashscope_api_key:
+        if not self.api_key:
             raise ValueError("未找到 DASHSCOPE_API_KEY，请在环境变量中配置。")
 
         try:
             # 1. 如果是相对路径，则按 backend 根目录解析本地图片路径
-            backend_dir = Path(__file__).resolve().parents[2]
+            backend_dir = self.storage_root
             resolved_image_path = image_path
             if not Path(image_path).is_absolute():
                 # 如果数据库相对路径以 backend/ 开头，则先去掉这段前缀
                 clean_path = image_path.replace("backend/", "")
                 resolved_image_path = str(backend_dir / clean_path)
 
-            # 2. 上传本地首帧图片，获取公网 URL
-            public_image_url = self._upload_file(resolved_image_path)
+            flash = self.model == "wan2.6-i2v-flash"
+            wan3 = self.model in {"wan3.0-video", "wan3.0-video-prime"}
+            happyhorse = self.model.startswith("happyhorse-")
+            if (wan3 or happyhorse) and not 2 <= duration <= 30:
+                raise ValueError(f"{self.model} requires 2–30 seconds")
+            fingerprint = sha256(Path(resolved_image_path).read_bytes())
+            fingerprint.update(json.dumps([self.model, video_prompt, duration, ratio]).encode())
+            job_dir = backend_dir / "assets" / task_id / "video_jobs"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            job = job_dir / f"{scene_id}-{fingerprint.hexdigest()}.json"
+            api_task_id = None
+            if job.is_file():
+                api_task_id = json.loads(job.read_text(encoding="utf-8")).get("task_id")
+                if not api_task_id:
+                    raise RuntimeError("Previous Wan submission is unconfirmed. Check the provider console before retrying.")
+            # Both API versions use the first frame to determine the aspect ratio.
+            from tempfile import TemporaryDirectory
+            from services.media_quality import write_aspect_frame
+            with TemporaryDirectory(prefix="wan_frame_") as tmp:
+                normalized = Path(tmp) / "first_frame.png"
+                write_aspect_frame(resolved_image_path, normalized, ratio)
+                if flash or wan3 or happyhorse:
+                    from PIL import Image
+                    buffer = BytesIO()
+                    with Image.open(normalized) as frame:
+                        frame.convert("RGB").save(buffer, format="JPEG", quality=92)
+                    first_frame = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+                elif api_task_id:
+                    first_frame = None
+                else:
+                    first_frame = self._upload_file(str(normalized))
 
             # 3. 提交视频生成任务
-            submit_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis"
+            submit_url = f"{self.api_base}/api/v1/services/aigc/video-generation/video-synthesis"
             headers = {
-                "Authorization": f"Bearer {settings.dashscope_api_key}",
+                "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
                 "X-DashScope-Async": "enable"
             }
             payload = {
-                "model": settings.wan_video_model,
+                "model": self.model,
                 "input": {
                     "prompt": video_prompt or "smooth movement, high quality, consistent with character",
                     "media": [
                         {
                             "type": "first_frame",
-                            "url": public_image_url
+                            "url": first_frame
                         }
                     ]
                 },
                 "parameters": {
                     "resolution": "720P",
-                    "ratio": "9:16"
+                    "duration": duration
                 }
             }
 
-            with httpx.Client(timeout=30.0) as client:
-                res = client.post(submit_url, json=payload, headers=headers)
-                res.raise_for_status()
-                res_data = res.json()
-                
-                api_task_id = res_data.get("output", {}).get("task_id")
+            if flash:
+                payload["input"].pop("media")
+                payload["input"]["img_url"] = first_frame
+                payload["parameters"].update({"audio": False, "shot_type": "single"})
+
+            if wan3:
+                payload["parameters"].update({"ratio": ratio, "audio": False, "prompt_extend": False})
+
+            with httpx.Client(timeout=60.0) as client:
                 if not api_task_id:
-                    raise ValueError(f"Failed to submit video task: {res_data}")
+                    # Claim this exact render before POST. An ambiguous network failure must not cause a second POST.
+                    with job.open("x", encoding="utf-8") as handle:
+                        json.dump({"task_id": None}, handle)
+                    res = client.post(submit_url, json=payload, headers=headers)
+                    if 400 <= res.status_code < 500:
+                        job.unlink(missing_ok=True)
+                    res.raise_for_status()
+                    api_task_id = res.json().get("output", {}).get("task_id")
+                    if not api_task_id:
+                        raise RuntimeError("Wan did not return a task ID. Check provider status before retrying.")
+                    staged_job = job.with_suffix(".tmp")
+                    staged_job.write_text(json.dumps({"task_id": api_task_id}), encoding="utf-8")
+                    staged_job.replace(job)
 
                 # 4. 轮询任务状态
-                status_url = f"https://dashscope.aliyuncs.com/api/v1/tasks/{api_task_id}"
+                status_url = f"{self.api_base}/api/v1/tasks/{api_task_id}"
                 status_headers = {
-                    "Authorization": f"Bearer {settings.dashscope_api_key}"
+                    "Authorization": f"Bearer {self.api_key}"
                 }
                 
                 video_url = None
-                max_retries = 100
-                for _ in range(max_retries):
+                max_retries = 180 if wan3 else 100
+                for attempt in range(max_retries):
                     time.sleep(5)
-                    task_res = client.get(status_url, headers=status_headers)
-                    task_res.raise_for_status()
-                    task_data = task_res.json()
+                    try:
+                        task_res = client.get(status_url, headers=status_headers)
+                        if task_res.status_code == 429:
+                            time.sleep(3)
+                            continue
+                        task_res.raise_for_status()
+                        task_data = task_res.json()
+                    except (httpx.TransportError, httpx.HTTPError) as net_err:
+                        print(f"[WanVideoService] Polling warning on attempt {attempt+1}: {net_err}, retrying...")
+                        continue
                     
                     output = task_data.get("output", {})
                     task_status = output.get("task_status")
@@ -156,8 +237,9 @@ class WanVideoService(BaseVideoService):
                     if task_status == "SUCCEEDED":
                         video_url = output.get("video_url")
                         break
-                    elif task_status in ["FAILED", "UNKNOWN"]:
-                        raise ValueError(f"Video task failed: {output.get('message', 'unknown error')}")
+                    elif task_status in {"FAILED", "CANCELED"}:
+                        job.unlink(missing_ok=True)
+                        raise VideoRenderRejected(f"Video task failed: {output.get('message', 'unknown error')}")
 
                 if not video_url:
                     raise TimeoutError("Polling video synthesis task timed out.")
@@ -167,16 +249,26 @@ class WanVideoService(BaseVideoService):
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest_path = dest_dir / f"{scene_id}.mp4"
 
-                # 6. 下载生成的视频片段
-                vid_res = client.get(video_url, timeout=120.0)
-                vid_res.raise_for_status()
-                with open(dest_path, "wb") as f:
-                    f.write(vid_res.content)
+                # 6. 下载生成的视频片段（带重试保护）
+                max_dl_retries = 3
+                for dl_attempt in range(max_dl_retries):
+                    try:
+                        vid_res = client.get(video_url, timeout=120.0)
+                        vid_res.raise_for_status()
+                        with open(dest_path, "wb") as f:
+                            f.write(vid_res.content)
+                        break
+                    except (httpx.TransportError, httpx.HTTPError) as dl_err:
+                        if dl_attempt == max_dl_retries - 1:
+                            raise
+                        print(f"[WanVideoService] Video download warning (attempt {dl_attempt+1}): {dl_err}, retrying...")
+                        time.sleep(3)
 
                 relative_video_path = f"backend/assets/{task_id}/videos/{scene_id}.mp4"
 
                 return {
                     "source": "wan",
+                    "provider_task_id": api_task_id,
                     "provider": "wan_video",
                     "task_id": task_id,
                     "scene_id": scene_id,

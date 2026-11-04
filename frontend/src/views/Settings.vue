@@ -1,6 +1,10 @@
 <template>
   <BasicLayout>
   <div class="settings-page">
+    <h2 class="page-heading">模型配置</h2>
+    <ModelSettings />
+    <details class="legacy-config">
+      <summary>其他平台 API Key</summary>
     <div class="page-header">
       <h2 class="page-heading">API Key 配置</h2>
     </div>
@@ -127,6 +131,7 @@
         </div>
       </div>
     </el-card>
+  </details>
   </div>
   </BasicLayout>
 </template>
@@ -135,6 +140,7 @@
 import BasicLayout from '../layouts/BasicLayout.vue'
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import ModelSettings from '../components/ModelSettings.vue'
 import { settingsApi } from '../api/settings.js'
 
 const formRef = ref(null)
@@ -258,4 +264,6 @@ onMounted(() => { loadStatus() })
 .status-item { display: flex; align-items: center; gap: 16px; }
 .status-label { width: 160px; font-size: 14px; color: #334155; }
 .status-masked { font-size: 13px; color: #94a3b8; font-family: monospace; }
+.legacy-config { margin-top:24px; }
+.legacy-config summary { cursor:pointer; }
 </style>

@@ -1,4 +1,3 @@
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from models.task_model import VideoTaskStatus
@@ -39,7 +38,10 @@ class EditorAgent:
             assert_no_mock_assets(task_assets)
 
             # 建立分镜素材映射
-            video_clips = {a["scene_id"]: a["path"] for a in task_assets if a.get("asset_type") == "video_clip"}
+            video_clips = {}
+            for asset in task_assets:
+                if asset.get("asset_type") == "video_clip":
+                    video_clips.setdefault(asset["scene_id"], asset["path"])
             image_assets = {a["scene_id"]: a["path"] for a in task_assets if a.get("asset_type") == "image"}
             # 建立分镜独立配音映射 (每个分镜有自己独立的配音文件)
             scene_audio_map = {}
@@ -50,7 +52,9 @@ class EditorAgent:
             mixed_inputs = []
             for scene in task_scenes:
                 scene_id = str(scene["scene_id"])
-                if scene_id in video_clips:
+                if scene.get("status") == "static_fallback":
+                    mixed_inputs.append({"scene_id": scene_id, "type": "static_image", "path": scene["image_path"]})
+                elif scene_id in video_clips:
                     mixed_inputs.append({
                         "scene_id": scene_id,
                         "type": "dynamic_video",
@@ -70,178 +74,130 @@ class EditorAgent:
             relative_path = f"backend/outputs/{task_id}/final.mp4"
             output_file = backend_dir / "outputs" / task_id / "final.mp4"
 
-            # 3. 使用 MoviePy 进行真实视频合成
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-            synthesis_msg = "Video synthesis completed"
-            source_type = "moviepy"
-
-            try:
-                try:
-                    from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips, vfx
-                except ImportError:
-                    from moviepy import ImageClip, VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips, vfx
-
-                clips = []
-                audio_segments: list[AudioFileClip] = []
-                for item in mixed_inputs:
-                    scene_id = item["scene_id"]
-                    scene_doc = next((s for s in task_scenes if str(s["scene_id"]) == scene_id), {})
-                    duration = float(scene_doc.get("duration", 5.0))
-
-                    item_path = item["path"]
-                    if not Path(item_path).is_absolute():
-                        clean_item = item_path.replace("backend/", "")
-                        resolved_item_path = str(backend_dir / clean_item)
-                    else:
-                        resolved_item_path = item_path
-
-                    if not os.path.exists(resolved_item_path):
-                        if item["type"] == "static_image":
-                            print(f"[EditorAgent] Warning: asset file {resolved_item_path} not found. Creating placeholder on the fly.")
-                            try:
-                                from PIL import Image
-                                os.makedirs(os.path.dirname(resolved_item_path), exist_ok=True)
-                                # 生成一张柔和的中性色占位背景图
-                                img = Image.new('RGB', (720, 1280), color=(100, 116, 139))
-                                img.save(resolved_item_path)
-                            except Exception as placeholder_err:
-                                print(f"[EditorAgent] Failed to create dynamic placeholder image: {placeholder_err}")
-                                continue
-                        else:
-                            print(f"[EditorAgent] Warning: asset file {resolved_item_path} not found. Skipping.")
-                            continue
-
+            # All streams use the same scene timeline. No silent omissions.
+            from services.generation_contract import build_timeline, format_srt_time, needs_video, scene_event_offset, voice_speed, voice_window
+            from services.media_quality import resolve_media
+            from contextlib import ExitStack
+            import json
+            import subprocess
+            import imageio_ffmpeg
+            from PIL import Image, ImageOps
+            import numpy as np
+            from moviepy.editor import (ImageClip, VideoFileClip, AudioFileClip,
+                                        CompositeAudioClip, concatenate_videoclips, vfx)
+            timeline = build_timeline(task_scenes)
+            if len(mixed_inputs) != len(task_scenes):
+                raise ValueError("Missing scene media; refusing incomplete export")
+            task = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
+            aspect = (16, 9) if task.get("ratio") == "16:9" else (9, 16)
+            with ExitStack() as resources:
+                clips, audio_segments = [], []
+                canvas = None
+                for scene, item, row in zip(task_scenes, mixed_inputs, timeline):
+                    path = resolve_media(item["path"])
+                    if not path.is_file():
+                        raise FileNotFoundError(f"Missing scene media: {path}")
+                    duration = row["duration"]
                     if item["type"] == "dynamic_video":
-                        clip = VideoFileClip(resolved_item_path)
-                        # 去掉视频原声（AI 生成的视频自带环境音效，会和 TTS 串）
-                        clip = clip.without_audio() if hasattr(clip, 'without_audio') else clip.set_audio(None)
-                        if clip.duration != duration:
-                            end_t = min(clip.duration, duration)
-                            clip = clip.subclipped(0, end_t) if hasattr(clip, 'subclipped') else clip.subclip(0, end_t)
-                    else:
-                        clip = ImageClip(resolved_item_path)
-                        clip = clip.with_duration(duration) if hasattr(clip, 'with_duration') else clip.set_duration(duration)
-
-                    # 收集分镜独立配音片段（不挂到 clip 上，而是单独拼合音轨）
-                    if scene_id in scene_audio_map:
-                        audio_path_str = scene_audio_map[scene_id]
-                        if not Path(audio_path_str).is_absolute():
-                            clean_audio = audio_path_str.replace("backend/", "")
-                            resolved_audio = backend_dir / clean_audio
+                        source = resources.enter_context(VideoFileClip(str(path)))
+                        clip = source.without_audio()
+                        if source.duration < duration:
+                            if duration - source.duration > 0.5:
+                                raise ValueError(f"Scene {scene['scene_id']} video is too short: {source.duration}s for {duration}s")
+                            # Preserve the planned clock; hold only the final frame.
+                            still = ImageClip(source.get_frame(max(0, source.duration - 1 / (source.fps or 24)))).set_duration(duration - source.duration)
+                            clip = concatenate_videoclips([clip, still], method="compose")
                         else:
-                            resolved_audio = Path(audio_path_str)
-                        if resolved_audio.exists():
-                            try:
-                                seg = AudioFileClip(str(resolved_audio))
-                                # 如果配音比画面长，加快说话速度匹配视频时长
-                                orig_dur = seg.duration
-                                if orig_dur > clip.duration + 0.3:
-                                    speed = orig_dur / clip.duration
-                                    try:
-                                        seg = seg.fx(vfx.speedx, speed)
-                                    except (AttributeError, TypeError):
-                                        seg = seg.with_effects([vfx.MultiplySpeed(speed)])
-                                    print(f"[EditorAgent] Sped up audio {scene_id} ({orig_dur:.1f}s → {seg.duration:.1f}s, {speed:.2f}x)")
-                                audio_segments.append(seg)
-                                print(f"[EditorAgent] Collected audio for {scene_id}: {resolved_audio} (audio={seg.duration:.1f}s, clip={seg.duration:.1f}s)")
-                            except Exception as audio_err:
-                                print(f"[EditorAgent] Failed to load audio for {scene_id}: {audio_err}")
-
+                            clip = clip.subclip(0, duration)
+                    else:
+                        if needs_video(scene):
+                            raise ValueError(f"Dynamic scene has no video: {scene['scene_id']}")
+                        with Image.open(path) as image:
+                            clip = ImageClip(np.asarray(ImageOps.exif_transpose(image).convert("RGB"))).set_duration(duration)
+                            # Remotion / OpenMontage 风格：Ken Burns 缓慢平滑推镜（呼吸感动效）
+                            clip = clip.resize(lambda t: 1.0 + 0.05 * (t / max(0.1, duration)))
+                    if canvas is None:
+                        units = max(2, int(min(clip.w / aspect[0], clip.h / aspect[1], 120) // 2) * 2)
+                        canvas = (aspect[0] * units, aspect[1] * units)
+                    if tuple(clip.size) != canvas:
+                        clip = clip.fl_image(lambda frame: np.asarray(ImageOps.fit(
+                            Image.fromarray(frame), canvas, method=Image.Resampling.LANCZOS)))
                     clips.append(clip)
-
-                if clips:
-                    final_video = concatenate_videoclips(clips, method="compose")
-
-                    # 将各分镜的独立音轨拼成一条完整音轨，挂载到最终视频
-                    if audio_segments:
-                        try:
-                            final_audio = concatenate_audioclips(audio_segments)
-                            final_video = final_video.with_audio(final_audio) if hasattr(final_video, 'with_audio') else final_video.set_audio(final_audio)
-                            print(f"[EditorAgent] Composite audio track: {final_audio.duration:.1f}s, video: {final_video.duration:.1f}s")
-                        except Exception as ae:
-                            print(f"[EditorAgent] Audio composite failed: {ae}")
-                    else:
-                        print(f"[EditorAgent] No per-scene audio segments found, video will be silent")
-
-                    write_kwargs = {
-                        "fps": 24,
-                        "codec": "libx264",
-                        "audio_codec": "aac",
-                    }
-                    try:
-                        final_video.write_videofile(str(output_file), **write_kwargs, verbose=False, logger=None)
-                    except TypeError:
-                        final_video.write_videofile(str(output_file), **write_kwargs)
-
-
-                    for c in clips:
-                        c.close()
-                    final_video.close()
-
-                    # 5. 烧录字幕 (使用 python 挂载的 ffmpeg.exe)
-                    try:
-                        import subprocess
-                        import imageio_ffmpeg
-                        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                        subtitle_file = backend_dir / "outputs" / task_id / "subtitle.srt"
-
-                        if subtitle_file.exists():
-                            print(f"[EditorAgent] Subtitle file found: {subtitle_file}. Starting to burn subtitles via FFmpeg...")
-                            temp_output = backend_dir / "outputs" / task_id / "final_with_subs.mp4"
-                            task_dir = backend_dir / "outputs" / task_id
-
-                            # 使用 ffmpeg subtitles 滤镜烧录字幕， force_style 设置基础大小颜色和描边
-                            cmd = [
-                                ffmpeg_exe,
-                                "-y",
-                                "-i", "final.mp4",
-                                "-vf", "subtitles=subtitle.srt:force_style='FontSize=16,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2'",
-                                "final_with_subs.mp4"
-                            ]
-
-                            print(f"[EditorAgent] Running FFmpeg command: {' '.join(cmd)}")
-                            result = subprocess.run(
-                                cmd,
-                                cwd=str(task_dir),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                timeout=60.0
-                            )
-
-                            if result.returncode == 0 and temp_output.exists():
-                                # 成功后覆盖原 final.mp4
-                                if os.path.exists(str(output_file)):
-                                    try:
-                                        os.remove(str(output_file))
-                                    except Exception as del_err:
-                                        print(f"[EditorAgent] Warning: could not remove old final.mp4 directly: {del_err}")
-
-                                try:
-                                    os.rename(str(temp_output), str(output_file))
-                                    print("[EditorAgent] Subtitles successfully burned into the final video!")
-                                except Exception as rename_err:
-                                    # 如果重命名失败，尝试复制
-                                    import shutil
-                                    shutil.copy(str(temp_output), str(output_file))
-                                    os.remove(str(temp_output))
-                                    print("[EditorAgent] Subtitles copied and burned into final video.")
-                            else:
-                                print(f"[EditorAgent] FFmpeg failed with code {result.returncode}. Stderr: {result.stderr}")
-                        else:
-                            print(f"[EditorAgent] Warning: Subtitle file not found at {subtitle_file}. Skipping subtitle burn-in.")
-                    except Exception as sub_err:
-                        print(f"[EditorAgent] Error occurred during subtitle burn-in: {sub_err}")
-
-                    synthesis_msg = "Real video synthesis completed successfully via MoviePy with subtitles"
-                    source_type = "moviepy"
-                    print("[EditorAgent] Successfully compiled video using MoviePy.")
-                else:
-                    raise ValueError("No valid video/image clips to compile.")
-
-            except Exception as e:
-                raise RuntimeError(f"Real MoviePy synthesis failed: {e}") from e
+                    audio_path = scene_audio_map.get(scene["scene_id"])
+                    if str(scene.get("voiceover") or "").strip() and not audio_path:
+                        raise ValueError(f"Missing scene audio: {scene['scene_id']}")
+                    if audio_path:
+                        audio = resources.enter_context(AudioFileClip(str(resolve_media(audio_path))))
+                        offset, slot = voice_window(scene)
+                        speed = voice_speed(scene["scene_id"], audio.duration, slot)
+                        if speed != 1:
+                            audio = audio.fx(vfx.speedx, speed)
+                        # Absolute placement preserves silence and missing-dialogue gaps.
+                        audio_segments.append(audio.set_start(row["start"] + offset))
+                    for cue in scene.get("sound_cues") or []:
+                        name = cue["name"]
+                        if name not in {"footstep", "impact", "water", "paper", "wind"}:
+                            continue
+                        offset = scene_event_offset(scene, cue["start"])
+                        path = backend_dir / "data" / "sfx" / f"{name}.wav"
+                        if not path.is_file():
+                            continue
+                        effect = resources.enter_context(AudioFileClip(str(path)))
+                        effect = effect.subclip(0, min(effect.duration, duration - offset)).volumex(0.28)
+                        audio_segments.append(effect.set_start(row["start"] + offset))
+                final_video = concatenate_videoclips(clips, method="compose")
+                resources.callback(final_video.close)
+                if audio_segments:
+                    # MoneyPrinterTurbo 风格：BGM 背景音乐自动铺底与混音
+                    bgm_dir = backend_dir / "data" / "bgm"
+                    bgm_candidates = (list(bgm_dir.glob("*.mp3")) + list(bgm_dir.glob("*.wav"))) if bgm_dir.exists() else []
+                    bgm_file = task.get("bgm_path") or (str(bgm_candidates[0]) if bgm_candidates else None)
+                    if bgm_file and Path(bgm_file).is_file():
+                        from moviepy.audio.fx.all import audio_loop, volumex
+                        bgm = resources.enter_context(AudioFileClip(str(bgm_file)))
+                        bgm = audio_loop(bgm, duration=timeline[-1]["end"]).fx(volumex, 0.15)
+                        audio_segments.insert(0, bgm.set_start(0))
+                    final_audio = CompositeAudioClip(audio_segments).set_duration(timeline[-1]["end"])
+                    resources.callback(final_audio.close)
+                    final_video = final_video.set_audio(final_audio)
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+                # Separate render from published final to avoid stale-file success.
+                raw_file = output_file.with_name("render.mp4")
+                final_video.write_videofile(str(raw_file), fps=24, codec="libx264", audio_codec="aac",
+                                            temp_audiofile=str(output_file.with_name("render_audio.m4a")), logger=None)
+                subtitle_file = output_file.with_name("subtitle.srt")
+                if not subtitle_file.is_file():
+                    raise FileNotFoundError("Subtitle file missing")
+                staged = output_file.with_name("final_staged.mp4")
+                subtitle_style = (
+                    "FontName=SimSun,FontSize=20,MarginV=28,Outline=1.5,Shadow=0"
+                    if task.get("subtitle_style") == "poetry" else "FontSize=16,Outline=2"
+                )
+                filters = [f"subtitles=subtitle.srt:force_style='{subtitle_style}'"]
+                title = " ".join((task.get("intro_title") or "").split())
+                title = title.translate(str.maketrans("", "", "{}<>\\")).strip()
+                title_end = min(3.8, timeline[-1]["end"])
+                if title and title_end > 1.2:
+                    output_file.with_name("intro_title.srt").write_text(
+                        f"1\n{format_srt_time(1.2)} --> {format_srt_time(title_end)}\n{title}\n",
+                        encoding="utf-8",
+                    )
+                    filters.append(
+                        "subtitles=intro_title.srt:force_style='Alignment=8,FontSize=22,MarginV=34,Outline=2'"
+                    )
+                cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", raw_file.name,
+                       "-vf", ",".join(filters),
+                       "-c:a", "copy", staged.name]
+                result = subprocess.run(cmd, cwd=str(output_file.parent), capture_output=True, timeout=180)
+                if result.returncode:
+                    raise RuntimeError(f"Subtitle burn failed: {result.stderr.decode(errors='replace')[-1000:]}")
+                from services.media_quality import extract_tail
+                extract_tail(staged, output_file.with_name("cover.png"), min(1, timeline[-1]["end"]))
+                staged.replace(output_file)
+                raw_file.unlink(missing_ok=True)
+                output_file.with_name("timeline.json").write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
+            synthesis_msg = "Video composed with aligned scene audio and subtitles"
+            source_type = "moviepy"
 
             # 4. 保存最终视频素材记录
             now = datetime.now(UTC)

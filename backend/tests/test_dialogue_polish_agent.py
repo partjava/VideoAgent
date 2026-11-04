@@ -12,7 +12,7 @@ class FakeMongo:
     def __init__(self):
         self.updated = []
 
-    async def find_many(self, collection_name, limit=50, sort_field="created_at", sort_direction=-1):
+    async def find_many(self, collection_name, query=None, limit=50, sort_field="created_at", sort_direction=-1):
         if collection_name != "scenes":
             return []
         return [

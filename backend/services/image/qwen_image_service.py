@@ -3,6 +3,7 @@ import httpx
 from pathlib import Path
 from typing import Any
 from config import settings
+from services.model_config import model_config
 from services.image.base import BaseImageService
 
 
@@ -18,20 +19,21 @@ class QwenImageService(BaseImageService):
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true 开启。")
 
-        if not settings.dashscope_api_key:
+        profile = model_config("image", settings)
+        if not profile["key"]:
             raise ValueError("未找到 DASHSCOPE_API_KEY，请在环境变量中配置。")
 
         try:
             # 1. 同步提交文生图任务（不使用异步请求头）
-            submit_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+            submit_url = f"{profile['url']}/api/v1/services/aigc/multimodal-generation/generation"
             headers = {
-                "Authorization": f"Bearer {settings.dashscope_api_key}",
+                "Authorization": f"Bearer {profile['key']}",
                 "Content-Type": "application/json"
             }
             
             content_list = [{"text": image_prompt}]
             payload = {
-                "model": settings.qwen_image_model,
+                "model": profile["model"],
                 "input": {
                     "messages": [
                         {

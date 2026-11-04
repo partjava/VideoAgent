@@ -1,6 +1,7 @@
 import os
 
 from config import settings
+from services.model_config import saved_models
 from services.image.base import BaseImageService
 from services.llm.base import BaseLLMService
 from services.video.base import BaseVideoService
@@ -20,7 +21,7 @@ def get_llm_service() -> BaseLLMService:
 
 
 def get_image_service() -> BaseImageService:
-    provider = _runtime_provider("IMAGE_PROVIDER", settings.image_provider)
+    provider = "qwen" if "image" in saved_models() else _runtime_provider("IMAGE_PROVIDER", settings.image_provider)
     if provider == "qwen":
         from services.image.qwen_image_service import QwenImageService
 
@@ -37,7 +38,7 @@ def get_image_service() -> BaseImageService:
 
 
 def get_video_service() -> BaseVideoService:
-    provider = _runtime_provider("VIDEO_PROVIDER", settings.video_provider)
+    provider = "wan" if "video" in saved_models() else _runtime_provider("VIDEO_PROVIDER", settings.video_provider)
     if provider == "vidu":
         from services.video.vidu_video_service import ViduVideoService
 

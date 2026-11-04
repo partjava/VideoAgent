@@ -42,6 +42,7 @@ async def mark_agent_start(
     status: VideoTaskStatus | str | None = None,
 ) -> None:
     values: dict[str, Any] = {
+        f"metadata.stage_states.{agent_name}": "running",
         "current_agent": agent_name,
         "progress": progress,
         "updated_at": datetime.now(UTC),
@@ -61,6 +62,7 @@ async def mark_agent_success(
     extra_fields: dict[str, Any] | None = None,
 ) -> None:
     values: dict[str, Any] = {
+        f"metadata.stage_states.{agent_name}": "success",
         "current_agent": agent_name,
         "progress": progress,
         "updated_at": datetime.now(UTC),
@@ -84,6 +86,7 @@ async def mark_agent_failed(task_id: str, agent_name: str, error: Exception) -> 
         {
             "status": VideoTaskStatus.FAILED.value,
             "current_agent": agent_name,
+            f"metadata.stage_states.{agent_name}": "failed",
             "metadata.last_error": str(error),
             "updated_at": datetime.now(UTC),
         },

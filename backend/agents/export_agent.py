@@ -30,7 +30,7 @@ class ExportAgent:
                 output_id=output_id,
                 task_id=task_id,
                 video_path=video_path,
-                cover_path=None,
+                cover_path=f"backend/outputs/{task_id}/cover.png",
                 subtitle_path=subtitle_path,
                 script_path=None,
                 storyboard_path=None,
@@ -69,6 +69,7 @@ class ExportAgent:
                     "metadata.video_path": video_path,
                     "metadata.subtitle_path": subtitle_path,
                     "metadata.output_id": output_id,
+                    "metadata.cover_path": f"backend/outputs/{task_id}/cover.png",
                 },
             )
             return result

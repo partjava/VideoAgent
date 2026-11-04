@@ -5,5 +5,6 @@
   "width": {"node": "55", "path": "inputs.width"},
   "height": {"node": "55", "path": "inputs.height"},
   "length": {"node": "55", "path": "inputs.length"},
-  "fps": {"node": "57", "path": "inputs.fps"}
+  "fps": {"node": "57", "path": "inputs.fps"},
+  "image_path": {"node": "60", "path": "inputs.image"}
 }

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
-from services.video.base import BaseVideoService
+from services.video.base import BaseVideoService, VideoRenderRejected
 
 
 class DoubaoVideoService(BaseVideoService):
@@ -119,7 +119,9 @@ class DoubaoVideoService(BaseVideoService):
 
             # 3. 提交图生视频任务
             # Seedance 最低支持 4 秒，最高 12 秒
-            clamped_duration = max(4, min(duration, 12))
+            if not 4 <= duration <= 12:
+                raise ValueError("Video duration must be between 4 and 12 seconds")
+            clamped_duration = duration
             # 自动替换可能触发审核的敏感词
             safe_prompt = self._sanitize_prompt(video_prompt or "")
             if safe_prompt != video_prompt:
@@ -150,6 +152,9 @@ class DoubaoVideoService(BaseVideoService):
                 res = client.post(
                     submit_url, json=payload, headers=self._get_headers()
                 )
+                if res.status_code == 429:
+                    time.sleep(2)
+                    res = client.post(submit_url, json=payload, headers=self._get_headers())
                 res.raise_for_status()
                 res_data = res.json()
 
@@ -178,7 +183,7 @@ class DoubaoVideoService(BaseVideoService):
                     elif state == "failed":
                         err = poll_data.get("error", {})
                         err_msg = err.get("message", "unknown error")
-                        raise ValueError(
+                        raise VideoRenderRejected(
                             f"Doubao 视频生成失败: {err_msg}"
                         )
                     # state 为 queued / running 则继续等待

@@ -50,6 +50,8 @@ class TaskService:
             platform=payload.platform,
             ratio=payload.ratio,
             generation_mode=payload.generation_mode,
+            intro_title=payload.intro_title,
+            subtitle_style=payload.subtitle_style,
             provider_mode="real",
             status=VideoTaskStatus.CREATED,
             progress=0,

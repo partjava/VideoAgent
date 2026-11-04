@@ -26,9 +26,7 @@ build/
 Thumbs.db
 
 # Backend generated assets
-backend/assets/*/videos/
-backend/assets/*/images/
-backend/assets/*/audio/
+backend/assets/
 backend/outputs/
 
 # Node / Frontend
@@ -46,3 +44,5 @@ backend/data/comfyui/test_history.json
 
 # Temp debug files
 comfyui_*.json
+
+backend/.env.models.local

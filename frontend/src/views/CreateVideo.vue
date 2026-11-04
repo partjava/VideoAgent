@@ -2,10 +2,16 @@
   <BasicLayout>
     <div class="create-video-page">
       <div class="header-intro">
-        <h1 class="page-main-title">生成 AI 短视频</h1>
+        <span class="studio-label">VIDEO STUDIO / NEW PROJECT</span>
+        <h1 class="page-main-title">一句话，开始拍片</h1>
         <p class="page-subtitle">
-          输入一个剧情创意，系统会自动完成编剧、分镜、绘图、视频生成、配音、字幕和合成。
+          描述一个故事、科普主题或产品创意，接下来可以在工作台查看每一步。
+
         </p>
+      </div>
+
+      <div class="creation-flow" aria-label="制作流程">
+        <span>01 创意与脚本</span><span>02 分镜与素材</span><span>03 剪辑与导出</span>
       </div>
 
       <div class="form-wrapper">
@@ -44,9 +50,7 @@ const handleCreateTask = async (formData) => {
     const taskResult = await videoApi.createTask(formData)
     const taskId = taskResult.task_id
 
-    videoApi.runPipeline(taskId).catch(err => {
-      console.warn('Pipeline trigger failed:', err)
-    })
+    await videoApi.runPipeline(taskId)
 
     router.push(`/progress/${taskId}`)
   } catch (error) {
@@ -90,4 +94,11 @@ const handleCreateTask = async (formData) => {
   margin-top: 16px;
   border-radius: 8px;
 }
+.create-video-page { max-width: 1050px; margin: auto; }
+.header-intro { background: radial-gradient(ellipse at 94% 10%, #38506a 0%, transparent 55%), linear-gradient(125deg, #101b30, #20304b); padding: clamp(23px, 4vw, 46px); border-radius: 23px; }
+.studio-label { color: #baf873; font-size: 11px; font-weight: 750; letter-spacing: .16em; }
+.header-intro .page-main-title { color: #f6f8ff; font-size: clamp(26px, 4vw, 44px); margin: 9px 0 8px; }
+.header-intro .page-subtitle { color: #c2d0e4; line-height: 1.65; }
+.creation-flow { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.creation-flow span { padding: 7px 12px; background: #eaf1fc; color: #324c72; border-radius: 7px; font-size: 12px; font-weight: 650; }
 </style>

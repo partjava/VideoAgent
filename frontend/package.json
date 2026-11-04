@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
+    "@rolldown/binding-linux-x64-gnu": "^1.2.16",
     "axios": "^1.18.1",
     "element-plus": "^2.14.2",
     "vue": "^3.5.39",

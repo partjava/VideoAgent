@@ -33,7 +33,11 @@ class ImageAgent:
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
 
-            task_scenes = task_scenes[: settings.max_images_per_task]
+            from services.generation_contract import needs_video
+            task_scenes = [scene for scene in task_scenes
+                           if not (needs_video(scene) and scene.get("transition_type") == "continue_action")]
+            if len(task_scenes) > settings.max_images_per_task:
+                raise ValueError("Storyboard exceeds the configured image limit")
             image_service = get_image_service()
             # 获取任务比例，后续传给生图服务
             task = await mongodb.find_one("video_tasks", {"_id": task_id})
@@ -52,7 +56,9 @@ class ImageAgent:
                 if existing_path:
                     clean_path = str(existing_path).replace("backend/", "")
                     abs_path = backend_dir / clean_path
-                    if abs_path.exists():
+                    if abs_path.is_file():
+                        if scene.get("status") == "static_fallback":
+                            continue
                         existing_asset = await mongodb.find_one(
                             ASSETS_COLLECTION,
                             {"task_id": task_id, "scene_id": scene_id, "asset_type": "image"}
@@ -105,22 +111,12 @@ class ImageAgent:
 
             sem = anyio.Semaphore(4)  # 限制最多 4 个并发，避免打满线程池
 
-            async def _bounded_generate(scene: dict) -> dict | None:
-                async with sem:
-                    return await _generate_one(scene)
-
-            results = await asyncio.gather(
-                *[_bounded_generate(s) for s in scenes_to_generate],
-                return_exceptions=False,
-            )
-
-            # ── 保存生成结果 ──────────────────────────────────────
-            success_count = 0
-            for scene, image_result in zip(scenes_to_generate, results):
+            async def _generate_and_save(scene: dict) -> str | None:
                 scene_id = str(scene["scene_id"])
-                if image_result is None:
-                    print(f"[ImageAgent] Skipping asset save for {scene_id} due to generation failure.")
-                    continue
+                async with sem:
+                    image_result = await _generate_one(scene)
+                if not image_result or image_result.get("status") != "success" or not image_result.get("asset_path"):
+                    return scene_id
 
                 asset = Asset(
                     asset_id=f"asset_{uuid4().hex[:12]}",
@@ -144,10 +140,18 @@ class ImageAgent:
                     },
                 )
                 assets.append(asset.model_dump())
-                success_count += 1
 
-            if success_count == 0:
-                raise RuntimeError("All image generation tasks failed.")
+                return None
+
+            results = await asyncio.gather(
+                *(_generate_and_save(scene) for scene in scenes_to_generate), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            failed = [result for result in results if result is not None]
+            if failed:
+                raise RuntimeError(f"Missing generated images: {', '.join(failed)}")
 
             await mark_agent_success(
                 task_id,

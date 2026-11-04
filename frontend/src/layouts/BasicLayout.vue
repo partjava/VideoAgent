@@ -14,19 +14,19 @@
         text-color="#475569"
         active-text-color="#4f46e5"
       >
-        <el-menu-item index="/">
+        <el-menu-item index="/" aria-label="创建视频">
           <el-icon><Plus /></el-icon>
           <span>创建视频</span>
         </el-menu-item>
-        <el-menu-item index="/history">
+        <el-menu-item index="/history" aria-label="历史任务">
           <el-icon><Collection /></el-icon>
           <span>历史任务</span>
         </el-menu-item>
-        <el-menu-item index="/settings">
+        <el-menu-item index="/settings" aria-label="API 配置">
           <el-icon><Setting /></el-icon>
           <span>API 配置</span>
         </el-menu-item>
-        <el-menu-item index="/comfyui">
+        <el-menu-item index="/comfyui" aria-label="ComfyUI">
           <el-icon><Connection /></el-icon>
           <span>ComfyUI</span>
         </el-menu-item>
@@ -160,5 +160,15 @@ const currentTitle = computed(() => {
 .content-wrapper {
   max-width: 100%;
   margin: 0;
+}
+@media (max-width: 760px) {
+  .aside-menu { width: 58px !important; }
+  .logo-area { padding: 0; justify-content: center; }
+  .logo-title, .el-menu-item span, .tech-tag { display: none; }
+  .el-menu-vertical { padding: 12px 4px; }
+  .el-menu-item { padding: 0 !important; justify-content: center; }
+  .el-menu-item :deep(.el-icon) { margin-right: 0; }
+  .top-header { padding: 0 14px; }
+  .main-content { padding: 12px; }
 }
 </style>

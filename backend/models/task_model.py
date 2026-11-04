@@ -29,6 +29,8 @@ class VideoTask(BaseModel):
     style: str | None = Field(default=None, description="Video style")
     platform: str | None = Field(default=None, description="Target publishing platform")
     ratio: str | None = Field(default="9:16", description="Video aspect ratio")
+    intro_title: str | None = Field(default=None, max_length=60)
+    subtitle_style: str = "standard"
     generation_mode: str = Field(default="full_dynamic", description="Video generation mode")
     status: VideoTaskStatus = Field(default=VideoTaskStatus.CREATED)
     progress: int = Field(default=0, ge=0, le=100)
@@ -45,6 +47,8 @@ class CreateVideoTaskRequest(BaseModel):
     style: str | None = None
     platform: str | None = None
     ratio: str = "9:16"
+    intro_title: str | None = Field(default=None, max_length=60)
+    subtitle_style: str = "standard"
     generation_mode: str = "full_dynamic"
 
 
@@ -60,3 +64,11 @@ class VideoTaskProgressResponse(BaseModel):
     progress: int
     current_agent: str | None
     message: str
+
+
+class RerunSceneRequest(BaseModel):
+    rerun_type: str = "voice"  # "voice" | "image" | "video" | "all"
+    voiceover: str | None = None
+    speaker: str | None = None
+    prompt: str | None = None
+    voice_start: float | None = Field(default=None, ge=0)

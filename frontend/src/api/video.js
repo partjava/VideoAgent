@@ -59,5 +59,14 @@ export const videoApi = {
   // Delete a task
   deleteTask(taskId) {
     return client.delete(`/${taskId}`)
+  },
+
+  // Rerun or edit single scene asset (OpenCut / OpenMontage style)
+  polishSceneDialogue(taskId, sceneId, payload) {
+    return client.post(`/${taskId}/scene/${sceneId}/polish-dialogue`, payload, { timeout: 120000 })
+  },
+
+  rerunScene(taskId, sceneId, payload) {
+    return client.post(`/${taskId}/scene/${sceneId}/rerun`, payload)
   }
 }

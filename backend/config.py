@@ -25,6 +25,8 @@ class Settings:
     deepseek_api_key: str | None = os.getenv("DEEPSEEK_API_KEY")
     enable_paid_api: bool = os.getenv("ENABLE_PAID_API", "false").lower() == "true"
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    dashscope_api_base: str = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com").rstrip("/")
+    video_review_model: str = os.getenv("VIDEO_REVIEW_MODEL", "")
     dashscope_api_key: str | None = os.getenv("DASHSCOPE_API_KEY", os.getenv("QWEN_API_KEY"))
     max_images_per_task: int = int(os.getenv("MAX_IMAGES_PER_TASK", "20"))
     max_video_seconds_per_task: int = int(os.getenv("MAX_VIDEO_SECONDS_PER_TASK", "600"))

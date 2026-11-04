@@ -9,6 +9,32 @@ from services.comfyui.workflow_store import WorkflowStore
 from services.video.base import BaseVideoService
 
 
+def prepare_video_workflow(data, client, image_path, prompt, duration, ratio):
+    import math
+    mapping, workflow = data["mapping"], data["workflow"]
+    required = {"positive_prompt", "image_path", "width", "height", "length", "fps"}
+    if not required.issubset(mapping):
+        raise ValueError(f"Missing required video mappings: {sorted(required - set(mapping))}")
+    if not 4 <= duration <= 12 or ratio not in {"9:16", "16:9"}:
+        raise ValueError("Unsupported video duration or aspect ratio")
+    # Validate mappings before any upload or queue operation.
+    fps_mapping = mapping["fps"]
+    fps_node = workflow.get(str(fps_mapping["node"]), {})
+    fps = fps_node
+    for key in fps_mapping["path"].split("."):
+        fps = fps.get(key, {}) if isinstance(fps, dict) else None
+    if not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("Workflow fps must be positive")
+    # Wan temporal VAE uses 4n+1 frames; retain at least requested duration.
+    length = math.ceil((duration * fps - 1) / 4) * 4 + 1
+    width, height = (704, 1280) if ratio == "9:16" else (1280, 704)
+    values = {"positive_prompt": prompt, "image_path": "validation.png", "width": width,
+              "height": height, "length": length, "fps": fps}
+    apply_mapping(workflow, mapping, values)
+    values["image_path"] = client.upload_image(image_path)
+    return apply_mapping(workflow, mapping, values)
+
+
 class ComfyUIVideoService(BaseVideoService):
     def __init__(
         self,
@@ -29,15 +55,9 @@ class ComfyUIVideoService(BaseVideoService):
     ) -> dict[str, Any]:
         try:
             data = self.workflow_store.load_workflow("video")
-            workflow = apply_mapping(
-                data["workflow"],
-                data["mapping"],
-                {
-                    "positive_prompt": video_prompt,
-                    "image_path": image_path,
-                    "duration": duration,
-                },
-            )
+            from services.media_quality import resolve_media, inspect_video
+            workflow = prepare_video_workflow(data, self.client, resolve_media(image_path), video_prompt,
+                                              duration, ratio)
             prompt_id = self.client.queue_prompt(workflow)
             history = self.client.wait_for_history(prompt_id)
             outputs = find_output_files(history, "videos")
@@ -54,7 +74,11 @@ class ComfyUIVideoService(BaseVideoService):
 
             backend_dir = Path(__file__).resolve().parents[2]
             dest_path = backend_dir / "assets" / task_id / "videos" / f"{scene_id}.mp4"
-            self.client.download_output(outputs[0], dest_path)
+            candidates = [o for o in outputs if Path(o.get("filename", "")).suffix.lower() == ".mp4"]
+            if not candidates:
+                raise ValueError("Workflow must return an MP4 video")
+            self.client.download_output(candidates[0], dest_path)
+            media = inspect_video(dest_path)
             relative_video_path = f"backend/assets/{task_id}/videos/{scene_id}.mp4"
 
             return {
@@ -67,6 +91,7 @@ class ComfyUIVideoService(BaseVideoService):
                 "image_path": image_path,
                 "video_prompt": video_prompt,
                 "duration": duration,
+                "actual_duration": media["duration"],
                 "status": "success",
                 "message": "Video generated successfully via ComfyUI.",
             }

@@ -2,6 +2,10 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+class VideoRenderRejected(RuntimeError):
+    """The provider confirmed that the submitted shot failed."""
+
+
 class BaseVideoService(ABC):
     @abstractmethod
     def generate_video(

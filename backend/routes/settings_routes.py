@@ -220,3 +220,131 @@ async def test_api_keys(payload: dict) -> JSONResponse:
         results["vidu_api_token"] = {"ok": True, "msg": "未填写（可选）"}
 
     return JSONResponse(content={"status": "success", "data": results})
+
+from typing import Literal
+
+import httpx
+from fastapi import HTTPException
+from pydantic import BaseModel, SecretStr
+
+from services.model_config import KINDS, model_config, save_models, saved_models, validate_config
+
+
+class ModelInput(BaseModel):
+    url: str
+    model: str
+    key: SecretStr | None = None
+
+
+def effective_model(kind, payload):
+    current = model_config(kind)
+    url = payload.url.strip().rstrip("/")
+    key = payload.key.get_secret_value().strip() if payload.key else ""
+    if not key and url == current["url"]:
+        key = current["key"]
+    try:
+        return validate_config({"url": url, "model": payload.model.strip(), "key": key})
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+
+
+@router.get("/models")
+def get_models():
+    models = {}
+    configured = saved_models()
+    for kind in KINDS:
+        config = model_config(kind)
+        models[kind] = {"url": config["url"], "model": config["model"],
+                        "has_key": bool(config["key"]), "active": kind in configured}
+    return {"status": "success", "data": models}
+
+
+@router.put("/models/{kind}")
+async def put_model(kind: Literal["prompt", "image", "video"], payload: ModelInput):
+    config = effective_model(kind, payload)
+    if not config["key"]:
+        raise HTTPException(422, detail="Enter a key for this URL.")
+    models = saved_models()
+    models[kind] = config
+    save_models(models)
+    return {"status": "success", "data": {"has_key": True, "active": True}}
+
+
+@router.post("/models/{kind}/test")
+async def test_model(kind: Literal["prompt", "image", "video"], payload: ModelInput):
+    config = effective_model(kind, payload)
+    if not config["key"]:
+        raise HTTPException(422, detail="Enter a key for this URL.")
+    path = "/models" if kind == "prompt" else "/api/v1/files"
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            response = await client.get(
+                config["url"] + path, headers={"Authorization": f"Bearer {config['key']}"}
+            )
+    except httpx.TimeoutException:
+        result = "timeout"
+    except (httpx.RequestError, ValueError):
+        result = "unreachable"
+    else:
+        if response.status_code in (401, 403):
+            result = "denied"
+        elif response.status_code == 402:
+            result = "balance"
+        elif response.is_success:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if kind == "prompt" and isinstance(body, dict) and isinstance(body.get("data"), list):
+                result = "model_listed" if any(
+                    isinstance(item, dict) and item.get("id") == config["model"]
+                    for item in body["data"]
+                ) else "model_unlisted"
+            elif kind != "prompt" and isinstance(body, dict) and "output" in body:
+                result = "authenticated"
+            else:
+                result = "unconfirmed"
+        elif response.status_code in (404, 405):
+            result = "unconfirmed"
+        else:
+            result = "http_error"
+    return {"status": "success", "data": {"result": result}}
+
+@router.post("/models/{kind}/catalog")
+async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload: ModelInput):
+    # Catalog lookup only requires a URL and credential, even when no model is selected.
+    config = effective_model(kind, payload.model_copy(update={"model": "catalog"}))
+    if not config["key"]:
+        raise HTTPException(422, detail="Enter a key for this URL.")
+    base = config["url"]
+    path = "/models" if kind == "prompt" else "/compatible-mode/v1/models"
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            response = await client.get(
+                base + path, headers={"Authorization": f"Bearer {config['key']}"}
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, detail="Model catalog request timed out.") from exc
+    except (httpx.RequestError, ValueError) as exc:
+        raise HTTPException(502, detail="Could not connect to the model catalog.") from exc
+
+    if response.status_code in (401, 403):
+        raise HTTPException(422, detail="The catalog rejected this key or workspace.")
+    if response.status_code in (404, 405, 501):
+        return {"status": "success", "data": {"models": [], "available": False}}
+    if not response.is_success:
+        raise HTTPException(502, detail=f"Model catalog returned HTTP {response.status_code}.")
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    items = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return {"status": "success", "data": {"models": [], "available": False}}
+    prefixes = {"image": ("qwen-image",), "video": ("wan",)}
+    models = sorted({
+        item["id"] for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+        and (kind == "prompt" or item["id"].lower().startswith(prefixes[kind]))
+    })
+    return {"status": "success", "data": {"models": models, "available": True}}

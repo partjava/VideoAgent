@@ -23,6 +23,21 @@
 
 ---
 
+## 核心技术特性与 GitHub Top 视频 Skills 融合
+
+本项目深度吸收并工程化融合了开源社区最顶尖的视频生成与剪辑 Skills（如 `MoneyPrinterTurbo`、`OpenCut`、`Remotion`、`OpenMontage`、`video-shotcraft`、`seedance2-skill`）：
+
+| 借鉴开源 Skill | 解决的痛点 | 本项目工程化落地机制 |
+| :--- | :--- | :--- |
+| **`seedance2-skill`** | AI 生成动作平淡、五官微抽、角色漂移 | **三段式动作动力学（Action Arc）**：前1/3时长蓄力起手 $\rightarrow$ 中1/3时长核心爆发与物体形变 $\rightarrow$ 后1/3时长动能结算定格；单镜头单一焦点律；环境物理受力联动（衣摆翻飞、纸张掀起、冷光反光）。 |
+| **`video-shotcraft`** | 运镜指令死板、缺乏影视镜头感 | **专业镜头配方卡（Shotcraft Recipe）**：规范 6 级景别（EWS/FS/MS/MCU/CU/ECU）与标准化摄影机运镜动词（Dolly In、Tracking Pan、Low-angle Tilt、Orbit 等）。 |
+| **`MoneyPrinterTurbo`** | 短视频留存差、配音被背景音乐掩盖 | **爆款短视频叙事引擎**：前3秒视觉与身份错位钩子；**音频自动混音与智能闪避（Audio Ducking）**，人声对白时自动压低 BGM 至 15%，静音处恢复丰满度。多角色独立音色与自然语速调节（防变音）。 |
+| **`OpenMontage`** | 跨镜头动作断层、画面跳戏 | **尾帧继承与同机位续片（Continue Action Handoff）**：长事件跨镜头时，自动截取前一镜的末尾帧 `tail_frame.png` 自动作为后一镜首帧输入。 |
+| **`Remotion` & `HyperFrames`** | 静态图片死板定格 | **Ken Burns 呼吸感推镜**：静态图片通过时间函数连续平滑微推（`1.0 + 0.05 * t / duration`），配合抗锯齿双线性重采样。 |
+| **`OpenCut`** | 生成不满意需全部重跑 | **分镜精修工坊**：前端提供单镜头独立工作台，支持单镜**重录配音**、**重绘底图**、**重拍视频**并局部重新合成成片。 |
+
+---
+
 ## 系统架构
 
 系统由 12 个智能体在 LangGraph StateGraph 中编排执行：
@@ -31,19 +46,17 @@
 第一阶段（串行）：
 TaskPlanner → Script → Storyboard → DialoguePolish → Prompt
 
-第二阶段（并行，LangGraph Send）：
-                ┌── Image → Video → Subtitle ──┐
-Prompt ──Send()─┼──────────────────────────────┤
-                └── Voice（独立运行，不触发后续）──┘
+第二阶段（并行准备）：
+Prompt ──┬── Image ──┐
+         └── Voice ──┴── Video → Subtitle
 
 第三阶段（串行）：
-Subtitle → Editor → Quality ──成功──→ Export → final.mp4
-                          └──失败──→ Editor（重试）
+Subtitle → Editor → Quality → Export → final.mp4
 ```
 
 ### 智能体说明
 
-> **使用 LangGraph 编排多智能体流程，LangChain 调用大模型。** 12 个 Agent 注册为 LangGraph StateGraph 节点，Send 并行分支 + 屏障汇聚 + 质检条件分支；LLM 统一通过 LangChain ChatOpenAI 调用 DeepSeek。
+> **使用 LangGraph 编排多智能体流程，LangChain 调用大模型。** 12 个 Agent 注册为 LangGraph StateGraph 节点，Send 并行分支 + 屏障汇聚 + 导出前质检；LLM 统一通过 LangChain ChatOpenAI 调用 DeepSeek。
 
 | 智能体 | 职责 | 调用服务 |
 |--------|------|---------|
@@ -53,11 +66,11 @@ Subtitle → Editor → Quality ──成功──→ Export → final.mp4
 | DialoguePolishAgent | 精修对白和字幕文本 | DeepSeek |
 | PromptAgent | 生成图片/视频提示词、运动节拍 | DeepSeek |
 | ImageAgent | 生成底图（4路并发） | **Doubao Seedream** / Qwen / ComfyUI |
-| VideoAgent | 图生视频（3路并发，审核AI重写重试） | **Doubao Seedance** / Wan / Vidu / ComfyUI |
+| VideoAgent | 图生视频（连续动作继承上一镜尾帧） | **Doubao Seedance** / Wan / Vidu / ComfyUI |
 | VoiceAgent | 每个分镜独立配音文件 | edge-tts |
-| SubtitleAgent | 组装SRT字幕（使用voiceover原文） | 本地 |
-| EditorAgent | 合成视频+字幕，配音超长时加速语音 | MoviePy + FFmpeg |
-| QualityAgent | 检查final.mp4是否存在 | 文件检查 |
+| SubtitleAgent | 按镜头时间轴和配音时长生成 SRT | 本地 |
+| EditorAgent | 按镜头时间轴对齐音画，统一比例并烧录字幕 | MoviePy + FFmpeg |
+| QualityAgent | 验证素材完整、视频解码、时长、比例、音轨与字幕 | 文件检查 |
 | ExportAgent | 保存结果到数据库 | — |
 
 ---
@@ -237,24 +250,40 @@ curl http://localhost:8000/api/video/task_xxx
 
 ---
 
-## 环境变量
+## 环境变量与模型配置
 
-| 变量 | 说明 | 必填 |
-|------|------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek API 密钥（脚本/分镜/提示词） | 是 |
-| `VOLCENGINE_API_KEY` | 火山引擎方舟 API Key（豆包模型） | 使用 Doubao 时必填 |
-| `DASHSCOPE_API_KEY` | 阿里通义 DashScope（Qwen/Wan） | 使用 Qwen/Wan 时必填 |
-| `MONGODB_URI` | MongoDB 连接地址 | 否（默认 `localhost:27017`） |
-| `ENABLE_PAID_API` | 是否启用付费 API | 开发建议 `false` |
+| 变量 | 说明 | 必填 | 默认 / 推荐值 |
+|------|------|:---:|------|
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥（用于导演策划、编剧、分镜与提示词） | 是 | `sk-...` |
+| `DEEPSEEK_MODEL` | DeepSeek 模型版本标识 | 否 | `deepseek-chat` / `deepseek-v4.1-flash-1017` |
+| `DASHSCOPE_API_KEY` | 阿里百炼 DashScope 密钥（用于 Qwen/万相/HappyHorse） | 使用 Wan/Qwen 时必填 | `sk-...` |
+| `WAN_VIDEO_MODEL` | 视频生成模型名称（支持长镜头生成） | 否 | `wan3.0-video` / `happyhorse-1.1-i2v` / `wan2.6-i2v-flash` |
+| `QWEN_IMAGE_MODEL` | 首帧图片生成模型 | 否 | `qwen-image-2.1-turbo` / `qwen-image-3.0-pro` / `wan2.7-image` |
+| `VOLCENGINE_API_KEY` | 火山引擎方舟 API Key（豆包模型） | 使用 Doubao 时必填 | `sk-...` |
+| `MONGODB_URI` | MongoDB 本地或远程连接地址 | 否 | `mongodb://localhost:27017` |
+| `ENABLE_PAID_API` | 是否启用付费云端 API（开启后才真实调用视频生成） | 否 | 生产设为 `true` |
 
-### 模型选择
+### 模型支持矩阵与长镜头配置
 
-通过 `IMAGE_PROVIDER` 和 `VIDEO_PROVIDER` 切换：
+本项目全面支持 5 ~ 15 秒长镜头视频生成：
 
 ```bash
-# .env
-IMAGE_PROVIDER=doubao     # doubao / qwen / comfyui
-VIDEO_PROVIDER=doubao     # doubao / wan / vidu / comfyui
+# .env 常用配置组合示例（百炼全家桶）
+MODEL_PROVIDER=deepseek
+IMAGE_PROVIDER=qwen
+VIDEO_PROVIDER=wan
+
+ENABLE_PAID_API=true
+DEEPSEEK_MODEL=deepseek-v4.1-flash-1017
+
+# 视频模型选型（任选一种）：
+WAN_VIDEO_MODEL=wan3.0-video        # 阿里万相 3.0，支持 2~30 秒长时序生成
+# WAN_VIDEO_MODEL=happyhorse-1.1-i2v # 阿里 HappyHorse 多模态图生视频，支持 3~15 秒
+# WAN_VIDEO_MODEL=wan2.6-i2v-flash   # 极速低成本 5 秒快闪生成
+
+# 底图模型选型：
+QWEN_IMAGE_MODEL=qwen-image-2.1-turbo # 高速竖屏 9:16 生成
+# QWEN_IMAGE_MODEL=qwen-image-3.0-pro   # 千问 3.0 专业版生图
 ```
 
 火山引擎方舟配置步骤：
@@ -284,7 +313,7 @@ MIT
 
 ## 使用守则
 
-> ⚠️ **当前状态：提示词质量仍待优化。** 生成的图片和视频效果受提示词影响较大，部分场景可能出现画风不一致、动作不自然等情况，后续会持续改进 PromptAgent 的生成质量。
+当前流程会检查分镜总时长、动作节拍覆盖和成片媒体完整性；连续动作镜头使用上一镜头的实际尾帧。角色外观和动作完成度仍应通过成片目测确认。详见 [六项优化与离线验证](docs/plans/2026-11-03-generation-quality.md)。
 
 本系统旨在辅助合法、合规的短视频内容创作。使用本系统时，请遵守以下规则：
 

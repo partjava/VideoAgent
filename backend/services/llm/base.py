@@ -42,5 +42,6 @@ class BaseLLMService(ABC):
         scenes: list[dict[str, Any]],
         ratio: str = "9:16",
         style: str | None = None,
+        visual_bible: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
