@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
 from uuid import uuid4
 
 import anyio
@@ -110,12 +111,14 @@ class ImageAgent:
 
             async def _generate_one(scene: dict) -> dict | None:
                 scene_id = str(scene["scene_id"])
-                image_prompt = str(scene.get("image_prompt") or "")
+                image_prompt = lock_visual_style(str(scene.get("image_prompt") or ""), (task or {}).get("style"))
                 negative_prompt = (
-                    scene.get("negative_prompt")
-                    if isinstance(scene.get("negative_prompt"), str)
+                    scene.get("image_negative_prompt") or scene.get("negative_prompt")
+                    if isinstance(scene.get("image_negative_prompt") or scene.get("negative_prompt"), str)
                     else None
                 )
+                if (task or {}).get("style") == "短剧":
+                    negative_prompt = PHOTO_EXCLUSIONS + "，" + (negative_prompt or "")
                 try:
                     result = await anyio.to_thread.run_sync(
                         lambda _sid=scene_id, _ip=image_prompt, _np=negative_prompt, _ratio=task_ratio:

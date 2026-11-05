@@ -13,28 +13,22 @@
 
       <el-form-item label="画面风格" class="style-select">
         <el-radio-group v-model="form.style" class="style-group">
-          <el-radio-button value="">自动</el-radio-button>
-          <el-radio-button value="漫剧">漫画风格</el-radio-button>
-          <el-radio-button value="短剧">真人写实</el-radio-button>
+          <el-radio-button value="短剧">真人实拍</el-radio-button>
+          <el-radio-button value="漫剧">漫画插画</el-radio-button>
         </el-radio-group>
+        <p class="style-help">{{ form.style === '短剧'
+          ? '真人演员、真实五官比例和皮肤纹理，摄影布光与实景材质。'
+          : '绘制的人物与场景，使用线条、色块或笔触表现，保持全片画风统一。' }}</p>
       </el-form-item>
 
       <div class="form-row-three">
-        <el-form-item label="发布平台" class="form-item-third">
-          <el-select v-model="form.platform" placeholder="选择目标平台" class="full-width">
-            <el-option label="抖音" value="抖音" />
-            <el-option label="Bilibili" value="B站" />
-            <el-option label="小红书" value="小红书" />
-          </el-select>
-        </el-form-item>
-
         <el-form-item label="目标时长" class="form-item-third">
           <el-select v-model="form.duration" placeholder="选择预计时长" class="full-width">
             <el-option label="自动" :value="0" />
             <el-option label="10 秒测试" :value="10" />
             <el-option label="30 秒" :value="30" />
-            <el-option v-if="form.generation_mode !== 'wan3_whole'" label="60 秒" :value="60" />
-            <el-option v-if="form.generation_mode !== 'wan3_whole'" label="90 秒" :value="90" />
+            <el-option label="60 秒" :value="60" />
+            <el-option label="90 秒" :value="90" />
           </el-select>
         </el-form-item>
 
@@ -46,19 +40,19 @@
         </el-form-item>
       </div>
 
-      <el-form-item label="生成方式">
-        <el-select v-model="form.generation_mode" @change="form.duration = 0">
-          <el-option label="原生 10 秒 · 每段一次生成" value="native_10s" />
-          <el-option label="Wan 3.0 整段 · 最长 30 秒" value="wan3_whole" />
-        </el-select>
+      <p>每段生成 10 秒动态视频，完成后自动拼接。</p>
+      <details class="advanced-options">
+        <summary>高级设置</summary>
+      <el-form-item label="片头标题（可选）">
+        <el-input v-model="form.intro_title" maxlength="60" placeholder="输入需要叠加在片头的文字" />
       </el-form-item>
       <el-form-item label="字幕样式">
-        <el-input v-model="form.intro_title" maxlength="60" placeholder="Optional opening title" />
         <el-select v-model="form.subtitle_style">
           <el-option label="标准字幕" value="standard" />
           <el-option label="国风诗词" value="poetry" />
         </el-select>
       </el-form-item>
+      </details>
       <div class="action-container">
         <el-button
           type="primary"
@@ -88,8 +82,7 @@ const emit = defineEmits(['submit'])
 const form = reactive({
   user_input: '',
   duration: 0,
-  style: '',
-  platform: '抖音',
+  style: '短剧',
   ratio: '9:16',
   generation_mode: 'native_10s',
   intro_title: '',
@@ -110,6 +103,9 @@ const handleSubmit = () => {
   border: 1px solid #e2e8f0;
   padding: 8px;
 }
+.style-help { color:#475569; font-size:13px; line-height:1.6; width:100%; margin:8px 0 0; }
+.advanced-options { margin:16px 0; }
+.advanced-options summary { cursor:pointer; margin-bottom:12px; }
 
 .prompt-textarea :deep(.el-textarea__inner) {
   font-family: inherit;

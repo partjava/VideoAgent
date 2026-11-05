@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from hashlib import sha256
+from copy import deepcopy
 import re
 
 import anyio
@@ -34,6 +35,8 @@ from services.media_quality import compare_join_frames, extract_tail, resolve_me
 from services.provider_factory import get_video_service
 from services.video.base import VideoRenderRejected
 from services.video_vision import replan_from_tail, review_enabled, review_opening_frame
+from services.audio_timing import narration_speed
+from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
 
 
 OVERLAY_DIRECTION = re.compile(
@@ -43,6 +46,64 @@ OVERLAY_DIRECTION = re.compile(
     r"(?:白字|字幕|字卡|片名|大字)[^。；;｜\n]*"
 )
 
+OVERLAY_CLAUSE = re.compile(
+    r"(?:屏幕|画面正中|画面中央|黑底|黑屏)[^。；;｜\n]{0,80}"
+    r"(?:文字|字样|英文字母|字幕|白字|大字)[^。；;｜\n]*"
+)
+
+
+def sanitize_motion_text(text):
+    props = []
+
+    def protect(match):
+        props.append(match.group())
+        return f"__PROP_TEXT_{len(props) - 1}__"
+
+    text = re.sub(
+        r"(?:鞋底|鞋面|招牌|信纸|信封|桌面)(?:上)?(?:刻有|印有|写有)"
+        r"[^，,。；;｜\n]*", protect, text,
+    )
+    text = OVERLAY_DIRECTION.sub("", OVERLAY_CLAUSE.sub("", text))
+    for index, prop in enumerate(props):
+        text = text.replace(f"__PROP_TEXT_{index}__", prop)
+    return text
+
+
+def align_measured_motion(scene):
+    scene = deepcopy(scene)
+    audio = scene.get("dialogue_audio") or []
+    if audio:
+        start, end = float(audio[-1]["start"]), float(audio[-1]["end"])
+    elif scene.get("audio_duration") and scene.get("voiceover"):
+        start, slot = voice_window(scene)
+        duration = float(scene["audio_duration"])
+        end = start + duration / narration_speed(scene, duration, slot)
+    else:
+        return scene
+    risky = re.compile(r"转身|背对|离场|离开画面|出画|切黑|拉门|卷帘门")
+    beats = scene.get("motion_beats") or []
+    index = next((i for i, beat in enumerate(beats)
+                  if float(beat["end"]) > start and float(beat["start"]) < end
+                  and risky.search(str(beat.get("action", "")))), None)
+    if index is None:
+        return scene
+    state = (beats[index - 1].get("end_state") if index else scene.get("start_state")) or beats[index].get("start_state") or "保持当前人物位置和道具接触"
+    camera = beats[index - 1].get("camera") if index else "保持首帧构图与拍摄侧"
+    focus = scene.get("reaction_focus") or {
+        "product": "当前产品和已完成的演示结果",
+        "explainer": "当前可见现象和演示结果",
+    }.get(scene.get("video_type"), "当前人物可见的表情和反应")
+    for beat in beats[index:]:
+        beat.update(camera=camera, start_state=state, end_state=state,
+                    action=f"维持当前人物位置、朝向和道具接触，保留{focus}。")
+    scene.update(video_prompt="从首帧按逐秒动作推进，保持人物和道具一致。",
+                 camera_motion="保持原拍摄侧，按逐秒构图平稳拍摄。",
+                 end_state=state, last_frame_for_transition=state,
+                 continuity_note="保持首帧人物外貌、服装、场景和光线。",
+                 scene_continuity="保持首帧场景。")
+    scene.pop("camera_plan", None)
+    return scene
+
 
 def actual_dialogue_direction(scene):
     audio = scene.get("dialogue_audio") or []
@@ -51,13 +112,31 @@ def actual_dialogue_direction(scene):
     last = audio[-1]
     return (
         f"\n[实测配音时间优先] 最后一句在 {last['start']:.2f}–{last['end']:.2f} 秒。"
-        "这段保留能看清说话者或关键反应主体表情的构图。"
+        "这段保留能看清当前保护目标的构图。"
         "若逐秒动作与该窗口冲突，推迟转身、离场或转移焦点；时间不足时省略次要动作。"
     )
 
 
+def speaker_windows(scene):
+    windows = []
+    for line in scene.get("dialogue_audio") or []:
+        speaker = line.get("speaker", "当前说话者")
+        if speaker == "旁白":
+            windows.append(f"{line['start']:.2f}–{line['end']:.2f}秒为画外旁白，画面内人物按剧情反应。")
+        else:
+            windows.append(
+                f"{line['start']:.2f}–{line['end']:.2f}秒：{speaker}若在画面中，"
+                "双唇自然轻微开合，下颌微动；同场倾听者自然闭口。"
+            )
+    return "\n[实测发声窗口]\n" + "\n".join(windows) if windows else ""
+
+
 def video_prompt_options(service, scene):
     negative = scene.get("video_negative_prompt")
+    if scene.get("style") == "短剧":
+        negative = PHOTO_EXCLUSIONS + "，" + (negative or "")
+    if scene.get("dialogue_audio"):
+        negative = (negative or "") + "，嘴部撕裂，牙齿畸形，嘴唇粘连，夸张扭曲张嘴"
     if isinstance(negative, str) and negative.strip() and getattr(service, "supports_negative_prompt", False) is True:
         return {"negative_prompt": negative.strip()}
     return {}
@@ -75,9 +154,13 @@ async def prepare_motion_prompt(scene, previous, first, first_digest):
     saved = scene.get("observed_handoff") or {}
     if scene.get("transition_type") != "continue_action" or not previous or not previous.get("video_path"):
         return _build_motion_prompt(scene), None
-    previous_beats = previous.get("motion_beats") or []
+    previous_beats = previous.get("effective_motion_beats") or previous.get("motion_beats") or []
     previous_state = previous_beats[-1].get("end_state") if previous_beats else previous.get("end_state")
-    scene = {**scene, "previous_action_state": previous_state}
+    scene = deepcopy(scene)
+    scene["previous_action_state"] = previous_state
+    if previous.get("effective_end_state") and scene.get("motion_beats"):
+        scene["start_state"] = previous["effective_end_state"]
+        scene["motion_beats"][0]["start_state"] = previous["effective_end_state"]
     revision = sha256(_build_motion_prompt(scene).encode()).hexdigest()
     if saved.get("digest") == first_digest and saved.get("revision") == revision:
         plan = saved["plan"]
@@ -89,6 +172,7 @@ async def prepare_motion_prompt(scene, previous, first, first_digest):
 
 
 def _build_motion_prompt(scene):
+    scene = align_measured_motion(scene)
     beats = scene.get("motion_beats")
     validate_motion_beats(beats, float(scene["duration"]), detailed=True)
 
@@ -147,8 +231,9 @@ def _build_motion_prompt(scene):
             handoff += f"[动作交接] 第1秒从上一拍状态继续：{previous_state}。保留接触点、视线和运动方向。\n"
     body = f"{handoff}{recipe_header}\n{base_prompt}\n[秒级动作演进]\n{timeline_block}\n{consistency_block}"
     return (
-        OVERLAY_DIRECTION.sub("", body)
+        lock_visual_style(sanitize_motion_text(body), scene.get("style"))
         + actual_dialogue_direction(scene)
+        + speaker_windows(scene)
         + "\n"
         "[画面交付] 全段保留剧情画面。字幕、标题、气泡、水印和字卡由后期处理，"
         "忽略上述字段里任何要求生成这些元素的指令。保留剧情需要的道具内文字。"
@@ -172,6 +257,10 @@ class VideoAgent:
             scenes = await mongodb.find_many(SCENES_COLLECTION, query, limit=100)
             scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
             task = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
+            video_type = (task.get("metadata", {}).get("task_plan") or {}).get("video_type", "story")
+            for scene in scenes:
+                scene["video_type"] = video_type
+                scene["style"] = task.get("style")
             ratio = str(task.get("ratio", "9:16"))
             paired = task.get("generation_mode") == PAIRED_GENERATION_MODE
             native = task.get("generation_mode") == NATIVE_GENERATION_MODE
@@ -194,7 +283,7 @@ class VideoAgent:
                     audio_path = scene.get("audio_path")
                     if not audio_path or not resolve_media(audio_path).is_file():
                         raise ValueError(f"Voice track not ready for scene {scene['scene_id']}")
-                    voice_speed(scene["scene_id"], float(scene.get("audio_duration") or 0), voice_window(scene)[1])
+                    narration_speed(scene, float(scene.get("audio_duration") or 0), voice_window(scene)[1])
             stored = await mongodb.find_many(ASSETS_COLLECTION, query, limit=200)
             images = {a["scene_id"]: a for a in stored if a.get("asset_type") == "image"}
             videos = {}
@@ -277,6 +366,13 @@ class VideoAgent:
                                               "continuity_input_path": first,
                                               "need_dynamic_video": True, "stale_tail": False, "status": "video_done"})
                 scene["video_path"] = asset["path"]
+                effective = align_measured_motion(scene)
+                await mongodb.update_one(SCENES_COLLECTION, key, {
+                    "effective_motion_beats": effective.get("motion_beats"),
+                    "effective_end_state": effective.get("end_state"),
+                })
+                scene["effective_motion_beats"] = effective.get("motion_beats")
+                scene["effective_end_state"] = effective.get("end_state")
                 assets.append(asset)
                 if scene.get("transition_type") == "continue_action":
                     actual_first = f"backend/assets/{task_id}/frames/{sid}_first.png"

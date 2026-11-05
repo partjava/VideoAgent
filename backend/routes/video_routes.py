@@ -26,9 +26,70 @@ from agents.agent_utils import with_document_id
 from models.asset_model import Asset
 from services.generation_contract import MAX_VOICE_SPEED, continuity_input, voice_speed, voice_window
 from services.media_quality import extract_tail, inspect_video, resolve_media
+from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
 
 
 router = APIRouter(prefix="/api/video", tags=["video"])
+_audio_remixes = set()
+
+
+class AudioTimingEdit(BaseModel):
+    start: float = Field(ge=0, allow_inf_nan=False)
+    speed: float = Field(ge=0.9, le=1.25, allow_inf_nan=False)
+
+
+class AudioTimingRequest(BaseModel):
+    lines: list[AudioTimingEdit] = Field(min_length=1, max_length=100)
+
+
+@router.post("/{task_id}/scene/{scene_id}/audio-timing", response_model=ApiResponse)
+async def apply_audio_timing(task_id: str, scene_id: str, payload: AudioTimingRequest):
+    from services.audio_timing import retime_audio
+
+    if task_id in _audio_remixes:
+        return error_response("正在合成，请稍候再试", 409)
+    _audio_remixes.add(task_id)
+    claimed = False
+    try:
+        task = await task_service.get_task(task_id)
+        if not task:
+            return error_response("Task not found", 404)
+        if task.get("status") not in {"success", "failed"}:
+            return error_response("请等待当前任务完成后调整配音", 409)
+        scene = await mongodb.find_one("scenes", {"task_id": task_id, "scene_id": scene_id})
+        if not scene:
+            return error_response("Scene not found", 404)
+        scenes = await mongodb.find_many("scenes", {"task_id": task_id}, limit=100)
+        if any(item.get("stale_tail") for item in scenes):
+            return error_response("请先完成待续接镜头，再调整配音", 409)
+        files = [line["path"] for line in scene.get("dialogue_audio") or []]
+        if not files and scene.get("audio_path"):
+            files = [scene["audio_path"]]
+        if not files or not all(resolve_media(path).is_file() for path in files):
+            return error_response("配音素材缺失，请先生成配音", 422)
+        values = retime_audio(scene, [line.model_dump() for line in payload.lines])
+        claimed = await mongodb.update_one("video_tasks", {
+            "_id": task_id, "status": {"$in": ["success", "failed"]},
+        }, {"status": VideoTaskStatus.SUBTITLE_GENERATING.value})
+        if not claimed:
+            return error_response("任务正在处理，请稍候再试", 409)
+        values["updated_at"] = datetime.now(UTC)
+        await mongodb.update_one("scenes", {"_id": scene["_id"]}, values)
+        await SubtitleAgent().run(task_id)
+        await EditorAgent().run(task_id)
+        await QualityAgent().run(task_id)
+        await ExportAgent().run(task_id)
+        return ApiResponse(status="success", data={"message": "配音时间已应用，成片已重新合成"})
+    except ValueError as exc:
+        if claimed:
+            await task_service.update_task_fields(task_id, {"status": "failed", "metadata.last_error": str(exc)})
+        return error_response(str(exc), 422)
+    except Exception:
+        if claimed:
+            await task_service.update_task_fields(task_id, {"status": "failed", "metadata.last_error": "配音重混未完成，请重试"})
+        return error_response("合成未完成，时间设置已保存，可重试应用或查看任务进度", 500)
+    finally:
+        _audio_remixes.discard(task_id)
 
 
 def error_response(message: str, status_code: int) -> JSONResponse:
@@ -158,7 +219,8 @@ async def get_video_task_storyboard(task_id: str) -> ApiResponse | JSONResponse:
                 try:
                     start, slot = voice_window(scene)
                     duration = float(scene["audio_duration"])
-                    scene["voice_end"] = start + duration / voice_speed(scene["scene_id"], duration, slot)
+                    from services.audio_timing import narration_speed
+                    scene["voice_end"] = start + duration / narration_speed(scene, duration, slot)
                 except (ValueError, KeyError, TypeError):
                     pass
         return ApiResponse(status="success", data=task_scenes)
@@ -326,6 +388,7 @@ async def rerun_scene_asset(
             relative_audio = f"backend/assets/{task_id}/audio/voice_{render_id}.mp3"
             updated_fields["audio_path"] = relative_audio
             updated_fields["audio_duration"] = audio_duration
+            updated_fields["audio_speed"] = None
             updated_fields["audio_text"] = voiceover
             updated_fields["speaker"] = speaker
             updated_fields["voice"] = voice_name
@@ -356,7 +419,9 @@ async def rerun_scene_asset(
                     lambda: image_service.generate_image(
                         task_id=task_id,
                         scene_id=render_id,
-                        prompt=image_prompt,
+                        image_prompt=lock_visual_style(image_prompt, task.get("style")),
+                        negative_prompt=(PHOTO_EXCLUSIONS + "，" if task.get("style") == "短剧" else "")
+                        + (scene.get("image_negative_prompt") or scene.get("negative_prompt") or ""),
                         ratio=task.get("ratio", "9:16"),
                     )
                 )
@@ -378,12 +443,14 @@ async def rerun_scene_asset(
                 raise ValueError("Rerun the previous clip first")
             first_digest = sha256(resolve_media(first).read_bytes()).hexdigest()
             prompt_scene = {**scene, "video_prompt": payload.prompt or scene.get("video_prompt")}
+            prompt_scene["video_type"] = (task.get("metadata", {}).get("task_plan") or {}).get("video_type", "story")
+            prompt_scene["style"] = task.get("style")
             if payload.prompt:
                 prompt_scene.pop("observed_handoff", None)
             prompt, observed = await prepare_motion_prompt(prompt_scene, prior, first, first_digest)
             provider = video_service_for_task(task)
             duration = int(scene["duration"])
-            prompt_options = video_prompt_options(provider, scene)
+            prompt_options = video_prompt_options(provider, prompt_scene)
             pending_key = render_signature(provider, first_digest, prompt, duration, task.get("ratio", "9:16"), **prompt_options)
             pending_job = scene.get("pending_video_rerun") or {}
             if pending_job.get("key") == pending_key:

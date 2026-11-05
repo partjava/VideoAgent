@@ -6,7 +6,7 @@ from agents.voice_agent import synthesize_dialogue
 
 
 class DialogueTimingTests(unittest.IsolatedAsyncioTestCase):
-    async def render(self, durations):
+    async def render(self, durations, starts=None):
         scene = {
             "scene_id": "scene_01",
             "duration": 10,
@@ -16,6 +16,9 @@ class DialogueTimingTests(unittest.IsolatedAsyncioTestCase):
                 {"speaker": "李白", "text": "这嗓子……汪伦？！", "start": 3.8},
             ],
         }
+        if starts is not None:
+            for line, start in zip(scene["dialogue_lines"], starts):
+                line["start"] = start
         with patch("agents.voice_agent.tts_service.generate_voice", AsyncMock(side_effect=durations)):
             return await synthesize_dialogue(scene, Path("."), "test", "scene_01")
 
@@ -32,3 +35,10 @@ class DialogueTimingTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_dialogue_that_cannot_fit_in_the_scene(self):
         with self.assertRaisesRegex(ValueError, "scene_01"):
             await self.render([4.5, 4.5, 4.5])
+
+    async def test_out_of_order_starts_keep_script_order(self):
+        lines = await self.render([1, 1, 1], starts=[3, 2.8, 3])
+        self.assertEqual([line["speaker"] for line in lines], ["李白", "岸上众人", "李白"])
+        for previous, current in zip(lines, lines[1:]):
+            self.assertLessEqual(previous["end"], current["start"])
+        self.assertLessEqual(lines[-1]["end"], 10)

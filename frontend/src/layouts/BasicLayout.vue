@@ -26,10 +26,6 @@
           <el-icon><Setting /></el-icon>
           <span>API 配置</span>
         </el-menu-item>
-        <el-menu-item index="/comfyui" aria-label="ComfyUI">
-          <el-icon><Connection /></el-icon>
-          <span>ComfyUI</span>
-        </el-menu-item>
       </el-menu>
     </el-aside>
 
@@ -38,9 +34,6 @@
       <el-header class="top-header">
         <div class="header-left">
           <span class="page-title">{{ currentTitle }}</span>
-        </div>
-        <div class="header-right">
-          <el-tag type="success" effect="plain" class="tech-tag">Real AI Mode</el-tag>
         </div>
       </el-header>
 

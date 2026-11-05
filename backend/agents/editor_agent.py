@@ -3,6 +3,7 @@ from pathlib import Path
 from models.task_model import VideoTaskStatus
 from models.asset_model import Asset
 from core.database import mongodb
+from services.audio_timing import narration_speed
 
 from agents.agent_utils import (
     ASSETS_COLLECTION,
@@ -154,7 +155,7 @@ class EditorAgent:
                     if audio_path:
                         audio = resources.enter_context(AudioFileClip(str(resolve_media(audio_path))))
                         offset, slot = voice_window(scene)
-                        speed = voice_speed(scene["scene_id"], audio.duration, slot)
+                        speed = narration_speed(scene, float(scene.get("audio_duration") or audio.duration), slot)
                         if speed != 1:
                             audio = audio.fx(vfx.speedx, speed)
                         # Absolute placement preserves silence and missing-dialogue gaps.

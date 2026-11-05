@@ -28,6 +28,7 @@ class Scene(BaseModel):
     transition_type: str = "cut"
     start_state: str | None = None
     end_state: str | None = None
+    reaction_focus: str | None = None
     continuity_input_path: str | None = None
     last_frame_path: str | None = None
     first_frame_focus: str | None = None

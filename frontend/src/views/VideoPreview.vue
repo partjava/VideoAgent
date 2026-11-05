@@ -32,8 +32,8 @@
         <!-- Left: Video Player region (aspect ratio 9:16 layout) -->
         <div class="player-wrapper">
           <VideoPlayerCard
-            :video-path="taskDetail.metadata?.video_path"
-            :subtitle-path="taskDetail.metadata?.subtitle_path"
+            :video-path="taskDetail.metadata?.video_path ? taskDetail.metadata.video_path + '?v=' + previewVersion : null"
+            :subtitle-path="taskDetail.metadata?.subtitle_path ? taskDetail.metadata.subtitle_path + '?v=' + previewVersion : null"
             :title="taskDetail.topic || '未命名视频'"
             :ratio="taskDetail.ratio"
             :duration="taskDetail.duration"
@@ -115,6 +115,8 @@
                   @click="polishDialogue(scene)">重新优化旁白</el-button>
               </label>
               </details>
+              <AudioTimingEditor :scene="scene" :busy="retryingSceneId !== null"
+                @apply="lines => applyAudioTiming(scene, lines)" />
               <div v-if="scene.transition_type === 'continue_action'" class="handoff-frames">
                 <figure v-if="storyboardData.find(item => item.scene_index === scene.scene_index - 1)?.last_frame_path">
                   <img :src="mediaUrl(storyboardData.find(item => item.scene_index === scene.scene_index - 1).last_frame_path)" alt="上一段实际尾帧" />
@@ -204,54 +206,13 @@
             </div>
           </el-card>
 
-          <!-- Download Action Card -->
-          <el-card class="detail-card download-card" shadow="never">
-            <template #header>
-              <div class="card-header">
-                <span class="card-title">导出与资产下载</span>
-              </div>
-            </template>
+          <details class="detail-card">
+            <summary>更多导出</summary>
             <div class="downloads-grid">
-              <el-button 
-                type="primary" 
-                icon="Download" 
-                class="download-btn main-action-btn"
-                @click="downloadVideo"
-              >
-                下载最终视频 (MP4)
-              </el-button>
-              
-              <el-button 
-                type="default" 
-                icon="Document" 
-                class="download-btn"
-                :disabled="!taskDetail.metadata?.subtitle_path"
-                @click="downloadSubtitle"
-              >
-                下载字幕文件 (SRT)
-              </el-button>
-
-              <el-button 
-                type="default" 
-                icon="Tickets" 
-                class="download-btn"
-                :disabled="!scriptData"
-                @click="downloadScript"
-              >
-                下载文字脚本 (TXT)
-              </el-button>
-
-              <el-button 
-                type="default" 
-                icon="Film" 
-                class="download-btn"
-                :disabled="!storyboardData || storyboardData.length === 0"
-                @click="downloadStoryboard"
-              >
-                下载分镜设计 (JSON)
-              </el-button>
+              <el-button :disabled="!scriptData" @click="downloadScript">下载脚本 TXT</el-button>
+              <el-button :disabled="!storyboardData.length" @click="downloadStoryboard">下载分镜 JSON</el-button>
             </div>
-          </el-card>
+          </details>
         </div>
       </div>
 
@@ -271,12 +232,14 @@ import { ElMessage } from 'element-plus'
 import BasicLayout from '../layouts/BasicLayout.vue'
 import TaskProgress from './TaskProgress.vue'
 import VideoPlayerCard from '../components/VideoPlayerCard.vue'
+import AudioTimingEditor from '../components/AudioTimingEditor.vue'
 import { videoApi } from '../api/video'
 
 const route = useRoute()
 const router = useRouter()
 const taskId = route.params.id
 const showProcess = ref(false)
+const previewVersion = ref(Date.now())
 
 const loading = ref(true)
 const taskDetail = ref(null)
@@ -284,6 +247,20 @@ const scriptData = ref(null)
 const storyboardData = ref([])
 const retryingSceneId = ref(null)
 const polishingSceneId = ref(null)
+async function applyAudioTiming(scene, lines) {
+  retryingSceneId.value = scene.scene_id
+  try {
+    await videoApi.applyAudioTiming(taskId, scene.scene_id, { lines })
+    storyboardData.value = await videoApi.getStoryboard(taskId)
+    taskDetail.value = await videoApi.getTask(taskId)
+    previewVersion.value = Date.now()
+    ElMessage.success('配音时间已应用，成片已重新合成')
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    retryingSceneId.value = null
+  }
+}
 async function polishDialogue(scene) {
   const draft = { voiceover: scene.voiceover || '', speaker: scene.speaker || '旁白', voice_start: scene.voice_start ?? 0 }
   polishingSceneId.value = scene.scene_id
@@ -395,28 +372,6 @@ const handleGoToProgress = () => {
 }
 
 // Download helpers
-const downloadVideo = () => {
-  if (!taskDetail.value?.metadata?.video_path) return
-  const path = taskDetail.value.metadata.video_path.replace('backend/', '')
-  const link = document.createElement('a')
-  link.href = `/${path}`
-  link.download = `${taskId}-final.mp4`
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-}
-
-const downloadSubtitle = () => {
-  if (!taskDetail.value?.metadata?.subtitle_path) return
-  const path = taskDetail.value.metadata.subtitle_path.replace('backend/', '')
-  const link = document.createElement('a')
-  link.href = `/${path}`
-  link.download = `${taskId}-subtitle.srt`
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-}
-
 const downloadScript = () => {
   if (!scriptData.value) return
   const content = `标题: ${scriptData.value.title || ''}\n\n口播脚本:\n${scriptData.value.content || ''}\n\n结尾总结:\n${scriptData.value.ending || ''}`

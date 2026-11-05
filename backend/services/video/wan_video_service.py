@@ -8,7 +8,7 @@ import httpx
 from pathlib import Path
 from typing import Any
 from config import settings
-from services.model_config import model_config, saved_models
+from services.model_config import model_config
 from services.video.base import BaseVideoService, VideoRenderRejected
 
 
@@ -26,7 +26,7 @@ class WanVideoService(BaseVideoService):
 
     def __init__(self, model=None, storage_root=None):
         profile = model_config("video", settings)
-        self.model = profile["model"] if "video" in saved_models() else model or profile["model"]
+        self.model = model or profile["model"]
         self.api_key = profile["key"]
         self.api_url = profile["url"]
         self.storage_root = Path(storage_root) if storage_root is not None else Path(__file__).resolve().parents[2]

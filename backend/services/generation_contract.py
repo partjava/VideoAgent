@@ -164,6 +164,7 @@ def render_srt(scenes):
         audio_duration = scene.get("audio_duration")
         spoken = slot
         if audio_duration and audio_duration > 0:
-            spoken = float(audio_duration) / voice_speed(scene["scene_id"], float(audio_duration), slot)
+            from services.audio_timing import narration_speed
+            spoken = float(audio_duration) / narration_speed(scene, float(audio_duration), slot)
         cues.append(f"{len(cues) + 1}\n{format_srt_time(start)} --> {format_srt_time(start + spoken)}\n{text}\n")
     return "\n".join(cues)

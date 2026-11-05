@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -49,7 +49,7 @@ class CreateVideoTaskRequest(BaseModel):
     ratio: str = "9:16"
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
-    generation_mode: str = "native_10s"
+    generation_mode: Literal["native_10s", "full_dynamic", "paired_5s", "key_scenes"] = "native_10s"
 
 
 class CreateVideoTaskResponse(BaseModel):

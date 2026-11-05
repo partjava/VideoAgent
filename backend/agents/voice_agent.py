@@ -53,6 +53,12 @@ async def synthesize_dialogue(scene, backend_dir, task_id, render_id):
     lines = scene["dialogue_lines"]
     offsets = [scene_event_offset(scene, line["start"]) for line in lines]
     scene_end = float(scene["duration"])
+    if any(current <= previous for previous, current in zip(offsets, offsets[1:])):
+        # Preserve script order while leaving room for all remaining starts.
+        gap = min(0.1, (scene_end - offsets[0]) / (len(offsets) + 1))
+        for index in range(1, len(offsets)):
+            latest = scene_end - gap * (len(offsets) - index)
+            offsets[index] = min(latest, max(offsets[index], offsets[index - 1] + gap))
     slots = [end - start for start, end in zip(offsets, offsets[1:] + [scene_end])]
     if any(slot <= 0 for slot in slots):
         raise ValueError("对白的出声时间必须依次递增，并留在当前镜头内")
@@ -66,7 +72,8 @@ async def synthesize_dialogue(scene, backend_dir, task_id, render_id):
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError(f"Invalid audio duration for scene {scene['scene_id']}")
         durations.append(duration)
-        rendered.append({"speaker": line["speaker"], "text": text, "path": f"backend/{path}"})
+        rendered.append({"speaker": line["speaker"], "text": text, "path": f"backend/{path}",
+                         "source_duration": duration})
 
     if all(duration <= slot * MAX_VOICE_SPEED for duration, slot in zip(durations, slots)):
         speeds = [voice_speed(scene["scene_id"], duration, slot) for duration, slot in zip(durations, slots)]
@@ -272,6 +279,7 @@ class VoiceAgent:
                         **({"voiceover": voiceover, "subtitle": voiceover, "voiceover_repaired": True} if repaired else {}),
                         "audio_path": scene_audio_relative,
                         "audio_duration": scene_duration,
+                        "audio_speed": None,
                         "audio_text": voiceover,
                         "speaker": speaker or "旁白",
                         "voice": scene_voice,

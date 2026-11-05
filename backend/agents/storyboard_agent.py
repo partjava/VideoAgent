@@ -132,9 +132,12 @@ class StoryboardAgent:
             _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else 60
             plan = task.get("metadata", {}).get("task_plan") or {}
             storyboard_context = {**script, "video_type": plan.get("video_type", "story"),
+                                  "visual_style": task.get("style"),
                                   "content_beats": plan.get("plot_beats", []), "characters": plan.get("characters", []),
                                   "visual_world": plan.get("visual_world", "")}
             _generation_mode = str(task.get("generation_mode", "full_dynamic"))
+            if _generation_mode == "wan3_whole":
+                storyboard_context["segments"] = []
             scenes_data = await anyio.to_thread.run_sync(
                 lambda _script=storyboard_context, _td=_target_duration, _gm=_generation_mode:
                     llm_service.generate_storyboard(
@@ -184,6 +187,7 @@ class StoryboardAgent:
                     transition_type=str(item.get("transition_type") or "cut"),
                     start_state=item.get("start_state"),
                     end_state=item.get("end_state"),
+                    reaction_focus=item.get("reaction_focus"),
                     speaker=item.get("speaker") if isinstance(item.get("speaker"), str) else None,
                     voiceover=item.get("voiceover") if isinstance(item.get("voiceover"), str) else None,
                     subtitle=item.get("subtitle") if isinstance(item.get("subtitle"), str) else None,

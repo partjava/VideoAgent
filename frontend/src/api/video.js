@@ -68,5 +68,8 @@ export const videoApi = {
 
   rerunScene(taskId, sceneId, payload) {
     return client.post(`/${taskId}/scene/${sceneId}/rerun`, payload)
+  },
+  applyAudioTiming(taskId, sceneId, payload) {
+    return client.post(`/${taskId}/scene/${sceneId}/audio-timing`, payload, { timeout: 300000 })
   }
 }

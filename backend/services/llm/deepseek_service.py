@@ -4,6 +4,7 @@ from typing import Any
 
 from config import settings
 from services.model_config import model_config
+from services.visual_style import PHOTO_RULES
 from services.llm.base import BaseLLMService
 
 from langchain_openai import ChatOpenAI
@@ -34,7 +35,7 @@ STYLE_TEMPLATES: dict[str, dict[str, str]] = {
     },
     "短剧": {
         "visual": (
-            "1080P高清写实影视画面，真人实拍质感。"
+            PHOTO_RULES +
             "角色外貌固定：五官、发型、肤色、体型在全片不变。"
             "服装道具与场景匹配时代背景，室内/室外光线自然真实。"
             "镜头语言偏影视化：正反打、过肩镜头、手持跟拍、推拉摇移。"
@@ -148,7 +149,7 @@ class DeepSeekService(BaseLLMService):
 目标时长：{str(duration) + " 秒（固定）" if duration is not None else "从原句提取；未指定则自行选择"}
 若生成模式为 native_10s，自动时长选 10 的整数倍，未指定则 30 秒。
 画面风格：{style or "自动选择"}（漫剧=漫画插画，短剧=写实影视）
-发布平台：{platform or "抖音/视频号"}
+发布场景：{platform or "通用视频"}
 画面比例：{ratio}
 生成模式：{generation_mode}
 
@@ -200,10 +201,6 @@ class DeepSeekService(BaseLLMService):
             result["duration"] = duration if duration is not None else (
                 planned_duration if type(planned_duration) is int and 4 <= planned_duration <= 90 else 30
             )
-            if generation_mode == "wan3_whole":
-                if duration is not None and not 4 <= duration <= 30:
-                    raise ValueError("Wan 3.0 whole mode supports 4–30 seconds")
-                result["duration"] = min(30, result["duration"])
             if generation_mode in ("paired_5s", "native_10s"):
                 if duration is not None and (duration < 10 or duration % 10):
                     raise ValueError("This mode requires a duration divisible by 10 seconds")
@@ -215,7 +212,7 @@ class DeepSeekService(BaseLLMService):
                 result["style"] = resolved_style
             if result.get("style") not in STYLE_TEMPLATES:
                 result["style"] = resolved_style
-            result.setdefault("platform", platform or "抖音")
+            result.setdefault("platform", platform or "通用视频")
             result["ratio"] = ratio
             result["generation_mode"] = generation_mode
             return result
@@ -244,6 +241,17 @@ class DeepSeekService(BaseLLMService):
             target_duration = int(task_plan.get("duration") or 60)
             resolved_style = str(task_plan.get("style") or DEFAULT_STYLE)
             characters_json = json.dumps(task_plan.get("characters", []), ensure_ascii=False, default=str)
+            mode = task_plan.get("generation_mode", "full_dynamic")
+            if mode == "native_10s":
+                segment_rules = (
+                    f"输出 segments，严格每段10秒，共{target_duration // 10}段。"
+                    "每段填写 plot、duration、voice_start、voiceover、dialogue_lines。"
+                    "多人对白填写 speaker、text、start，时间从本段第0秒起算，0 ≤ 时间 < 10。"
+                    "voice_start 等于第一句时间。旁白段 dialogue_lines 为空。"
+                    "content 展示同一份分段剧本。"
+                )
+            else:
+                segment_rules = "segments 返回空数组，在 content 中编写完整画面和对应台词。"
             system_prompt = (
                 "你是爆款短视频金牌编剧。你的剧本以戏剧张力强、反差感拉满、台词有梗生动著称。"
                 "每句台词都要推动剧情或情绪。冲突强度服从题材，画面动作必须能在段落时长内完成。必须输出严格 JSON。"
@@ -265,7 +273,7 @@ class DeepSeekService(BaseLLMService):
 - 按项目方案的 video_type 编写。剧情用角色行动和对白推进，科普按现象、解释、结论展开，产品介绍按场景、演示、总结展开。
 - 保留原始需求中的关键信息。每一段都写出画面和对应的台词或旁白，结尾必须完成开头提出的叙事或说明目标。
 - 先写画面推进：首秒动作钩子 → 行动让局面发生变化 → 清晰结果和反应。10秒以内的短片尽量围绕一个事件，不用多秒站立、凝视或慢慢准备来铺垫。
-- 原生 10 秒模式先按时长输出 segments，严格每段 10 秒，共 {target_duration // 10} 段。每段填写 plot、duration、voice_start、voiceover 和 dialogue_lines。多人对白按出声顺序填写 speaker、text、start。start 和 voice_start 均从当前段落的第 0 秒起算，取值为 0 ≤ 时间 < 10。voice_start 等于第一句出声时间。旁白段的 dialogue_lines 为空。content 展示同一份分段剧本。
+- 当前模式的结构要求：{segment_rules}
 - 旁白按每秒约 3.5 个汉字估算，标点不计。字数上限为 max(0, floor((duration - voice_start - 0.5) * 3.5))。多人对白每句按距下一句的时间预算，最后一句留 0.5 秒给画面。旁白补充画外信息，关键结果出现前不提前揭晓。
 - 科普避免虚构事实，产品介绍不添加未提供的规格与功效。
 
@@ -279,6 +287,8 @@ class DeepSeekService(BaseLLMService):
 """
             result = self._call_api(system_prompt, user_prompt, max_tokens=2500)
             result["source"] = "deepseek"
+            if mode != "native_10s":
+                result["segments"] = []
             return result
         except Exception as e:
             raise RuntimeError(f"DeepSeek generate_script failed: {e}") from e
@@ -291,7 +301,6 @@ class DeepSeekService(BaseLLMService):
     ) -> list[dict[str, Any]]:
         try:
             dynamic_hint = {
-                "wan3_whole": "返回唯一一段动态视频，时长等于目标。可以在这段内部按事件推进、转移视线和调整景别，不拆分外部片段。",
                 "native_10s": "每个故事段落恰好一条10秒动态视频。分镜数量严格等于总时长除以10。所有 duration=10、need_dynamic_video=true、transition_type=cut。每段用独立首帧，一次生成完整事件。旁白按该10秒段落编写，中间不断句重启。",
                 "full_dynamic": "所有分镜 need_dynamic_video 都设为 true。",
                 "paired_5s": (
@@ -309,6 +318,7 @@ class DeepSeekService(BaseLLMService):
             )
             user_prompt = f"""\
 剧本：{json.dumps(script, ensure_ascii=False, default=str)}
+画面风格：{script.get("visual_style") or "跟随剧本设定"}。短剧为真人演员实景拍摄，使用自然五官比例、皮肤纹理和实物材质；漫剧为漫画插画。角色名和故事题材不能改变所选媒介。
 目标时长：{target_duration or 60} 秒
 生成模式：{generation_mode}
 {dynamic_hint}
@@ -319,6 +329,7 @@ class DeepSeekService(BaseLLMService):
 - 每拍只突出一个观看重点。双人交互可随动作和反应交接焦点，保持人物位置与拍摄轴线。
 - 复杂交接优先改成借桌面等支撑面完成，或把交接前后分配给已有的相邻段落。关键对白时保留说话者或反应主体的面部。
 - 若镜头从接物者取物开始，把道具已落稳、递物者已松手、接物者尚未接触写入 start_state，并交代支撑面。
+- reaction_focus 写明关键配音时观众必须看清的具体主体：剧情人物的反应、产品演示结果或科普现象。只写本镜已经存在的可见主体。
 - 先用一个贯穿本段的可见事件串起起因、动作、结果和反应，再写 visual_description。后一个动作必须由前一个动作的可见结果或台词触发。预留交互完成和人物反应的时间，删去挤占揭晓或反应的次要动作、额外转场和结尾字卡。
 - 重要道具每次换手、落到支撑面、翻面或离开画面，都交代动作过程及完成后的状态。情节依赖观众看见的线索，提前选好能看清线索的构图。
 - transition_type 为 cut（切镜或换机位）、continue_action（同机位同构图连续动作，必须继承上一镜尾帧）、scene_change（明确换场）。首镜必须为 cut。
@@ -334,7 +345,7 @@ class DeepSeekService(BaseLLMService):
 - shot_type 用影视镜头语言：特写、近景、中景、全景、过肩、俯拍、仰拍等。
 - voice_start 写台词相对本段开始的秒数，台词在所描述的动作之后出现，必须留够朗读时间。sound_cues 写发生时间和音效名，仅支持 footstep、impact、water、paper、wind，没有就返回空数组。
 - voiceover 写这个镜头对应的旁白或角色台词，这是直接送入 TTS 配音的文本。
-- 如果剧本是多人对白，必须保留关键原对白的说话人、意思和顺序，不改成独白。为该分镜输出 dialogue_lines，按出声顺序填写 speaker、text（纯台词）、start（本段开始后的秒数）。在10秒内说不完时删去次要对白，给每句话留出自然读时。voiceover 同步填写这些台词拼接后的纯文本。纯旁白场景的 dialogue_lines 为空。
+- 如果剧本是多人对白，必须保留关键原对白的说话人、意思和顺序，不改成独白。为该分镜输出 dialogue_lines，按出声顺序填写 speaker、text（纯台词）、start（本段开始后的秒数）。按该分镜 duration 安排对白，超出时删去次要对白，给每句话留出自然读时。voiceover 同步填写这些台词拼接后的纯文本。纯旁白场景的 dialogue_lines 为空。
 - voiceover 禁止出现“李白：”“旁白：”“某某说：”这类角色标签，禁止包含括号、音效或动作指示（如“（大笑）”、“【音效】”）。
 - 没有已定稿台词时，按 max(0, floor((duration - voice_start - 0.5) * 3.5)) 估算旁白汉字数上限，标点不计，保留收尾空间。
 - subtitle 直接使用 voiceover 原文，不再缩写。
@@ -360,6 +371,7 @@ class DeepSeekService(BaseLLMService):
 - transition_type
 - start_state
 - end_state
+- reaction_focus
 
 返回 JSON：{{"scenes": [...]}}
 """
@@ -444,6 +456,7 @@ class DeepSeekService(BaseLLMService):
                     "shot_type": scene.get("shot_type"),
                     "voice_start": scene.get("voice_start", 0),
                     "dialogue_lines": scene.get("dialogue_lines") or [],
+                    "reaction_focus": scene.get("reaction_focus"),
                     "character_state": scene.get("character_state"),
                     "scene_continuity": scene.get("scene_continuity"),
                     "transition_note": scene.get("transition_note"),
@@ -504,6 +517,7 @@ image_prompt 要求：
 - 对照已定的对白时间安排画面：台词所依赖的线索先进入可辨认的景别，揭晓句说出时保留说话人或听者的可见反应，句末留出反应的画面时间。片段的结尾优先停在事件结果或人物反应上。
 - 生图和视频提示词仅描述可拍摄的画面。对白用来安排动作与反应的时机，不把台词原文、字幕、标题、气泡或黑底字卡写入画面提示词。情节所需的道具内文字可单独描述。
 - 按 dialogue_lines 中的 speaker、text、start 安排说话者和听者反应。start 是段内计划秒点。关键对白期间留住能看清表情的构图，把转身和焦点转移留到反应之后。
+- 已有 reaction_focus 时按它安排关键配音的观看重点。说话者在画面内时双唇自然轻微开合、下颌微动；倾听者自然闭口。画外旁白不要求画面人物同步开口。
 - 禁止把后期字幕、字卡或标题安排写进 camera、action、起止状态、衔接说明或收尾构图。结尾保留剧情画面。
 {legacy_camera_rules}
 

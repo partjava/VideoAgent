@@ -9,6 +9,7 @@ from services.provider_factory import get_llm_service
 from services.task_service import task_service
 from services.camera_plan import normalize_camera_plan
 from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE
+from services.visual_style import PHOTO_RULES, PHOTO_EXCLUSIONS, lock_visual_style
 
 DEFAULT_IMAGE_NEGATIVE_PROMPT = "多余肢体，手指结构混乱，五官错位，无关文字，水印，主体边缘异常断裂"
 DEFAULT_VIDEO_NEGATIVE_PROMPT = "道具瞬移，非计划抖动，突然变脸，肢体穿模，多余肢体，服装颜色突变，画面撕裂，非计划倒放"
@@ -96,11 +97,12 @@ class PromptAgent:
                 if scene.get("start_state"):
                     prompt["image_prompt"] = f"首帧时刻的画面状态：{scene['start_state']}\n{prompt['image_prompt']}"
                 if _style == "短剧":
-                    style_lock = "真人实拍写实影视，真实人物比例、皮肤纹理、材质与光影。"
-                    prompt["image_prompt"] = f"{style_lock}\n{prompt['image_prompt']}"
-                    prompt["video_prompt"] = f"{style_lock}沿用首帧的真人质感。\n{prompt['video_prompt']}"
+                    style_lock = PHOTO_RULES
+                    prompt["image_prompt"] = lock_visual_style(prompt["image_prompt"], _style)
+                    prompt["video_prompt"] = lock_visual_style(prompt["video_prompt"], _style)
                     prompt["continuity_note"] = f"{style_lock}{prompt.get('continuity_note') or ''}"
-                    prompt["image_negative_prompt"] = "动画，卡通，漫画，插画，三渲二，游戏建模，塑料皮肤。" + str(prompt.get("image_negative_prompt") or prompt.get("negative_prompt") or "")
+                    prompt["image_negative_prompt"] = PHOTO_EXCLUSIONS + "，" + str(prompt.get("image_negative_prompt") or "")
+                    prompt["video_negative_prompt"] = PHOTO_EXCLUSIONS + "，" + str(prompt.get("video_negative_prompt") or "")
 
             if native:
                 prompts = []
