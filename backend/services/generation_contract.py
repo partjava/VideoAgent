@@ -1,7 +1,7 @@
 """Offline contracts shared by planning, generation and composition."""
 import math
 
-MAX_VOICE_SPEED = 1.2
+MAX_VOICE_SPEED = 1.25
 
 
 def build_timeline(scenes):
@@ -37,6 +37,15 @@ def validate_scene_durations(scenes, target=None, *, whole=False):
 
 WHOLE_GENERATION_MODE = "wan3_whole"
 PAIRED_GENERATION_MODE = "paired_5s"
+NATIVE_GENERATION_MODE = "native_10s"
+
+
+def validate_native_scenes(scenes, target_duration):
+    validate_scene_durations(scenes, target_duration)
+    for index, scene in enumerate(scenes):
+        if (scene["duration"] != 10 or scene.get("transition_type", "cut") != "cut"
+                or scene.get("need_dynamic_video") is not True):
+            raise ValueError(f"Native clip {index + 1} must be one dynamic 10-second clip with its own first frame")
 
 
 def validate_paired_scenes(scenes, target_duration):
@@ -50,16 +59,28 @@ def validate_paired_scenes(scenes, target_duration):
             raise ValueError(f"Paired clip {index + 1} must be dynamic, 5 seconds, and use {expected}")
 
 
+def _motion_seconds(value):
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value.endswith(("s", "秒")):
+            value = value[:-1].strip()
+    return float(value)
+
+
 def validate_motion_beats(beats, duration, *, detailed=False, per_second=False):
     if not isinstance(beats, list) or not beats:
         raise ValueError("Motion beats must cover entire scene")
     if per_second and len(beats) != duration:
         raise ValueError("Motion beats must have exactly one entry per second")
     cursor = 0.0
+    normalized = []
     for index, beat in enumerate(beats):
         if not isinstance(beat, dict):
             raise ValueError("Motion beat must be structured with start/end/action")
-        start, end = float(beat.get("start", -1)), float(beat.get("end", -1))
+        try:
+            start, end = _motion_seconds(beat["start"]), _motion_seconds(beat["end"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Motion beat {index + 1} must have valid start/end seconds") from exc
         if not all(math.isfinite(t) for t in (start, end)) or abs(start - cursor) > 0.01 or end <= start or end > duration + 0.01:
             raise ValueError("Motion beats must cover scene without gaps or overlaps")
         if per_second and (start != index or end != index + 1):
@@ -71,8 +92,13 @@ def validate_motion_beats(beats, duration, *, detailed=False, per_second=False):
                 if not isinstance(beat.get(field), str) or not beat[field].strip():
                     raise ValueError(f"Motion beat is missing {field}")
         cursor = end
+        normalized.append((start, end))
     if abs(cursor - duration) > 0.01:
         raise ValueError("Motion beats must cover entire scene")
+    for beat, (start, end) in zip(beats, normalized):
+        for field, value in (("start", start), ("end", end)):
+            if isinstance(beat[field], str):
+                beat[field] = int(value) if value.is_integer() else value
 
 
 def needs_video(scene):
@@ -125,6 +151,11 @@ def format_srt_time(seconds):
 def render_srt(scenes):
     cues = []
     for scene, row in zip(scenes, build_timeline(scenes)):
+        if scene.get("dialogue_audio"):
+            for line in scene["dialogue_audio"]:
+                start, end = (format_srt_time(row["start"] + line[field]) for field in ("start", "end"))
+                cues.append(f"{len(cues) + 1}\n{start} --> {end}\n{line['text']}\n")
+            continue
         text = str(scene.get("voiceover") or scene.get("subtitle") or "").strip()
         if not text:
             continue

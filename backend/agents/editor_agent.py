@@ -14,6 +14,22 @@ from agents.agent_utils import (
 )
 
 
+def _fit_dialogue_audio(source, speed, scheduled_duration):
+    import numpy as np
+
+    duration = min(scheduled_duration, source.duration / speed)
+
+    def read_frame(get_frame, time):
+        # MoviePy mixes whole sample batches before masking inactive clips.
+        source_time = np.asarray(time) * speed
+        active = (np.asarray(time) >= 0) & (np.asarray(time) < duration) & (source_time < source.duration)
+        if source_time.ndim == 0:
+            return get_frame(float(source_time)) if active else np.zeros(source.nchannels)
+        return get_frame(np.where(active, source_time, 0.0)) * active[:, None]
+
+    return source.fl(read_frame).set_duration(duration)
+
+
 class EditorAgent:
     agent_name = "EditorAgent"
 
@@ -124,7 +140,16 @@ class EditorAgent:
                             Image.fromarray(frame), canvas, method=Image.Resampling.LANCZOS)))
                     clips.append(clip)
                     audio_path = scene_audio_map.get(scene["scene_id"])
-                    if str(scene.get("voiceover") or "").strip() and not audio_path:
+                    if scene.get("dialogue_lines"):
+                        lines = scene.get("dialogue_audio") or []
+                        if len(lines) != len(scene["dialogue_lines"]):
+                            raise ValueError(f"Missing dialogue audio: {scene['scene_id']}")
+                        for line in lines:
+                            audio = resources.enter_context(AudioFileClip(str(resolve_media(line["path"]))))
+                            audio = _fit_dialogue_audio(audio, line["speed"], line["end"] - line["start"])
+                            audio_segments.append(audio.set_start(row["start"] + line["start"]))
+                        audio_path = None
+                    elif str(scene.get("voiceover") or "").strip() and not audio_path:
                         raise ValueError(f"Missing scene audio: {scene['scene_id']}")
                     if audio_path:
                         audio = resources.enter_context(AudioFileClip(str(resolve_media(audio_path))))

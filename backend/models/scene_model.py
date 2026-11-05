@@ -10,6 +10,7 @@ class Scene(BaseModel):
     duration: int = Field(..., ge=1)
     speaker: str | None = None
     voiceover: str | None = None
+    dialogue_lines: list[dict] = Field(default_factory=list)
     subtitle: str | None = None
     visual_description: str | None = None
     shot_type: str | None = None

@@ -9,7 +9,7 @@ from services.comfyui.workflow_store import WorkflowStore
 from services.video.base import BaseVideoService
 
 
-def prepare_video_workflow(data, client, image_path, prompt, duration, ratio):
+def prepare_video_workflow(data, client, image_path, prompt, duration, ratio, negative_prompt=None):
     import math
     mapping, workflow = data["mapping"], data["workflow"]
     required = {"positive_prompt", "image_path", "width", "height", "length", "fps"}
@@ -30,12 +30,16 @@ def prepare_video_workflow(data, client, image_path, prompt, duration, ratio):
     width, height = (704, 1280) if ratio == "9:16" else (1280, 704)
     values = {"positive_prompt": prompt, "image_path": "validation.png", "width": width,
               "height": height, "length": length, "fps": fps}
+    if negative_prompt and "negative_prompt" in mapping:
+        values["negative_prompt"] = negative_prompt
     apply_mapping(workflow, mapping, values)
     values["image_path"] = client.upload_image(image_path)
     return apply_mapping(workflow, mapping, values)
 
 
 class ComfyUIVideoService(BaseVideoService):
+    supports_negative_prompt = True
+
     def __init__(
         self,
         client: ComfyUIClient | None = None,
@@ -52,12 +56,13 @@ class ComfyUIVideoService(BaseVideoService):
         video_prompt: str | None = None,
         duration: int = 5,
         ratio: str = "9:16",
+        negative_prompt: str | None = None,
     ) -> dict[str, Any]:
         try:
             data = self.workflow_store.load_workflow("video")
             from services.media_quality import resolve_media, inspect_video
             workflow = prepare_video_workflow(data, self.client, resolve_media(image_path), video_prompt,
-                                              duration, ratio)
+                                              duration, ratio, negative_prompt)
             prompt_id = self.client.queue_prompt(workflow)
             history = self.client.wait_for_history(prompt_id)
             outputs = find_output_files(history, "videos")

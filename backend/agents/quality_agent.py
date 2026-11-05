@@ -46,7 +46,13 @@ class QualityAgent:
                             raise ValueError(f"Missing continuation evidence: {scene['scene_id']}")
                 elif not scene.get("image_path") or not resolve_media(scene["image_path"]).is_file():
                     raise ValueError(f"Missing scene image: {scene['scene_id']}")
-                if scene.get("voiceover") and (not scene.get("audio_path") or not resolve_media(scene["audio_path"]).is_file()):
+                dialogue = scene.get("dialogue_audio") or []
+                audio_ready = (
+                    len(dialogue) == len(scene["dialogue_lines"]) and all(resolve_media(line["path"]).is_file() for line in dialogue)
+                    if scene.get("dialogue_lines")
+                    else scene.get("audio_path") and resolve_media(scene["audio_path"]).is_file()
+                )
+                if scene.get("voiceover") and not audio_ready:
                     raise ValueError(f"Missing scene audio: {scene['scene_id']}")
             media = await anyio.to_thread.run_sync(
                 inspect_video, video_file, timeline[-1]["end"], task.get("ratio", "9:16"),

@@ -1,5 +1,5 @@
 <template>
-  <BasicLayout>
+  <component :is="embedded ? 'div' : BasicLayout">
     <main class="studio">
       <section class="studio-hero">
         <div>
@@ -19,8 +19,8 @@
           <div class="meter" role="progressbar" aria-label="制作进度" :aria-valuenow="progress" aria-valuemin="0" aria-valuemax="100">
             <div :style="{ width: progress + '%' }"></div>
           </div>
-          <RouterLink v-if="status === 'success'" class="primary" :to="'/preview/' + taskId">观看成片 →</RouterLink>
-          <button v-else-if="status === 'failed' || task?.status === 'created'" class="primary" :disabled="starting" @click="resume">
+        <RouterLink v-if="status === 'success' && !embedded" class="primary" :to="'/preview/' + taskId">观看成片 →</RouterLink>
+          <button v-else-if="status === 'failed' || task?.status === 'created'" class="primary" :disabled="starting || !!voiceRetry" @click="resume">
             {{ starting ? '正在启动…' : status === 'failed' ? '继续生成' : '开始生成' }}
           </button>
         </div>
@@ -37,7 +37,7 @@
           </div>
           <ol class="steps">
             <li v-for="(step, index) in steps" :key="step.key">
-              <button :class="[stepState(step), { selected: active.key === step.key }]" :aria-pressed="active.key === step.key" @click="selected = step.key">
+              <button type="button" :class="[stepState(step), { selected: active.key === step.key }]" :aria-pressed="active.key === step.key" aria-controls="stage-panel" @click="selectStep(step.key)">
                 <span class="step-index">{{ String(index + 1).padStart(2, '0') }}</span>
                 <span class="step-name">{{ step.title }}</span>
                 <span class="step-status">{{ stateLabels[stepState(step)] }}</span>
@@ -47,7 +47,7 @@
         </aside>
 
         <div class="workspace">
-          <section class="panel stage" aria-labelledby="stage-title">
+          <section id="stage-panel" ref="stagePanel" class="panel stage" :class="{ 'stage-selected': selected }" aria-labelledby="stage-title">
             <div class="stage-header">
               <div>
                 <span class="eyebrow">STEP {{ String(steps.indexOf(active) + 1).padStart(2, '0') }} / {{ steps.length }}</span>
@@ -85,6 +85,7 @@
             <div v-else class="stage-output summary">
               <span class="signal" :class="stepState(active)"></span>
               {{ stageSummary }}
+              <button v-if="selectedArtifactId" type="button" class="copy-prompt" @click="jumpToArtifact">查看对应产物</button>
               <a v-if="active.key === 'SubtitleAgent' && subtitleFile" :href="subtitleFile" download>下载 SRT</a>
             </div>
           </section>
@@ -99,32 +100,85 @@
               <div v-if="task?.generation_mode === 'paired_5s' && i % 2 === 0" class="story-section-label">
                 段落 {{ Math.floor(i / 2) + 1 }} · {{ shotTimes[i] }}
               </div>
-              <article class="shot">
-              <div class="shot-media">
-                <video v-if="scene.video_path" :src="mediaUrl(scene.video_path)" controls preload="metadata" playsinline></video>
-                <img v-else-if="scene.image_path" :src="mediaUrl(scene.image_path)" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+              <article :id="'shot-output-' + scene.scene_id" class="shot">
+              <div class="shot-media" :class="{ 'focused-media': (selected === 'ImageAgent' && firstFrame(scene)) || (selected === 'VideoAgent' && scene.video_path) }">
+                <img v-if="selected === 'ImageAgent' && firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+                <video v-else-if="scene.video_path" :src="mediaUrl(scene.video_path)" controls preload="metadata" playsinline></video>
+                <img v-else-if="firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
                 <div v-else class="frame-placeholder"><span>◫</span><small>等待画面</small></div>
               </div>
               <div class="shot-body">
                 <div class="shot-title"><h3>镜头 {{ String(i + 1).padStart(2, '0') }}</h3><span>{{ shotTimes[i] }} · {{ scene.duration }} 秒</span></div>
-                <p v-if="scene.visual_description">{{ scene.visual_description }}</p>
-                <p v-if="scene.voiceover" class="narration">{{ scene.voiceover }}</p>
+                <p v-if="scene.visual_description" :class="{ 'selected-output': selected === 'StoryboardAgent' }">{{ scene.visual_description }}</p>
+                <p v-if="scene.voiceover" class="narration" :class="{ 'selected-output': selected === 'DialoguePolishAgent' }">{{ scene.voiceover }}</p>
+                <p v-if="scene.audio_text"><strong>实际配音稿</strong> {{ scene.audio_text }}</p>
+                <div v-for="(line, index) in scene.dialogue_audio || []" :key="index" class="voice-output">
+                  <p><strong>{{ line.speaker }}</strong> · {{ seconds(line.start) }}–{{ seconds(line.end) }} 秒 · {{ line.text }}</p>
+                  <audio :src="mediaUrl(line.path)" controls preload="none"></audio>
+                </div>
+                <template v-if="status === 'failed' && stepState(steps.find(step => step.key === 'VoiceAgent')) === 'failed' && !scene.audio_path && !scene.dialogue_audio?.length && scene.voiceover">
+                  <label v-if="!scene.dialogue_lines?.length">配音重试稿
+                    <textarea v-model="scene.voiceover" rows="3" :disabled="!!voiceRetry"></textarea>
+                  </label>
+                  <button type="button" class="copy-prompt" :disabled="!!voiceRetry || starting" @click="retryVoice(scene)">
+                    {{ voiceRetry === scene.scene_id ? '正在重新配音…' : '重新生成配音' }}
+                  </button>
+                </template>
+                <p v-if="voiceFeedback.sceneId === scene.scene_id" role="status">{{ voiceFeedback.text }}</p>
+                <details v-if="scene.previous_segment_context" class="segment-context">
+                  <summary>写提示词时参考的上一段</summary>
+                  <p v-if="scene.previous_segment_context.key_action || scene.previous_segment_context.visual_description"><strong>关键动作</strong> {{ scene.previous_segment_context.key_action || scene.previous_segment_context.visual_description }}</p>
+                  <p v-if="scene.previous_segment_context.voiceover"><strong>旁白</strong> {{ scene.previous_segment_context.voiceover }}</p>
+                  <p v-if="scene.previous_segment_context.final_second?.end_state"><strong>秒末人物与道具状态</strong> {{ scene.previous_segment_context.final_second.end_state }}</p>
+                  <p v-if="scene.previous_segment_context.closing_composition || scene.previous_segment_context.final_second?.camera"><strong>计划收尾构图</strong> {{ scene.previous_segment_context.closing_composition || scene.previous_segment_context.final_second.camera }}</p>
+                </details>
                 <div class="shot-tags">
                   <span v-if="scene.status === 'static_fallback'" class="badge failed">静态替代</span>
                   <span v-else-if="scene.video_path" class="badge success">片段已生成</span>
                   <span v-else-if="scene.image_path" class="badge neutral">首帧就绪</span>
                   <span v-if="scene.audio_path" class="badge neutral">配音就绪</span>
                 </div>
-                <audio v-if="scene.audio_path" :src="mediaUrl(scene.audio_path)" :aria-label="'镜头 ' + (i + 1) + ' 配音'" controls preload="none"></audio>
-                <details v-if="scene.motion_beats?.length || scene.image_prompt || scene.video_prompt">
+                <div v-if="scene.audio_path" class="voice-output" :class="{ 'selected-output': selected === 'VoiceAgent' }">
+                  <audio :src="mediaUrl(scene.audio_path)" :aria-label="'镜头 ' + (i + 1) + ' 配音'" controls preload="none"></audio>
+                  <p v-if="scene.audio_duration > 0">
+                    画面 {{ seconds(scene.duration) }} 秒 · 旁白起点 {{ seconds(scene.voice_start || 0) }} 秒
+                    · 原始读时 {{ seconds(scene.audio_duration) }} 秒
+                    <template v-if="scene.voice_end != null">
+                      · 合成后旁白结束于第 {{ seconds(scene.voice_end) }} 秒
+                      · 结尾留白 {{ seconds(Math.max(0, scene.duration - scene.voice_end)) }} 秒
+                    </template>
+                  </p>
+                  <p v-if="scene.duration === 10 && scene.voice_end != null && scene.voice_end - (scene.voice_start || 0) < 5">
+                    这段旁白实读不足 5 秒，可先试听，确认是否需要留白。
+                  </p>
+                </div>
+                <details v-if="scene.motion_beats?.length || scene.image_prompt || scene.video_prompt" :class="{ 'selected-output': selected === 'PromptAgent' }" :open="selected === 'PromptAgent'">
                   <summary>动作节拍与生成提示</summary>
                   <ol v-if="scene.motion_beats?.length" class="beats">
                     <li v-for="(beat, j) in scene.motion_beats" :key="j">
-                      {{ typeof beat === 'string' ? beat : (beat.start ?? '—') + '–' + (beat.end ?? '—') + ' 秒 · ' + (beat.action || '') }}
+                      <template v-if="typeof beat === 'string'">{{ beat }}</template>
+                      <template v-else>
+                        <strong>{{ beat.start ?? '—' }}–{{ beat.end ?? '—' }} 秒</strong>
+                        <p v-if="beat.camera"><strong>构图与机位</strong> {{ beat.camera }}</p>
+                        <p v-if="beat.start_state"><strong>起始画面</strong> {{ beat.start_state }}</p>
+                        <p><strong>可见动作</strong> {{ beat.subject }} {{ beat.action }}</p>
+                        <p v-if="beat.end_state"><strong>秒末画面</strong> {{ beat.end_state }}</p>
+                      </template>
                     </li>
                   </ol>
                   <p v-if="scene.image_prompt"><strong>首帧</strong> {{ scene.image_prompt }}</p>
                   <p v-if="scene.video_prompt"><strong>运动</strong> {{ scene.video_prompt }}</p>
+                  <details v-if="scene.planned_video_prompt" class="prompt-version">
+                    <summary>待提交视频提示词</summary>
+                    <pre>{{ scene.planned_video_prompt }}</pre>
+                    <button type="button" class="copy-prompt" @click="copyPrompt(scene, scene.planned_video_prompt, '待提交')">复制待提交提示词</button>
+                  </details>
+                  <details v-if="scene.submitted_video_prompt" class="prompt-version">
+                    <summary>实际提交的视频提示词</summary>
+                    <pre>{{ scene.submitted_video_prompt }}</pre>
+                    <button type="button" class="copy-prompt" @click="copyPrompt(scene, scene.submitted_video_prompt, '实际提交')">复制实际提交提示词</button>
+                  </details>
+                  <small v-if="copyFeedback.sceneId === scene.scene_id" role="status">{{ copyFeedback.text }}</small>
                 </details>
               </div>
               </article>
@@ -133,11 +187,11 @@
         </div>
       </div>
     </main>
-  </BasicLayout>
+  </component>
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import BasicLayout from '../layouts/BasicLayout.vue'
 import { videoApi } from '../api/video'
@@ -159,10 +213,63 @@ const steps = [
 const stateLabels = { success: '已完成', running: '进行中', failed: '失败', waiting: '待开始' }
 const route = useRoute()
 const taskId = computed(() => String(route.params.id || ''))
+defineProps({ embedded: Boolean })
+const voiceRetry = ref(null)
+const voiceFeedback = ref({})
+async function retryVoice(scene) {
+  voiceRetry.value = scene.scene_id
+  voiceFeedback.value = {}
+  try {
+    await videoApi.rerunScene(taskId.value, scene.scene_id, {
+      rerun_type: 'voice',
+      ...(scene.dialogue_lines?.length ? {} : { voiceover: scene.voiceover }),
+    })
+    scenes.value = await videoApi.getStoryboard(taskId.value)
+    voiceFeedback.value = { sceneId: scene.scene_id, text: '配音已保存，可以继续生成。' }
+  } catch (error) {
+    voiceFeedback.value = { sceneId: scene.scene_id, text: error.message }
+  } finally {
+    voiceRetry.value = null
+  }
+}
 const task = ref(null)
 const script = ref(null)
 const scenes = ref([])
 const selected = ref('')
+const copyFeedback = ref({})
+const seconds = value => Number(value).toFixed(1)
+const firstFrame = scene => scene.continuity_input_path || scene.image_path
+async function copyPrompt(scene, prompt, version) {
+  try {
+    await navigator.clipboard.writeText(prompt)
+    copyFeedback.value = { sceneId: scene.scene_id, text: `已复制${version}的提示词` }
+  } catch {
+    copyFeedback.value = { sceneId: scene.scene_id, text: '复制失败，请检查浏览器剪贴板权限' }
+  }
+}
+const stagePanel = ref(null)
+const selectedArtifactId = computed(() => {
+  const ready = {
+    ImageAgent: firstFrame,
+    VoiceAgent: scene => scene.audio_path || scene.dialogue_audio?.length,
+    VideoAgent: scene => scene.video_path,
+  }[selected.value]
+  return ready ? scenes.value.find(ready)?.scene_id : null
+})
+function jumpToArtifact() {
+  document.getElementById('shot-output-' + selectedArtifactId.value)?.scrollIntoView({
+    block: 'start',
+    behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+  })
+}
+async function selectStep(key) {
+  selected.value = key
+  await nextTick()
+  stagePanel.value?.scrollIntoView({
+    block: 'start',
+    behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+  })
+}
 const starting = ref(false)
 const connectionIssue = ref('')
 const plan = computed(() => task.value?.metadata?.task_plan)
@@ -211,9 +318,11 @@ const stageSummary = computed(() => {
   const summaries = {
     StoryboardAgent: `已保存 ${scenes.value.length} 个分镜`,
     DialoguePolishAgent: `已润色 ${count('dialogue_polished')} 个镜头`,
-    PromptAgent: `已有 ${count('motion_beats')} 个镜头具备动作节拍`,
+    PromptAgent: task.value?.metadata?.prompt_active_segment && stepState(active.value) === 'running'
+      ? `已保存 ${count('motion_beats')} 段 · 正在编写第 ${task.value.metadata.prompt_active_segment} 段`
+      : `已保存 ${count('motion_beats')} 段逐秒提示词`,
     ImageAgent: `已有 ${count('image_path')} 张首帧`,
-    VoiceAgent: `已有 ${count('audio_path')} 段配音`,
+    VoiceAgent: `已有 ${scenes.value.filter(scene => scene.audio_path || scene.dialogue_audio?.length).length} 段配音`,
     VideoAgent: `已有 ${count('video_path')} 个动态片段`
   }
   return summaries[active.value.key] || stateLabels[stepState(active.value)]
@@ -330,6 +439,15 @@ h1, h2, h3, p { margin: 0; }
 .steps button { display: grid; grid-template-columns: 30px 1fr auto; width: 100%; gap: 9px; align-items: center; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 9px; color: var(--ink); font: inherit; cursor: pointer; }
 .steps button:hover { background: #f2f6fb; }
 .steps .selected { background: #eaf1fc; border-color: #d7e5fa; }
+.stage, .shot { scroll-margin-top: 16px; }
+.stage-selected { border-color: #818cf8; box-shadow: 0 0 0 2px #e0e7ff; }
+.stage-selected #stage-title { color: #312e81; font-weight: 800; }
+.stage-selected .stage-header p { font-weight: 650; }
+.shot-body .selected-output { background: #eef2ff; color: #312e81; border-radius: 6px; padding: 8px 10px; font-weight: 650; }
+.shot-media.focused-media { outline: 3px solid #818cf8; outline-offset: 3px; }
+.voice-output { margin-top: 8px; }
+.copy-prompt { margin: 8px 8px 0 0; padding: 5px 9px; border: 1px solid #a5b4fc; border-radius: 6px; background: white; color: #3730a3; cursor: pointer; }
+.prompt-version pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-weight: 400; }
 .step-index { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 7px; background: #edf1f6; font-size: 11px; font-weight: 750; color: #58677d; }
 .steps .success .step-index { background: #e5f5eb; color: #276342; }
 .steps .running .step-index { background: #cde4ff; color: #1e5188; }

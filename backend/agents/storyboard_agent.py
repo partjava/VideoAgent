@@ -6,7 +6,7 @@ from core.database import mongodb
 from models.scene_model import Scene
 from models.task_model import VideoTaskStatus
 from services.provider_factory import get_llm_service
-from services.generation_contract import PAIRED_GENERATION_MODE, build_timeline, validate_paired_scenes, validate_scene_durations, voice_window, scene_event_offset
+from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE, build_timeline, validate_native_scenes, validate_paired_scenes, validate_scene_durations, voice_window, scene_event_offset
 
 from agents.agent_utils import (
     SCENES_COLLECTION,
@@ -144,6 +144,19 @@ class StoryboardAgent:
                     )
             )
             target_duration = _target_duration
+            segments = script.get("segments") or []
+            if _generation_mode == NATIVE_GENERATION_MODE and segments:
+                if len(scenes_data) != len(segments):
+                    raise ValueError("原生10秒分镜必须与剧本段落一一对应")
+                scenes_data.sort(key=lambda scene: int(scene["scene_index"]))
+                for scene, segment in zip(scenes_data, segments):
+                    lines = segment.get("dialogue_lines") or []
+                    voiceover = "\n".join(line["text"] for line in lines) if lines else segment.get("voiceover", "")
+                    scene.update(
+                        voiceover=voiceover, subtitle=voiceover,
+                        voice_start=lines[0]["start"] if lines else segment["voice_start"],
+                        dialogue_lines=lines,
+                    )
             validate_storyboard_scenes(
                 scenes_data,
                 target_duration=target_duration,
@@ -153,6 +166,8 @@ class StoryboardAgent:
 
             if _generation_mode == PAIRED_GENERATION_MODE:
                 validate_paired_scenes(scenes_data, target_duration)
+            elif _generation_mode == NATIVE_GENERATION_MODE:
+                validate_native_scenes(scenes_data, target_duration)
 
             saved_scenes: list[dict[str, object]] = []
             for item in scenes_data:
@@ -162,6 +177,7 @@ class StoryboardAgent:
                     task_id=task_id,
                     scene_index=int(item["scene_index"]),
                     duration=int(item["duration"]),
+                    dialogue_lines=item.get("dialogue_lines") or [],
                     voice_cue=item.get("voice_cue"),
                     voice_start=item.get("voice_start", 0),
                     sound_cues=item.get("sound_cues") or [],

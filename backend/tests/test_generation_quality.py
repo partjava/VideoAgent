@@ -44,6 +44,7 @@ class GenerationContractTest(unittest.TestCase):
     def test_voiceover_speed_is_bounded(self):
         self.assertEqual(voice_speed("a", 3, 5), 1)
         self.assertAlmostEqual(voice_speed("a", 5.5, 5), 1.1)
+        self.assertAlmostEqual(voice_speed("a", 6.1, 5), 1.22)
         with self.assertRaisesRegex(ValueError, "Voice too long"):
             voice_speed("a", 7, 5)
 

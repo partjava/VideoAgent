@@ -52,21 +52,45 @@ class ImageAgent:
             for scene in task_scenes:
                 scene_id = str(scene["scene_id"])
 
+                disk_img = backend_dir / "assets" / task_id / "images" / f"{scene_id}.png"
                 existing_path = scene.get("image_path")
-                if existing_path:
-                    clean_path = str(existing_path).replace("backend/", "")
-                    abs_path = backend_dir / clean_path
-                    if abs_path.is_file():
-                        if scene.get("status") == "static_fallback":
-                            continue
-                        existing_asset = await mongodb.find_one(
-                            ASSETS_COLLECTION,
-                            {"task_id": task_id, "scene_id": scene_id, "asset_type": "image"}
+                has_valid_img = (existing_path and (backend_dir / str(existing_path).replace("backend/", "")).is_file()) or (disk_img.is_file() and disk_img.stat().st_size > 1024)
+
+                if has_valid_img:
+                    rel_path = f"backend/assets/{task_id}/images/{scene_id}.png"
+                    if scene.get("status") == "static_fallback":
+                        continue
+                    existing_asset = await mongodb.find_one(
+                        ASSETS_COLLECTION,
+                        {"task_id": task_id, "scene_id": scene_id, "asset_type": "image"}
+                    )
+                    if not existing_asset:
+                        asset = Asset(
+                            asset_id=f"asset_{uuid4().hex[:12]}",
+                            task_id=task_id,
+                            scene_id=scene_id,
+                            asset_type="image",
+                            path=rel_path,
+                            source=str(image_service.__class__.__name__),
+                            status="success",
+                            created_at=now,
+                            updated_at=now,
                         )
-                        if existing_asset:
-                            assets.append(existing_asset)
-                            print(f"[ImageAgent] Image already exists for {scene_id}, skipping generation.")
-                            continue
+                        await mongodb.replace_one(
+                            ASSETS_COLLECTION,
+                            {"_id": asset.asset_id},
+                            with_document_id(asset.model_dump(), asset.asset_id),
+                            upsert=True,
+                        )
+                        existing_asset = asset.model_dump()
+                    await mongodb.update_one(
+                        SCENES_COLLECTION,
+                        {"_id": f"{task_id}_{scene_id}"},
+                        {"image_path": rel_path, "status": "image_done", "updated_at": now},
+                    )
+                    assets.append(existing_asset)
+                    print(f"[ImageAgent] Image already exists for {scene_id}, reused existing file.")
+                    continue
 
                 scenes_to_generate.append(scene)
 

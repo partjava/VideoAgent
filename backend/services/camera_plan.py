@@ -2,25 +2,52 @@
 from math import isfinite
 
 
-def normalize_camera_plan(raw, duration):
+def default_camera_plan(duration=10):
+    return {
+        "purpose": "主体动作展示与场景呈现",
+        "focus": "主行动角色与关键互动点",
+        "framing": "中景 (MS)",
+        "viewpoint": "平视主体正面略侧微仰",
+        "opening": "主体居中偏中下，环境背景清晰",
+        "closing": "主体动作定格，留出后续衔接空间",
+        "handoff": "主体动作进行中，保持视线与动势连续",
+        "movement": "fixed",
+        "direction": "保持机位稳定",
+        "move_start": 0.0,
+        "move_end": 0.0,
+    }
+
+
+def normalize_camera_plan(raw, duration=10):
+    defaults = default_camera_plan(duration)
     if not isinstance(raw, dict):
-        raise ValueError("Missing section camera plan")
+        return defaults
     plan = {}
     for field in ("purpose", "focus", "framing", "viewpoint", "opening", "closing", "handoff"):
         value = raw.get(field)
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"Camera plan requires {field}")
-        plan[field] = value.strip()
+            plan[field] = defaults[field]
+        else:
+            plan[field] = value.strip()
     move = raw.get("movement")
     if move not in {"fixed", "track", "pan", "tilt", "push", "pull"}:
-        raise ValueError("Unsupported camera movement")
-    start = float(raw.get("move_start", 0))
-    end = float(raw.get("move_end", 0))
-    if not isfinite(start) or not isfinite(end) or not 0 <= start <= end <= duration:
-        raise ValueError("Camera movement must stay inside the section")
+        move = "fixed"
+    try:
+        start = float(raw.get("move_start", 0))
+    except (ValueError, TypeError):
+        start = 0.0
+    try:
+        end = float(raw.get("move_end", 0))
+    except (ValueError, TypeError):
+        end = 0.0
+    if not isfinite(start) or not isfinite(end) or start < 0 or end > duration or start > end:
+        start, end = 0.0, 0.0
+        move = "fixed"
     direction = str(raw.get("direction") or "").strip()
     if move != "fixed" and (not direction or end <= start):
-        raise ValueError("Moving camera requires direction and a positive time window")
+        move = "fixed"
+        direction = "保持机位稳定"
+        start, end = 0.0, 0.0
     plan.update(movement=move, direction=direction, move_start=start, move_end=end)
     return plan
 

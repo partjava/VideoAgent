@@ -13,9 +13,9 @@
 
       <el-form-item label="画面风格" class="style-select">
         <el-radio-group v-model="form.style" class="style-group">
-          <el-radio-button label="">自动</el-radio-button>
-          <el-radio-button label="漫剧">漫剧（漫画风格）</el-radio-button>
-          <el-radio-button label="短剧">短剧（写实风格）</el-radio-button>
+          <el-radio-button value="">自动</el-radio-button>
+          <el-radio-button value="漫剧">漫画风格</el-radio-button>
+          <el-radio-button value="短剧">真人写实</el-radio-button>
         </el-radio-group>
       </el-form-item>
 
@@ -48,7 +48,7 @@
 
       <el-form-item label="生成方式">
         <el-select v-model="form.generation_mode" @change="form.duration = 0">
-          <el-option label="双段续接 · 每 10 秒一组" value="paired_5s" />
+          <el-option label="原生 10 秒 · 每段一次生成" value="native_10s" />
           <el-option label="Wan 3.0 整段 · 最长 30 秒" value="wan3_whole" />
         </el-select>
       </el-form-item>
@@ -91,7 +91,7 @@ const form = reactive({
   style: '',
   platform: '抖音',
   ratio: '9:16',
-  generation_mode: 'paired_5s',
+  generation_mode: 'native_10s',
   intro_title: '',
   subtitle_style: 'standard'
 })

@@ -46,25 +46,31 @@ class QwenImageService(BaseImageService):
                     "size": "1080*1920"
                 }
             }
+            if negative_prompt:
+                if profile["model"].startswith("qwen-image-2.0"):
+                    payload["parameters"]["negative_prompt"] = negative_prompt[:500]
+                else:
+                    content_list[0]["text"] = f"{image_prompt}\n请避免出现：{negative_prompt}"
 
             import time
             res = None
             max_retries = 6
             backoff_factor = 2.0
 
-            with httpx.Client(timeout=60.0) as client:
+            with httpx.Client(timeout=180.0) as client:
                 for attempt in range(max_retries):
-                    res = client.post(submit_url, json=payload, headers=headers)
                     try:
+                        res = client.post(submit_url, json=payload, headers=headers)
                         res.raise_for_status()
                         break
-                    except httpx.HTTPStatusError as err:
-                        if res.status_code == 429 and attempt < max_retries - 1:
+                    except (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TransportError) as err:
+                        if attempt < max_retries - 1:
                             sleep_time = (backoff_factor ** attempt) + 1.0
-                            print(f"[QwenImageService] Got 429 Too Many Requests. Retrying in {sleep_time}s... (Attempt {attempt+1}/{max_retries})")
+                            print(f"[QwenImageService] Request error ({err}). Retrying in {sleep_time}s... (Attempt {attempt+1}/{max_retries})")
                             time.sleep(sleep_time)
                             continue
-                        print(f"DashScope API Error Response: {res.text}")
+                        if hasattr(err, "response") and err.response is not None:
+                            print(f"DashScope API Error Response: {err.response.text}")
                         raise err
                 
                 res_data = res.json()

@@ -11,6 +11,15 @@ from services.media_quality import inspect_video
 
 
 class OfflineMediaTest(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch("services.model_config.PATH", Path(directory) / "models.json"))
+        self.enterContext(patch("services.video.wan_video_service.model_config", return_value={
+            "url": "https://example.invalid",
+            "model": "wan2.6-i2v-flash",
+            "key": "fake",
+        }))
+
     def test_pipeline_waits_for_voice_and_images_before_video(self):
         from contextlib import ExitStack
         from agents import pipeline
@@ -187,7 +196,7 @@ class OfflineMediaTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "square.png"
             Image.new("RGB", (200, 200)).save(path)
-            service = WanVideoService(model="wan2.7-i2v", storage_root=tmp)
+            service = WanVideoService(model="wan2.2-i2v-plus", storage_root=tmp)
 
             def upload(frame):
                 with Image.open(frame) as img:
@@ -200,7 +209,7 @@ class OfflineMediaTest(unittest.TestCase):
             client.post.side_effect = RuntimeError("stop after capturing request")
             with patch.object(service, "_upload_file", side_effect=upload), \
                  patch("services.video.wan_video_service.settings", SimpleNamespace(
-                     enable_paid_api=True, dashscope_api_key="fake", wan_video_model="wan2.7-i2v")), \
+                     enable_paid_api=True, dashscope_api_key="fake", wan_video_model="wan2.2-i2v-plus")), \
                  patch("services.video.wan_video_service.httpx.Client", return_value=client):
                 with self.assertRaisesRegex(RuntimeError, "stop after capturing request"):
                     service.generate_video("offline", "a", str(path), duration=7, ratio="16:9")

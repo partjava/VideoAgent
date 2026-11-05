@@ -21,6 +21,8 @@ from services.generation_contract import (
     validate_motion_beats,
     validate_scene_durations,
     PAIRED_GENERATION_MODE,
+    NATIVE_GENERATION_MODE,
+    validate_native_scenes,
     WHOLE_GENERATION_MODE,
     validate_paired_scenes,
     voice_speed,
@@ -33,9 +35,19 @@ from services.video.base import VideoRenderRejected
 from services.video_vision import replan_from_tail, review_enabled, review_opening_frame
 
 
-def render_signature(service, first_digest, prompt, duration, ratio):
+def video_prompt_options(service, scene):
+    negative = scene.get("video_negative_prompt")
+    if isinstance(negative, str) and negative.strip() and getattr(service, "supports_negative_prompt", False) is True:
+        return {"negative_prompt": negative.strip()}
+    return {}
+
+
+def render_signature(service, first_digest, prompt, duration, ratio, *, negative_prompt=None):
     provider = f"{type(service).__module__}.{type(service).__qualname__}:{getattr(service, 'model', '')}:{getattr(service, 'api_base', '')}"
-    return sha256(repr((provider, first_digest, prompt, duration, ratio)).encode()).hexdigest()
+    parts = (provider, first_digest, prompt, duration, ratio)
+    if negative_prompt:
+        parts += (negative_prompt,)
+    return sha256(repr(parts).encode()).hexdigest()
 
 
 async def prepare_motion_prompt(scene, previous, first, first_digest):
@@ -77,10 +89,15 @@ def _build_motion_prompt(scene):
     # 2. 秒级时间切片进度 (seedance2-skill 语法: 结构化动作演进与动力学向量)
     timeline_slices = []
     for b in beats:
-        cam_info = f"，镜头: {b['camera']}" if not plan and b.get("camera") and b.get("camera") != camera_motion else ""
-        timeline_slices.append(
-            f"【{b['start']}-{b['end']}秒】{b.get('subject', '')} {b['action']}{cam_info}。"
-        )
+        fields = []
+        if b.get("camera") and b["camera"] != "沿用分组运镜计划":
+            fields.append(f"构图与机位：{b['camera']}")
+        if b.get("start_state"):
+            fields.append(f"起始画面与位置：{b['start_state']}")
+        fields.append(f"可见动作：{b.get('subject', '')} {b['action']}".strip())
+        if b.get("end_state"):
+            fields.append(f"秒末画面：{b['end_state']}")
+        timeline_slices.append(f"【{b['start']}-{b['end']}秒】" + "｜".join(fields))
     timeline_block = "\n".join(timeline_slices)
 
     # 3. 角色一致性与物理结算 (Seedance 角色锁定与尾帧锚定)
@@ -129,12 +146,22 @@ class VideoAgent:
             task = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
             ratio = str(task.get("ratio", "9:16"))
             paired = task.get("generation_mode") == PAIRED_GENERATION_MODE
+            native = task.get("generation_mode") == NATIVE_GENERATION_MODE
             if paired:
                 validate_paired_scenes(scenes, task.get("duration"))
+            elif native:
+                validate_native_scenes(scenes, task.get("duration"))
+                for scene in scenes:
+                    validate_motion_beats(scene.get("motion_beats"), 10, detailed=True, per_second=True)
             else:
                 validate_scene_durations(scenes, task.get("duration"), whole=task.get("generation_mode") == WHOLE_GENERATION_MODE)
             # Fail before submitting paid clips if the soundtrack cannot fit the timeline.
             for scene in scenes:
+                if scene.get("dialogue_lines"):
+                    audio = scene.get("dialogue_audio") or []
+                    if len(audio) != len(scene["dialogue_lines"]) or not all(resolve_media(line["path"]).is_file() for line in audio):
+                        raise ValueError(f"Dialogue tracks not ready for scene {scene['scene_id']}")
+                    continue
                 if str(scene.get("voiceover") or "").strip():
                     audio_path = scene.get("audio_path")
                     if not audio_path or not resolve_media(audio_path).is_file():
@@ -168,7 +195,8 @@ class VideoAgent:
                 first_digest = sha256(resolve_media(first).read_bytes()).hexdigest()
                 previous = scenes[index - 1] if index else None
                 prompt, observed = await prepare_motion_prompt(scene, previous, first, first_digest)
-                signature = render_signature(service, first_digest, prompt, duration, ratio)
+                prompt_options = video_prompt_options(service, scene)
+                signature = render_signature(service, first_digest, prompt, duration, ratio, **prompt_options)
                 reusable = asset and asset.get("render_signature") == signature
                 if not cached_path or not resolve_media(cached_path).is_file() or not reusable:
                     if scene.get("camera_plan") and scene.get("transition_type") != "continue_action" and review_enabled():
@@ -184,10 +212,11 @@ class VideoAgent:
                     try:
                         result = await anyio.to_thread.run_sync(
                             lambda: service.generate_video(task_id=task_id, scene_id=sid, image_path=first,
-                                                           video_prompt=prompt, duration=duration, ratio=ratio)
+                                                           video_prompt=prompt, duration=duration, ratio=ratio,
+                                                           **prompt_options)
                         )
                     except Exception as exc:
-                        if paired or task.get("generation_mode") == WHOLE_GENERATION_MODE or (not isinstance(exc, VideoRenderRejected) and not isinstance(exc.__cause__, VideoRenderRejected)):
+                        if paired or native or task.get("generation_mode") == WHOLE_GENERATION_MODE or (not isinstance(exc, VideoRenderRejected) and not isinstance(exc.__cause__, VideoRenderRejected)):
                             raise
                         await mongodb.update_one(SCENES_COLLECTION, key, {
                             "video_path": None, "image_path": first, "need_dynamic_video": False,
@@ -206,9 +235,11 @@ class VideoAgent:
                     asset["provider_task_id"] = result.get("provider_task_id")
                     asset["first_frame_digest"] = first_digest
                     asset["render_signature"] = signature
+                    asset["submitted_video_prompt"] = prompt
                     await mongodb.replace_one(ASSETS_COLLECTION, {"_id": asset_id},
                                               with_document_id(asset, asset_id), upsert=True)
                     await mongodb.update_one(SCENES_COLLECTION, key, {"video_path": asset["path"],
+                                              "submitted_video_prompt": prompt,
                                               "continuity_input_path": first, "need_dynamic_video": True, "stale_tail": False,
                                               "status": "video_done", "updated_at": now})
                 elif scene.get("stale_tail") or scene.get("video_path") != cached_path or (

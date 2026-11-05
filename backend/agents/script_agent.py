@@ -54,6 +54,7 @@ class ScriptAgent:
                 }
 
             llm_service = get_llm_service()
+            task_plan = {**task_plan, "generation_mode": task.get("generation_mode", "full_dynamic")}
             script_data = await anyio.to_thread.run_sync(
                 lambda _plan=task_plan: llm_service.generate_script(_plan)
             )
@@ -64,6 +65,7 @@ class ScriptAgent:
                 title=script_data.get("title") if isinstance(script_data.get("title"), str) else None,
                 hook=script_data.get("hook") if isinstance(script_data.get("hook"), str) else None,
                 content=str(script_data.get("content", "")),
+                segments=script_data.get("segments") or [],
                 ending=script_data.get("ending") if isinstance(script_data.get("ending"), str) else None,
                 publish_copy=script_data.get("publish_copy") if isinstance(script_data.get("publish_copy"), str) else None,
                 source=str(script_data.get("source", "deepseek")),
@@ -71,6 +73,8 @@ class ScriptAgent:
                 created_at=now,
                 updated_at=now,
             )
+            if task.get("generation_mode") == "native_10s" and sum(segment.duration for segment in script.segments) != task.get("duration"):
+                raise ValueError("剧本段落时长必须等于任务时长")
             await mongodb.replace_one(
                 SCRIPTS_COLLECTION,
                 {"_id": script.script_id},

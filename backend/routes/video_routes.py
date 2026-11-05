@@ -14,17 +14,17 @@ from models.response_model import ApiResponse
 from models.task_model import CreateVideoTaskRequest, VideoTaskStatus, RerunSceneRequest
 from services.task_service import task_service
 from services.provider_factory import get_llm_service
-from agents.voice_agent import clean_tts_text
+from agents.voice_agent import clean_tts_text, synthesize_dialogue
 from services.tts_service import resolve_voice_for_speaker, tts_service
 from agents.editor_agent import EditorAgent
 from agents.quality_agent import QualityAgent
 from agents.subtitle_agent import SubtitleAgent
 from agents.export_agent import ExportAgent
-from agents.video_agent import prepare_motion_prompt, render_signature, video_service_for_task
+from agents.video_agent import _build_motion_prompt, prepare_motion_prompt, render_signature, video_prompt_options, video_service_for_task
 from services.media_quality import compare_join_frames
 from agents.agent_utils import with_document_id
 from models.asset_model import Asset
-from services.generation_contract import continuity_input, voice_window
+from services.generation_contract import MAX_VOICE_SPEED, continuity_input, voice_speed, voice_window
 from services.media_quality import extract_tail, inspect_video, resolve_media
 
 
@@ -147,6 +147,20 @@ async def get_video_task_storyboard(task_id: str) -> ApiResponse | JSONResponse:
         for scene in task_scenes:
             if "_id" in scene:
                 scene["_id"] = str(scene["_id"])
+            if (scene.get("need_dynamic_video") and scene.get("motion_beats")
+                    and scene.get("video_prompt") and scene.get("transition_type") != "continue_action"):
+                try:
+                    scene["planned_video_prompt"] = _build_motion_prompt(scene)
+                except (ValueError, KeyError, TypeError):
+                    # Older scenes may lack the fields required to build a render prompt.
+                    pass
+            if scene.get("audio_path") and scene.get("audio_duration"):
+                try:
+                    start, slot = voice_window(scene)
+                    duration = float(scene["audio_duration"])
+                    scene["voice_end"] = start + duration / voice_speed(scene["scene_id"], duration, slot)
+                except (ValueError, KeyError, TypeError):
+                    pass
         return ApiResponse(status="success", data=task_scenes)
     except PyMongoError:
         return error_response("MongoDB unavailable", 503)
@@ -241,6 +255,18 @@ async def rerun_scene_asset(
         updated_fields = {}
         if payload.rerun_type not in {"voice", "image", "video", "all"}:
             return error_response("Invalid rerun type", 400)
+        if scene.get("dialogue_lines") and payload.rerun_type in {"voice", "all"}:
+            if payload.rerun_type != "voice":
+                return error_response("请先单独重新生成对白，再处理其他素材", 400)
+            lines = await synthesize_dialogue(scene, backend_dir, task_id, f"{scene_id}_{uuid4().hex[:12]}")
+            await mongodb.update_one("scenes", {"_id": scene["_id"]}, {"dialogue_audio": lines, "updated_at": now})
+            if task.get("status") == "failed":
+                return ApiResponse(status="success", data={"message": "对白已保存，可以继续原任务"})
+            await SubtitleAgent().run(task_id)
+            await EditorAgent().run(task_id)
+            await QualityAgent().run(task_id)
+            await ExportAgent().run(task_id)
+            return ApiResponse(status="success", data={"message": "对白已更新并重新合成"})
         if payload.voice_start is not None:
             if payload.voice_start != scene.get("voice_start", 0):
                 updated_fields["voice_start_locked"] = True
@@ -287,8 +313,8 @@ async def rerun_scene_asset(
                 output_path=str(audio_path),
                 voice=voice_name,
             )
-            if duration < audio_duration <= duration * 1.2:
-                rate_pct = min(20, max(5, int(round((audio_duration / duration - 1.0) * 100))))
+            if duration < audio_duration <= duration * MAX_VOICE_SPEED:
+                rate_pct = min(25, max(5, int(round((audio_duration / duration - 1.0) * 100))))
                 audio_duration = await tts_service.generate_voice(
                     text=voiceover,
                     output_path=str(audio_path),
@@ -296,7 +322,6 @@ async def rerun_scene_asset(
                     rate=f"+{rate_pct}%",
                 )
 
-            from services.generation_contract import voice_speed
             voice_speed(scene_id, audio_duration, duration)
             relative_audio = f"backend/assets/{task_id}/audio/voice_{render_id}.mp3"
             updated_fields["audio_path"] = relative_audio
@@ -358,7 +383,8 @@ async def rerun_scene_asset(
             prompt, observed = await prepare_motion_prompt(prompt_scene, prior, first, first_digest)
             provider = video_service_for_task(task)
             duration = int(scene["duration"])
-            pending_key = render_signature(provider, first_digest, prompt, duration, task.get("ratio", "9:16"))
+            prompt_options = video_prompt_options(provider, scene)
+            pending_key = render_signature(provider, first_digest, prompt, duration, task.get("ratio", "9:16"), **prompt_options)
             pending_job = scene.get("pending_video_rerun") or {}
             if pending_job.get("key") == pending_key:
                 render_id = pending_job["render_id"]
@@ -370,7 +396,7 @@ async def rerun_scene_asset(
             result = await anyio.to_thread.run_sync(
                 lambda: provider.generate_video(task_id=task_id, scene_id=render_id,
                                                 image_path=first, video_prompt=prompt,
-                                                duration=duration, ratio=task.get("ratio", "9:16"))
+                                                duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options)
             )
             if result.get("status") != "success" or not result.get("asset_path"):
                 raise ValueError("Video rerun did not return an asset")
@@ -381,8 +407,10 @@ async def rerun_scene_asset(
             tail = f"backend/assets/{task_id}/frames/{render_id}_tail.png"
             await anyio.to_thread.run_sync(extract_tail, video_path, resolve_media(tail), duration)
             await save_asset("video_clip", video_path, result.get("source") or "video_provider",
+                             submitted_video_prompt=prompt,
                              first_frame_digest=first_digest, render_signature=pending_key, provider_task_id=result.get("provider_task_id"))
             updated_fields.update(video_path=video_path, last_frame_path=tail, continuity_input_path=first,
+                                  submitted_video_prompt=prompt,
                                   observed_handoff=observed, need_dynamic_video=True, stale_tail=False,
                                   status="video_done", pending_video_rerun=None)
             if scene.get("transition_type") == "continue_action":
@@ -399,6 +427,8 @@ async def rerun_scene_asset(
 
         updated_fields["updated_at"] = now
         await mongodb.update_one("scenes", {"_id": f"{task_id}_{scene_id}"}, updated_fields)
+        if task.get("status") == "failed" and payload.rerun_type == "voice":
+            return ApiResponse(status="success", data={"message": "配音已保存，可以继续原任务"})
 
         pending = await mongodb.find_many("scenes", {"task_id": task_id, "stale_tail": True}, limit=100)
         if pending:

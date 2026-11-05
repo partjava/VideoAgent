@@ -256,6 +256,10 @@
       </div>
 
       <!-- OpenCut / OpenMontage: 分镜工作台与局部重生成 -->
+      <details v-if="taskDetail?.status === 'success'" @toggle="showProcess = $event.target.open">
+        <summary>完整生成过程</summary>
+        <TaskProgress v-if="showProcess" embedded />
+      </details>
     </div>
   </BasicLayout>
 </template>
@@ -265,12 +269,14 @@ import { computed, ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import BasicLayout from '../layouts/BasicLayout.vue'
+import TaskProgress from './TaskProgress.vue'
 import VideoPlayerCard from '../components/VideoPlayerCard.vue'
 import { videoApi } from '../api/video'
 
 const route = useRoute()
 const router = useRouter()
 const taskId = route.params.id
+const showProcess = ref(false)
 
 const loading = ref(true)
 const taskDetail = ref(null)

@@ -222,12 +222,52 @@ async def test_api_keys(payload: dict) -> JSONResponse:
     return JSONResponse(content={"status": "success", "data": results})
 
 from typing import Literal
+import re
 
 import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, SecretStr
 
 from services.model_config import KINDS, model_config, save_models, saved_models, validate_config
+from services.video.wan_video_service import FLASH_MODEL, SILENT_OUTPUT_MODELS, WAN3_MODELS
+
+SUPPORTED_WAN_VIDEO_MODELS = SILENT_OUTPUT_MODELS | WAN3_MODELS | {FLASH_MODEL}
+
+
+def model_catalog_url(kind, base):
+    if kind == "prompt":
+        if base == "https://api.deepseek.com/v1":
+            return "https://api.deepseek.com/models"
+        return f"{base}/models"
+    return f"{base.removesuffix('/compatible-mode/v1')}/compatible-mode/v1/models"
+
+
+def matches_model_catalog(kind, item, model_id):
+    name = model_id.lower().rsplit("/", 1)[-1]
+    if kind == "video":
+        return model_id in SUPPORTED_WAN_VIDEO_MODELS
+
+    inputs = item.get("input_modalities")
+    outputs = item.get("output_modalities")
+    if isinstance(inputs, list) and "text" not in inputs:
+        return False
+
+    qwen_image = name.startswith("qwen-image")
+    wan_image = bool(re.match(r"wanx?\d+(?:\.\d+)*-(?:image|t2i)(?:-|$)", name))
+    edit_only = bool(re.search(r"(?:^|[-_])(?:edit|imageedit|i2i|inpaint)(?:[-_]|$)", name))
+    if kind == "image":
+        if edit_only:
+            return False
+        if isinstance(outputs, list):
+            return "image" in outputs and (isinstance(inputs, list) or qwen_image or wan_image)
+        return qwen_image or wan_image or name.startswith(("z-image-", "gpt-image-", "dall-e-"))
+
+    non_chat = re.search(
+        r"(?:^|[-_])(?:embeddings?|rerank(?:er)?|tts|asr|stt|whisper|transcription|"
+        r"moderation|image|imageedit|t2i|i2i|video|i2v|t2v|r2v|v2v|s2v)(?:[-_]|$)",
+        name,
+    )
+    return not non_chat and (not isinstance(outputs, list) or "text" in outputs)
 
 
 class ModelInput(BaseModel):
@@ -254,8 +294,11 @@ def get_models():
     configured = saved_models()
     for kind in KINDS:
         config = model_config(kind)
+        local_key = configured.get(kind, {}).get("key")
+        key_source = "local" if local_key else "environment" if config["key"] else "none"
         models[kind] = {"url": config["url"], "model": config["model"],
-                        "has_key": bool(config["key"]), "active": kind in configured}
+                        "has_key": bool(config["key"]), "key_source": key_source,
+                        "active": kind in configured}
     return {"status": "success", "data": models}
 
 
@@ -267,7 +310,18 @@ async def put_model(kind: Literal["prompt", "image", "video"], payload: ModelInp
     models = saved_models()
     models[kind] = config
     save_models(models)
-    return {"status": "success", "data": {"has_key": True, "active": True}}
+    return {"status": "success", "data": {"has_key": True, "key_source": "local", "active": True}}
+
+
+@router.delete("/models/{kind}/key")
+async def clear_model_key(kind: Literal["prompt", "image", "video"]):
+    models = saved_models()
+    profile = models.get(kind)
+    if profile and profile.get("key"):
+        # Keep an explicit empty key so the environment key is not reused.
+        profile["key"] = ""
+        save_models(models)
+    return {"status": "success", "data": get_models()["data"][kind]}
 
 
 @router.post("/models/{kind}/test")
@@ -275,11 +329,11 @@ async def test_model(kind: Literal["prompt", "image", "video"], payload: ModelIn
     config = effective_model(kind, payload)
     if not config["key"]:
         raise HTTPException(422, detail="Enter a key for this URL.")
-    path = "/models" if kind == "prompt" else "/api/v1/files"
+    url = model_catalog_url(kind, config["url"]) if kind == "prompt" else config["url"] + "/api/v1/files"
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
             response = await client.get(
-                config["url"] + path, headers={"Authorization": f"Bearer {config['key']}"}
+                url, headers={"Authorization": f"Bearer {config['key']}"}
             )
     except httpx.TimeoutException:
         result = "timeout"
@@ -316,12 +370,12 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
     config = effective_model(kind, payload.model_copy(update={"model": "catalog"}))
     if not config["key"]:
         raise HTTPException(422, detail="Enter a key for this URL.")
-    base = config["url"]
-    path = "/models" if kind == "prompt" else "/compatible-mode/v1/models"
+    url = model_catalog_url(kind, config["url"])
+    official_video = kind == "video" and url == "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
             response = await client.get(
-                base + path, headers={"Authorization": f"Bearer {config['key']}"}
+                url, headers={"Authorization": f"Bearer {config['key']}"}
             )
     except httpx.TimeoutException as exc:
         raise HTTPException(504, detail="Model catalog request timed out.") from exc
@@ -331,20 +385,22 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
     if response.status_code in (401, 403):
         raise HTTPException(422, detail="The catalog rejected this key or workspace.")
     if response.status_code in (404, 405, 501):
-        return {"status": "success", "data": {"models": [], "available": False}}
-    if not response.is_success:
+        items = None
+    elif not response.is_success:
         raise HTTPException(502, detail=f"Model catalog returned HTTP {response.status_code}.")
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    items = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(items, list):
-        return {"status": "success", "data": {"models": [], "available": False}}
-    prefixes = {"image": ("qwen-image",), "video": ("wan",)}
+    else:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        items = body.get("data") if isinstance(body, dict) else None
+    available = isinstance(items, list)
     models = sorted({
-        item["id"] for item in items
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
-        and (kind == "prompt" or item["id"].lower().startswith(prefixes[kind]))
+        model_id for item in (items if available else [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        and (model_id := item["id"].strip()) and matches_model_catalog(kind, item, model_id)
     })
-    return {"status": "success", "data": {"models": models, "available": True}}
+    suggested_models = sorted(SUPPORTED_WAN_VIDEO_MODELS.difference(models)) if official_video else []
+    return {"status": "success", "data": {
+        "models": models, "available": available, "suggested_models": suggested_models,
+    }}

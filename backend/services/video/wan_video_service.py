@@ -12,7 +12,18 @@ from services.model_config import model_config, saved_models
 from services.video.base import BaseVideoService, VideoRenderRejected
 
 
+SILENT_OUTPUT_MODELS = frozenset({
+    "wan2.2-i2v-flash", "wan2.2-i2v-plus", "wanx2.1-i2v-turbo", "wanx2.1-i2v-plus",
+})
+WAN3_MODELS = frozenset({"wan3.0-video", "wan3.0-video-prime"})
+FLASH_MODEL = "wan2.6-i2v-flash"
+
+
 class WanVideoService(BaseVideoService):
+    @property
+    def supports_negative_prompt(self):
+        return self.model == FLASH_MODEL or self.model in SILENT_OUTPUT_MODELS
+
     def __init__(self, model=None, storage_root=None):
         profile = model_config("video", settings)
         self.model = profile["model"] if "video" in saved_models() else model or profile["model"]
@@ -114,12 +125,25 @@ class WanVideoService(BaseVideoService):
         video_prompt: str | None = None,
         duration: int = 5,
         ratio: str = "9:16",
+        negative_prompt: str | None = None,
     ) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true 开启。")
 
         if not self.api_key:
             raise ValueError("未找到 DASHSCOPE_API_KEY，请在环境变量中配置。")
+
+        flash = self.model == FLASH_MODEL
+        wan3 = self.model in WAN3_MODELS
+        if not (flash or wan3 or self.model in SILENT_OUTPUT_MODELS):
+            raise ValueError(
+                f"当前模型 {self.model} 无法确认支持无声生成，未提交任务。"
+                "请在模型设置中选择 wan2.6-i2v-flash、wan3.0-video 或 wan3.0-video-prime。"
+            )
+        if flash and not 2 <= duration <= 15:
+            raise ValueError("wan2.6-i2v-flash 无声生成支持 2–15 秒。")
+        if wan3 and not 2 <= duration <= 30:
+            raise ValueError(f"{self.model} 无声生成支持 2–30 秒。")
 
         try:
             # 1. 如果是相对路径，则按 backend 根目录解析本地图片路径
@@ -130,13 +154,10 @@ class WanVideoService(BaseVideoService):
                 clean_path = image_path.replace("backend/", "")
                 resolved_image_path = str(backend_dir / clean_path)
 
-            flash = self.model == "wan2.6-i2v-flash"
-            wan3 = self.model in {"wan3.0-video", "wan3.0-video-prime"}
-            happyhorse = self.model.startswith("happyhorse-")
-            if (wan3 or happyhorse) and not 2 <= duration <= 30:
-                raise ValueError(f"{self.model} requires 2–30 seconds")
             fingerprint = sha256(Path(resolved_image_path).read_bytes())
             fingerprint.update(json.dumps([self.model, video_prompt, duration, ratio]).encode())
+            if negative_prompt and self.supports_negative_prompt:
+                fingerprint.update(negative_prompt.encode("utf-8"))
             job_dir = backend_dir / "assets" / task_id / "video_jobs"
             job_dir.mkdir(parents=True, exist_ok=True)
             job = job_dir / f"{scene_id}-{fingerprint.hexdigest()}.json"
@@ -151,7 +172,7 @@ class WanVideoService(BaseVideoService):
             with TemporaryDirectory(prefix="wan_frame_") as tmp:
                 normalized = Path(tmp) / "first_frame.png"
                 write_aspect_frame(resolved_image_path, normalized, ratio)
-                if flash or wan3 or happyhorse:
+                if flash or wan3:
                     from PIL import Image
                     buffer = BytesIO()
                     with Image.open(normalized) as frame:
@@ -186,13 +207,18 @@ class WanVideoService(BaseVideoService):
                 }
             }
 
+            if flash or wan3:
+                payload["parameters"]["audio"] = False
+            if negative_prompt and self.supports_negative_prompt:
+                payload["input"]["negative_prompt"] = negative_prompt
+
             if flash:
                 payload["input"].pop("media")
                 payload["input"]["img_url"] = first_frame
-                payload["parameters"].update({"audio": False, "shot_type": "single"})
+                payload["parameters"]["shot_type"] = "single"
 
             if wan3:
-                payload["parameters"].update({"ratio": ratio, "audio": False, "prompt_extend": False})
+                payload["parameters"].update({"ratio": ratio, "prompt_extend": False})
 
             with httpx.Client(timeout=60.0) as client:
                 if not api_task_id:

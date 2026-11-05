@@ -56,12 +56,14 @@ class DialoguePolishAgent:
                 )
                 return task_scenes
 
-            llm_service = get_llm_service()
             _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else None
-            dialogues = await anyio.to_thread.run_sync(
-                lambda _scenes=task_scenes, _td=_target_duration:
-                    llm_service.polish_dialogue(_scenes, target_duration=_td)
-            )
+            narration_scenes = [scene for scene in task_scenes if not scene.get("dialogue_lines")]
+            dialogues = []
+            if narration_scenes:
+                llm_service = get_llm_service()
+                dialogues = await anyio.to_thread.run_sync(
+                    lambda: llm_service.polish_dialogue(narration_scenes, target_duration=_target_duration)
+                )
             dialogue_by_scene_id = {str(item.get("scene_id")): item for item in dialogues}
 
             updated_scenes: list[dict[str, Any]] = []
@@ -69,6 +71,9 @@ class DialoguePolishAgent:
             for scene in task_scenes:
                 scene_id = str(scene.get("scene_id"))
                 dialogue = dialogue_by_scene_id.get(scene_id)
+                if scene.get("dialogue_lines"):
+                    spoken = "\n".join(line["text"] for line in scene["dialogue_lines"])
+                    dialogue = {"speaker": scene["dialogue_lines"][0]["speaker"], "voiceover": spoken, "subtitle": spoken}
                 if dialogue is None:
                     raise ValueError(f"Dialogue polish result missing scene: {scene_id}")
 

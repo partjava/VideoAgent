@@ -28,6 +28,9 @@ export const settingsApi = {
   saveModel(kind, payload) {
     return client.put(`/models/${kind}`, payload)
   },
+  clearModelKey(kind) {
+    return client.delete(`/models/${kind}/key`)
+  },
   testModel(kind, payload) {
     return client.post(`/models/${kind}/test`, payload)
   },

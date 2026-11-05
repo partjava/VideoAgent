@@ -49,7 +49,7 @@ class CreateVideoTaskRequest(BaseModel):
     ratio: str = "9:16"
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
-    generation_mode: str = "full_dynamic"
+    generation_mode: str = "native_10s"
 
 
 class CreateVideoTaskResponse(BaseModel):
