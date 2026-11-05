@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from hashlib import sha256
+import re
 
 import anyio
 
@@ -33,6 +34,26 @@ from services.media_quality import compare_join_frames, extract_tail, resolve_me
 from services.provider_factory import get_video_service
 from services.video.base import VideoRenderRejected
 from services.video_vision import replan_from_tail, review_enabled, review_opening_frame
+
+
+OVERLAY_DIRECTION = re.compile(
+    r"(?:切黑|黑底|黑屏)(?=[^。；;｜\n]{0,24}(?:白字|字幕|字卡))[^。；;｜\n]*"
+    r"|(?:浮出|浮现|弹出|出现|显示|叠加|打出)\s*"
+    r"(?:[一行段条短句白色中文英文巨大醒目居中]{0,12})"
+    r"(?:白字|字幕|字卡|片名|大字)[^。；;｜\n]*"
+)
+
+
+def actual_dialogue_direction(scene):
+    audio = scene.get("dialogue_audio") or []
+    if not audio:
+        return ""
+    last = audio[-1]
+    return (
+        f"\n[实测配音时间优先] 最后一句在 {last['start']:.2f}–{last['end']:.2f} 秒。"
+        "这段保留能看清说话者或关键反应主体表情的构图。"
+        "若逐秒动作与该窗口冲突，推迟转身、离场或转移焦点；时间不足时省略次要动作。"
+    )
 
 
 def video_prompt_options(service, scene):
@@ -124,7 +145,14 @@ def _build_motion_prompt(scene):
         previous_state = scene.get("previous_action_state")
         if previous_state:
             handoff += f"[动作交接] 第1秒从上一拍状态继续：{previous_state}。保留接触点、视线和运动方向。\n"
-    return f"{handoff}{recipe_header}\n{base_prompt}\n[秒级动作演进]\n{timeline_block}\n{consistency_block}"
+    body = f"{handoff}{recipe_header}\n{base_prompt}\n[秒级动作演进]\n{timeline_block}\n{consistency_block}"
+    return (
+        OVERLAY_DIRECTION.sub("", body)
+        + actual_dialogue_direction(scene)
+        + "\n"
+        "[画面交付] 全段保留剧情画面。字幕、标题、气泡、水印和字卡由后期处理，"
+        "忽略上述字段里任何要求生成这些元素的指令。保留剧情需要的道具内文字。"
+    )
 
 
 def video_service_for_task(task):
