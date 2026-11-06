@@ -2,15 +2,18 @@
   <BasicLayout>
     <div class="history-page" v-loading="loading">
       <div class="header-intro">
-        <h1 class="page-main-title">历史生成任务</h1>
-        <p class="page-subtitle">管理所有已提交的视频生成任务，并按生成状态进行筛选。</p>
+        <div>
+          <h1 class="page-main-title">历史生成任务</h1>
+          <p class="page-subtitle">管理单次视频任务，支持断点续传、开拍前预审与成片复核。</p>
+        </div>
+        <el-button tag="router-link" to="/series" type="primary" plain>查看连载项目库 →</el-button>
       </div>
 
       <!-- Filters & Actions Area -->
       <div class="filter-bar">
         <el-radio-group v-model="statusFilter" class="filter-radio-group">
           <el-radio-button label="all">全部</el-radio-button>
-          <el-radio-button label="generating">生成中</el-radio-button>
+          <el-radio-button label="generating">进行中 / 待预审</el-radio-button>
           <el-radio-button label="success">成功</el-radio-button>
           <el-radio-button label="failed">失败</el-radio-button>
         </el-radio-group>
@@ -24,10 +27,10 @@
               <span class="mono-text">{{ scope.row.task_id }}</span>
             </template>
           </el-table-column>
-          
-          <el-table-column prop="topic" label="视频主题" width="180">
+
+          <el-table-column prop="topic" label="视频主题" min-width="200">
             <template #default="scope">
-              <span class="topic-text">{{ scope.row.topic || scope.row.user_input.substring(0, 15) + '...' }}</span>
+              <span class="topic-text">{{ scope.row.topic || (scope.row.user_input || '').substring(0, 20) + '...' }}</span>
             </template>
           </el-table-column>
 
@@ -36,7 +39,7 @@
               <span>{{ getModeText(scope.row.generation_mode) }}</span>
             </template>
           </el-table-column>
-          
+
           <el-table-column prop="status" label="任务状态" width="140">
             <template #default="scope">
               <el-tag :type="getStatusTagType(scope.row.status)" effect="light">
@@ -44,13 +47,13 @@
               </el-tag>
             </template>
           </el-table-column>
-          
+
           <el-table-column prop="created_at" label="创建时间" width="180">
             <template #default="scope">
               <span>{{ formatDate(scope.row.created_at) }}</span>
             </template>
           </el-table-column>
-          
+
           <el-table-column label="操作" min-width="220" fixed="right">
             <template #default="scope">
               <template v-if="scope.row.source === 'comfyui_test'">
@@ -70,7 +73,7 @@
                   icon="View"
                   @click="handleViewTask(scope.row)"
                 >
-                  {{ scope.row.status === 'success' ? '预览' : '进度' }}
+                  {{ scope.row.status === 'success' ? '预览' : scope.row.status === 'awaiting_shoot_review' ? '开拍预审' : '进度' }}
                 </el-button>
 
                 <el-button
@@ -115,7 +118,9 @@ const statusFilter = ref('all')
 const getModeText = (mode) => {
   const modes = {
     key_scenes: '关键镜头动态',
-    full_dynamic: '全动态视频'
+    full_dynamic: '全动态视频',
+    native_10s: '原生 10 秒动态',
+    paired_5s: '双 5 秒连续动作'
   }
   return modes[mode] || mode
 }
@@ -123,6 +128,7 @@ const getModeText = (mode) => {
 const getStatusTagType = (status) => {
   if (status === 'success') return 'success'
   if (status === 'failed') return 'danger'
+  if (status === 'awaiting_shoot_review') return 'warning'
   if (status === 'created') return 'info'
   return 'primary'
 }
@@ -133,9 +139,12 @@ const getStatusText = (status) => {
     planning: '规划中',
     script_done: '脚本完成',
     storyboard_done: '分镜完成',
-    image_generating: '图片生成中',
+    polish_done: '台词润色完成',
+    prompt_done: '提示词完成',
+    image_generating: '首帧生成中',
+    voice_generating: '配音合成中',
+    awaiting_shoot_review: '待开拍预审',
     video_generating: '视频生成中',
-    voice_generating: '语音合成中',
     subtitle_generating: '字幕生成中',
     rendering: '渲染中',
     editing: '剪辑中',
@@ -252,7 +261,6 @@ const fetchTasks = async () => {
       videoApi.listTasks(),
       comfyuiApi.getTestHistory().catch(() => ({ tests: [] })),
     ])
-    // 格式化 ComfyUI 测试记录，和任务列表合并
     const comfyuiTests = (comfyuiRes.tests || []).map(t => ({
       task_id: t.created_at,
       source: 'comfyui_test',
@@ -281,12 +289,18 @@ onMounted(async () => {
 
 <style scoped>
 .history-page {
-  padding: 16px 0;
+  max-width: 1250px;
+  margin: 0 auto;
+  padding: 8px 0;
 }
 
 .header-intro {
   margin-bottom: 24px;
-  text-align: left;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
 }
 
 .page-main-title {
@@ -305,7 +319,10 @@ onMounted(async () => {
 .filter-bar {
   margin-bottom: 20px;
   display: flex;
-  justify-content: flex-start;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .filter-radio-group :deep(.el-radio-button__inner) {
@@ -315,6 +332,7 @@ onMounted(async () => {
 .table-card {
   border-radius: 12px;
   border: 1px solid #e2e8f0;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.03);
 }
 
 .custom-table {

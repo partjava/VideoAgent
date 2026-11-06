@@ -10,6 +10,7 @@ from services.task_service import task_service
 from services.camera_plan import normalize_camera_plan
 from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE
 from services.visual_style import PHOTO_RULES, PHOTO_EXCLUSIONS, lock_visual_style
+from services.character_binding import series_prompt_context
 
 DEFAULT_IMAGE_NEGATIVE_PROMPT = "多余肢体，手指结构混乱，五官错位，无关文字，水印，主体边缘异常断裂"
 DEFAULT_VIDEO_NEGATIVE_PROMPT = "道具瞬移，非计划抖动，突然变脸，肢体穿模，多余肢体，服装颜色突变，画面撕裂，非计划倒放"
@@ -68,7 +69,8 @@ class PromptAgent:
             llm_service = get_llm_service()
             _style = str(task.get("style") or task.get("metadata", {}).get("style") or "") or None
             world = task.get("metadata", {}).get("task_plan") or {}
-            bible = {"characters": world.get("characters", []), "visual_world": world.get("visual_world", "")}
+            bible = {"characters": world.get("characters", []), "visual_world": world.get("visual_world", ""),
+                     "series_context": series_prompt_context(task)}
             fixed = json.dumps(bible, ensure_ascii=False)
 
             def generate(batch):

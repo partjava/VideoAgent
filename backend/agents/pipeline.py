@@ -22,6 +22,8 @@ from agents.subtitle_agent import SubtitleAgent
 from agents.task_planner_agent import TaskPlannerAgent
 from agents.video_agent import VideoAgent
 from agents.voice_agent import VoiceAgent
+from models.task_model import VideoTaskStatus
+from services.task_service import task_service
 
 
 def _merge_results_dict(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
@@ -35,6 +37,7 @@ class PipelineState(TypedDict):
     status: str
     error: Optional[str]
     results: Annotated[dict[str, Any], _merge_results_dict]
+    pre_shoot_review: bool
 
 
 # ── Node 函数：每个 Agent 封装为一个节点 ──────────────────────
@@ -109,6 +112,20 @@ async def voice_node(state: PipelineState) -> dict:
     return _merge_results(state, "voice", result)
 
 
+async def shoot_review_node(state: PipelineState) -> dict:
+    if not state.get("pre_shoot_review"):
+        return {}
+    status = VideoTaskStatus.AWAITING_SHOOT_REVIEW.value
+    await task_service.update_task_fields(state["task_id"], {
+        "status": status, "current_agent": None, "progress": 87,
+    })
+    return {"status": status}
+
+
+def route_after_shoot_review(state: PipelineState) -> str:
+    return END if state.get("status") == VideoTaskStatus.AWAITING_SHOOT_REVIEW.value else "video"
+
+
 async def subtitle_node(state: PipelineState) -> dict:
     print(f"[Pipeline] Entering subtitle_node")
     agent = SubtitleAgent()
@@ -161,7 +178,7 @@ def route_to_parallel(state: PipelineState) -> list[Send]:
 # ── 构建 LangGraph ──────────────────────────────────────────
 
 
-def build_pipeline() -> StateGraph:
+def build_pipeline(*, resume_shoot: bool = False) -> StateGraph:
     workflow = StateGraph(PipelineState)
 
     # 注册节点
@@ -173,13 +190,14 @@ def build_pipeline() -> StateGraph:
     workflow.add_node("images", images_node)
     workflow.add_node("video", video_node)
     workflow.add_node("voice", voice_node)
+    workflow.add_node("shoot_review", shoot_review_node)
     workflow.add_node("subtitle", subtitle_node)
     workflow.add_node("editor", editor_node)
     workflow.add_node("quality", quality_node)
     workflow.add_node("export", export_node)
 
     # 第一阶段：串行（任务规划 → 脚本 → 分镜 → 润色 → 提示词）
-    workflow.set_entry_point("task_planner")
+    workflow.set_entry_point("video" if resume_shoot else "task_planner")
     workflow.add_edge("task_planner", "script")
     workflow.add_edge("script", "storyboard")
     workflow.add_edge("storyboard", "dialogue")
@@ -188,7 +206,8 @@ def build_pipeline() -> StateGraph:
     # 第二阶段：并行分叉（LangGraph Send）
     # 首帧与配音并行准备，确认配音能装进时间轴后再提交视频。
     workflow.add_conditional_edges("prompts", route_to_parallel, ["images", "voice"])
-    workflow.add_edge(["images", "voice"], "video")
+    workflow.add_edge(["images", "voice"], "shoot_review")
+    workflow.add_conditional_edges("shoot_review", route_after_shoot_review, [END, "video"])
     workflow.add_edge("video", "subtitle")
 
 
@@ -206,26 +225,27 @@ def build_pipeline() -> StateGraph:
 # ── 公开入口 ────────────────────────────────────────────────
 
 
-async def run_pipeline(task_id: str) -> dict[str, Any]:
+async def run_pipeline(task_id: str, *, resume_shoot: bool = False) -> dict[str, Any]:
     print(f"[Pipeline] Starting pipeline for task {task_id}")
-    workflow = build_pipeline()
-    app = workflow.compile()
-
-    initial_state: PipelineState = {
-        "task_id": task_id,
-        "status": "running",
-        "error": None,
-        "results": {},
-    }
-
     try:
+        task = await task_service.get_task(task_id) or {}
+        approved = (task.get("metadata") or {}).get("shoot_review_approved") is True
+        waiting = VideoTaskStatus.AWAITING_SHOOT_REVIEW.value
+        if task.get("status") == waiting:
+            return {"task_id": task_id, "status": waiting, "source": "real", "results": {}}
+        if resume_shoot and not approved:
+            raise ValueError("请先确认开拍预审")
+        app = build_pipeline(resume_shoot=approved).compile()
+        initial_state: PipelineState = {
+            "task_id": task_id, "status": "running", "error": None, "results": {},
+            "pre_shoot_review": bool(task.get("pre_shoot_review")),
+        }
         final_state = await app.ainvoke(initial_state)
-        # 所有节点跑完即为成功
-        final_state["status"] = "success"
-        print(f"[Pipeline] Pipeline completed, status: {final_state.get('status')}")
+        status = waiting if final_state.get("status") == waiting else "success"
+        print(f"[Pipeline] Pipeline completed, status: {status}")
         return {
             "task_id": task_id,
-            "status": final_state.get("status", "success"),
+            "status": status,
             "source": "real",
             "results": final_state.get("results", {}),
         }

@@ -147,53 +147,67 @@ async def test_api_keys(payload: dict) -> JSONResponse:
 
     results = {}
 
-    # 测试 DeepSeek
+    # 测试 DeepSeek（零成本只读探测 /models，不消耗 Token）
     dsk = payload.get("deepseek_api_key") or ""
     if dsk:
         try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.post(
-                    "https://api.deepseek.com/chat/completions",
-                    headers={"Authorization": f"Bearer {dsk}", "Content-Type": "application/json"},
-                    json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
-                )
-                if r.status_code == 200:
-                    results["deepseek_api_key"] = {"ok": True, "msg": "连接成功"}
-                elif r.status_code == 401:
-                    results["deepseek_api_key"] = {"ok": False, "msg": "Key 无效（401）"}
-                elif r.status_code == 402:
+            prompt_base = model_config("prompt").get("url") or "https://api.deepseek.com/v1"
+            async with httpx.AsyncClient(timeout=12, follow_redirects=False) as c:
+                r = None
+                for probe_url in model_catalog_candidates("prompt", prompt_base):
+                    r = await c.get(
+                        probe_url,
+                        headers={"Authorization": f"Bearer {dsk}"},
+                    )
+                    if r.status_code not in (404, 405, 501):
+                        break
+                if r is not None and r.status_code == 200:
+                    results["deepseek_api_key"] = {"ok": True, "msg": "连接成功（只读校验通过）"}
+                elif r is not None and r.status_code in (401, 403):
+                    results["deepseek_api_key"] = {"ok": False, "msg": f"Key 无效或无权限（{r.status_code}）"}
+                elif r is not None and r.status_code == 402:
                     results["deepseek_api_key"] = {"ok": False, "msg": "账户余额不足"}
                 else:
-                    results["deepseek_api_key"] = {"ok": False, "msg": f"响应异常 ({r.status_code})"}
+                    code = r.status_code if r is not None else "未知"
+                    results["deepseek_api_key"] = {"ok": False, "msg": f"响应异常 ({code})"}
         except Exception as e:
             results["deepseek_api_key"] = {"ok": False, "msg": f"连接失败: {str(e)[:60]}"}
     else:
         results["deepseek_api_key"] = {"ok": False, "msg": "未填写"}
 
-    # 测试 DashScope
+    # 测试 DashScope（零成本只读探测 /api/v1/files 或模型目录，不消耗 Token）
     dsc = payload.get("dashscope_api_key") or ""
     if dsc:
         try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.post(
-                    "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                    headers={
-                        "Authorization": f"Bearer {dsc}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "qwen-turbo",
-                        "input": {"messages": [{"role": "user", "content": "hi"}]},
-                        "parameters": {"max_tokens": 5, "result_format": "message"},
-                    },
-                )
-                if r.status_code == 200:
-                    results["dashscope_api_key"] = {"ok": True, "msg": "连接成功"}
-                elif r.status_code == 401:
-                    results["dashscope_api_key"] = {"ok": False, "msg": "Key 无效（401）"}
+            image_base = model_config("image").get("url") or "https://dashscope.aliyuncs.com"
+            probe_urls = [
+                f"{dashscope_base_url(image_base)}/api/v1/files",
+                *model_catalog_candidates("image", image_base),
+            ]
+            async with httpx.AsyncClient(timeout=12, follow_redirects=False) as c:
+                r = None
+                for probe_url in dict.fromkeys(probe_urls):
+                    r = await c.get(
+                        probe_url,
+                        headers={"Authorization": f"Bearer {dsc}"},
+                    )
+                    if r.status_code not in (404, 405, 501):
+                        break
+                if r is not None and r.status_code == 200:
+                    results["dashscope_api_key"] = {"ok": True, "msg": "连接成功（只读校验通过）"}
+                elif r is not None and r.status_code in (401, 403):
+                    results["dashscope_api_key"] = {"ok": False, "msg": f"Key 无效或无权限（{r.status_code}）"}
                 else:
-                    body = r.json()
-                    results["dashscope_api_key"] = {"ok": False, "msg": f"错误: {body.get('message','')[:60]}"}
+                    try:
+                        body = r.json() if r is not None else {}
+                    except ValueError:
+                        body = {}
+                    err_msg = body.get("message") if isinstance(body, dict) else ""
+                    code = r.status_code if r is not None else "未知"
+                    results["dashscope_api_key"] = {
+                        "ok": False,
+                        "msg": f"错误: {err_msg[:60]}" if err_msg else f"响应异常 ({code})",
+                    }
         except Exception as e:
             results["dashscope_api_key"] = {"ok": False, "msg": f"连接失败: {str(e)[:60]}"}
     else:
@@ -234,6 +248,14 @@ from services.video.wan_video_service import FLASH_MODEL, SILENT_OUTPUT_MODELS, 
 SUPPORTED_WAN_VIDEO_MODELS = SILENT_OUTPUT_MODELS | WAN3_MODELS | {FLASH_MODEL}
 
 
+def dashscope_base_url(base: str) -> str:
+    cleaned = (base or "").strip().rstrip("/")
+    for suffix in ("/compatible-mode/v1", "/api/v1", "/v1"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+    return cleaned or (base or "").strip().rstrip("/")
+
+
 def model_catalog_url(kind, base):
     if kind == "prompt":
         if base == "https://api.deepseek.com/v1":
@@ -242,10 +264,90 @@ def model_catalog_url(kind, base):
     return f"{base.removesuffix('/compatible-mode/v1')}/compatible-mode/v1/models"
 
 
+def model_catalog_candidates(kind: str, base: str) -> list[str]:
+    primary = model_catalog_url(kind, base)
+    root = dashscope_base_url(base)
+    if kind == "prompt":
+        candidates = [
+            primary,
+            f"{root}/v1/models",
+            f"{root}/models",
+            f"{root}/compatible-mode/v1/models",
+        ]
+    else:
+        candidates = [
+            primary,
+            f"{base}/models",
+            f"{root}/v1/models",
+            f"{root}/models",
+            f"{root}/compatible-mode/v1/models",
+        ]
+    return list(dict.fromkeys(c for c in candidates if c))
+
+
+def extract_catalog_items(body) -> list[dict] | None:
+    if not isinstance(body, dict):
+        return None
+    raw_list = body.get("data")
+    if not isinstance(raw_list, list):
+        raw_list = body.get("models")
+    if not isinstance(raw_list, list) and isinstance(body.get("output"), dict):
+        raw_list = body["output"].get("models")
+    if not isinstance(raw_list, list):
+        return None
+    normalized: list[dict] = []
+    for entry in raw_list:
+        if isinstance(entry, str) and entry.strip():
+            normalized.append({"id": entry.strip()})
+        elif isinstance(entry, dict):
+            raw_id = entry.get("id") or entry.get("model") or entry.get("name")
+            if isinstance(raw_id, str) and raw_id.strip():
+                clean_id = raw_id.strip()
+                if clean_id.startswith("models/") and "name" in entry and "id" not in entry:
+                    clean_id = clean_id.removeprefix("models/")
+                normalized.append({**entry, "id": clean_id})
+    return normalized
+
+
+def _model_in_catalog(model_name: str, items: list[dict]) -> bool:
+    target = (model_name or "").strip().lower()
+    if not target:
+        return False
+    target_short = target.rsplit("/", 1)[-1]
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        cid = item["id"].strip().lower()
+        if cid == target or cid.rsplit("/", 1)[-1] == target_short:
+            return True
+    return False
+
+
+def matches_third_party_video_catalog(item: dict, model_id: str) -> bool:
+    name = model_id.lower().rsplit("/", 1)[-1]
+    outputs = item.get("output_modalities")
+    if isinstance(outputs, list):
+        return "video" in outputs
+    non_video = re.search(
+        r"(?:^|[-_])(?:embeddings?|rerank(?:er)?|tts|asr|stt|whisper|transcription|"
+        r"moderation|image|imageedit|t2i|i2i|inpaint)(?:[-_]|$)",
+        name,
+    )
+    if non_video:
+        return False
+    return bool(
+        re.search(
+            r"(?:^|[-_])(?:video|i2v|t2v|v2v|r2v|s2v|kling|vidu|seedance|"
+            r"cogvideox?|hunyuan-video|luma|runway|sora|hailuo|minimax-video|pika|mochi)(?:[-_\d]|$)",
+            name,
+        )
+    )
+
+
 def matches_model_catalog(kind, item, model_id):
     name = model_id.lower().rsplit("/", 1)[-1]
     if kind == "video":
-        return model_id in SUPPORTED_WAN_VIDEO_MODELS
+        return model_id in SUPPORTED_WAN_VIDEO_MODELS or name in SUPPORTED_WAN_VIDEO_MODELS
 
     inputs = item.get("input_modalities")
     outputs = item.get("output_modalities")
@@ -260,7 +362,28 @@ def matches_model_catalog(kind, item, model_id):
             return False
         if isinstance(outputs, list):
             return "image" in outputs and (isinstance(inputs, list) or qwen_image or wan_image)
-        return qwen_image or wan_image or name.startswith(("z-image-", "gpt-image-", "dall-e-"))
+        return (
+            qwen_image
+            or wan_image
+            or name.startswith(
+                (
+                    "z-image-",
+                    "gpt-image-",
+                    "dall-e-",
+                    "flux-",
+                    "flux.",
+                    "kolors",
+                    "sdxl",
+                    "stable-diffusion",
+                    "seedream",
+                    "cogview",
+                    "hunyuan-image",
+                    "ideogram",
+                    "recraft",
+                    "imagen-",
+                )
+            )
+        )
 
     non_chat = re.search(
         r"(?:^|[-_])(?:embeddings?|rerank(?:er)?|tts|asr|stt|whisper|transcription|"
@@ -329,40 +452,68 @@ async def test_model(kind: Literal["prompt", "image", "video"], payload: ModelIn
     config = effective_model(kind, payload)
     if not config["key"]:
         raise HTTPException(422, detail="Enter a key for this URL.")
-    url = model_catalog_url(kind, config["url"]) if kind == "prompt" else config["url"] + "/api/v1/files"
+    headers = {"Authorization": f"Bearer {config['key']}"}
+    probe_urls = (
+        model_catalog_candidates("prompt", config["url"])
+        if kind == "prompt"
+        else [
+            f"{dashscope_base_url(config['url'])}/api/v1/files",
+            *model_catalog_candidates(kind, config["url"]),
+        ]
+    )
+    result = "unconfirmed"
+    matched_url = None
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            response = await client.get(
-                url, headers={"Authorization": f"Bearer {config['key']}"}
-            )
+            for url in dict.fromkeys(probe_urls):
+                response = await client.get(url, headers=headers)
+                if response.status_code in (401, 403):
+                    result = "denied"
+                    matched_url = url
+                    break
+                if response.status_code == 402:
+                    result = "balance"
+                    matched_url = url
+                    break
+                if response.is_success:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                    items = extract_catalog_items(body)
+                    if isinstance(items, list):
+                        matched_url = url
+                        if kind == "prompt":
+                            result = (
+                                "model_listed"
+                                if _model_in_catalog(config["model"], items)
+                                else "model_unlisted"
+                            )
+                        else:
+                            result = (
+                                "model_listed"
+                                if _model_in_catalog(config["model"], items)
+                                else "authenticated"
+                            )
+                        break
+                    if kind != "prompt" and isinstance(body, dict) and "output" in body:
+                        result = "authenticated"
+                        matched_url = url
+                        break
+                    result = "unconfirmed"
+                elif response.status_code in (404, 405, 501):
+                    if result == "http_error":
+                        continue
+                    result = "unconfirmed"
+                else:
+                    result = "http_error"
+                    matched_url = url
     except httpx.TimeoutException:
         result = "timeout"
     except (httpx.RequestError, ValueError):
         result = "unreachable"
-    else:
-        if response.status_code in (401, 403):
-            result = "denied"
-        elif response.status_code == 402:
-            result = "balance"
-        elif response.is_success:
-            try:
-                body = response.json()
-            except ValueError:
-                body = None
-            if kind == "prompt" and isinstance(body, dict) and isinstance(body.get("data"), list):
-                result = "model_listed" if any(
-                    isinstance(item, dict) and item.get("id") == config["model"]
-                    for item in body["data"]
-                ) else "model_unlisted"
-            elif kind != "prompt" and isinstance(body, dict) and "output" in body:
-                result = "authenticated"
-            else:
-                result = "unconfirmed"
-        elif response.status_code in (404, 405):
-            result = "unconfirmed"
-        else:
-            result = "http_error"
-    return {"status": "success", "data": {"result": result}}
+    return {"status": "success", "data": {"result": result, "endpoint": matched_url}}
+
 
 @router.post("/models/{kind}/catalog")
 async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload: ModelInput):
@@ -370,37 +521,58 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
     config = effective_model(kind, payload.model_copy(update={"model": "catalog"}))
     if not config["key"]:
         raise HTTPException(422, detail="Enter a key for this URL.")
-    url = model_catalog_url(kind, config["url"])
-    official_video = kind == "video" and url == "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+    candidates = model_catalog_candidates(kind, config["url"])
+    official_video = kind == "video" and candidates[0] == "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+    headers = {"Authorization": f"Bearer {config['key']}"}
+    items = None
+    last_response = None
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            response = await client.get(
-                url, headers={"Authorization": f"Bearer {config['key']}"}
-            )
+            for url in candidates:
+                response = await client.get(url, headers=headers)
+                last_response = response
+                if response.status_code in (401, 403):
+                    raise HTTPException(422, detail="The catalog rejected this key or workspace.")
+                if response.status_code in (404, 405, 501):
+                    continue
+                if not response.is_success:
+                    raise HTTPException(502, detail=f"Model catalog returned HTTP {response.status_code}.")
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                parsed = extract_catalog_items(body)
+                if isinstance(parsed, list):
+                    items = parsed
+                    break
     except httpx.TimeoutException as exc:
         raise HTTPException(504, detail="Model catalog request timed out.") from exc
     except (httpx.RequestError, ValueError) as exc:
         raise HTTPException(502, detail="Could not connect to the model catalog.") from exc
 
-    if response.status_code in (401, 403):
-        raise HTTPException(422, detail="The catalog rejected this key or workspace.")
-    if response.status_code in (404, 405, 501):
-        items = None
-    elif not response.is_success:
-        raise HTTPException(502, detail=f"Model catalog returned HTTP {response.status_code}.")
-    else:
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-        items = body.get("data") if isinstance(body, dict) else None
     available = isinstance(items, list)
     models = sorted({
         model_id for item in (items if available else [])
         if isinstance(item, dict) and isinstance(item.get("id"), str)
         and (model_id := item["id"].strip()) and matches_model_catalog(kind, item, model_id)
     })
-    suggested_models = sorted(SUPPORTED_WAN_VIDEO_MODELS.difference(models)) if official_video else []
+    suggestion_source = "none"
+    if official_video:
+        suggested_models = sorted(SUPPORTED_WAN_VIDEO_MODELS.difference(models))
+        suggestion_source = "official" if suggested_models else "none"
+    elif kind == "video" and available and not models:
+        suggested_models = sorted({
+            model_id for item in items
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+            and (model_id := item["id"].strip()) and matches_third_party_video_catalog(item, model_id)
+        })
+        suggestion_source = "catalog" if suggested_models else "none"
+    else:
+        suggested_models = []
     return {"status": "success", "data": {
-        "models": models, "available": available, "suggested_models": suggested_models,
+        "models": models,
+        "available": available,
+        "suggested_models": suggested_models,
+        "suggestion_source": suggestion_source,
+        "endpoint": last_response.request.url.path if (last_response is not None and getattr(last_response, "request", None) is not None) else None,
     }}

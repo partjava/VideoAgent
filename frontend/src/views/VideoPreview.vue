@@ -4,7 +4,7 @@
       <!-- Title header -->
       <div class="header-intro">
         <h1 class="page-main-title">生成结果控制台</h1>
-        <p class="page-subtitle">您的短视频已合成完毕，可在线播放并下载。</p>
+        <p class="page-subtitle">您的短视频已合成完毕，可在线播放、按质检定位精修分镜并下载。</p>
       </div>
 
       <!-- Task Failed Error State -->
@@ -22,8 +22,8 @@
         <el-icon class="empty-icon"><VideoCameraFilled /></el-icon>
         <div class="empty-content">
           <h3>视频文件未就绪</h3>
-          <p>该任务尚未完成渲染流程或尚未启动生成 pipeline。</p>
-          <el-button type="primary" icon="CaretRight" @click="handleGoToProgress">查看生成进度</el-button>
+          <p>该任务尚未完成渲染流程或正处于开拍前预审阶段。</p>
+          <el-button type="primary" icon="CaretRight" @click="handleGoToProgress">查看生成进度与预审</el-button>
         </div>
       </div>
 
@@ -42,133 +42,188 @@
         </div>
 
         <!-- Right: Detail Info & Script/Storyboard download actions -->
-      <div v-if="taskDetail && storyboardData.length > 0" class="studio-editing-section">
-        <el-card class="detail-card studio-card" shadow="never">
-          <template #header>
-            <div class="card-header studio-header">
-              <span class="card-title">分镜精修</span>
-              <span class="header-tip">沿时间轴选择片段，查看画面并局部调整</span>
-            </div>
-          </template>
+        <div v-if="taskDetail && storyboardData.length > 0" class="studio-editing-section">
+          <el-card class="detail-card studio-card" shadow="never">
+            <template #header>
+              <div class="card-header studio-header">
+                <span class="card-title">分镜精修工作台</span>
+                <span class="header-tip">沿时间轴或质检提示选择片段，查看画面并局部微调</span>
+              </div>
+            </template>
 
-          <nav class="section-timeline" aria-label="分镜时间轴">
-            <div v-for="(group, index) in timelineGroups" :key="group[0].scene.scene_id" class="timeline-group">
-              <small>{{ taskDetail.generation_mode === 'paired_5s' ? '段落' : '片段' }} {{ index + 1 }} · {{ group[0].start }}–{{ group.at(-1).end }} 秒</small>
-              <div class="timeline-clips">
-                <button v-for="item in group" :key="item.scene.scene_id" type="button"
-                  :aria-pressed="item.scene.scene_id === currentScene?.scene_id" @click="selectClip(item)">
-                  {{ item.start }}–{{ item.end }} 秒
-                  <span v-if="item.scene.stale_tail"> · 待续接</span>
-                </button>
+            <div v-if="qualityIssues.length" class="quality-jump-panel">
+              <div class="quality-jump-header">
+                <strong>质检复核提示（点击直接跳到对应分镜与秒数）</strong>
+                <el-tag size="small" type="warning">{{ qualityIssues.length }} 项建议复核</el-tag>
               </div>
+              <ul class="quality-jump-list">
+                <li v-for="(item, idx) in qualityIssues" :key="idx">
+                  <button type="button" class="quality-jump-btn" @click="jumpToQualityIssue(item)">
+                    <span class="jump-badge">
+                      <template v-if="item.time != null">{{ Number(item.time).toFixed(1) }}s</template>
+                      <template v-if="item.scene_index"> · 镜头 {{ item.scene_index }}</template>
+                      <template v-if="item.scene_offset != null">（镜内 {{ Number(item.scene_offset).toFixed(1) }}s）</template>
+                    </span>
+                    <span class="jump-text">{{ item.issue }}</span>
+                    <span class="jump-arrow">定位精修 →</span>
+                  </button>
+                </li>
+              </ul>
             </div>
-          </nav>
-          <div class="scenes-edit-list">
-            <div
-              v-for="scene in currentScene ? [currentScene] : []"
-              :key="scene.scene_id"
-              class="scene-edit-item"
-              v-loading="retryingSceneId === scene.scene_id"
-            >
-              <div class="clip-overview">
-                <img v-if="scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path"
-                  :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path)" alt="当前片段首帧" />
-                <div><strong>镜头 {{ scene.scene_index }} · {{ scene.duration }} 秒</strong>
-                  <p>{{ scene.motion_beats?.[0]?.action || scene.visual_description || '查看下方的动作与配音细节' }}</p>
+
+            <nav class="section-timeline" aria-label="分镜时间轴">
+              <div v-for="(group, index) in timelineGroups" :key="group[0].scene.scene_id" class="timeline-group">
+                <small>{{ taskDetail.generation_mode === 'paired_5s' ? '段落' : '片段' }} {{ index + 1 }} · {{ group[0].start }}–{{ group.at(-1).end }} 秒</small>
+                <div class="timeline-clips">
+                  <button
+                    v-for="item in group"
+                    :key="item.scene.scene_id"
+                    type="button"
+                    :aria-pressed="item.scene.scene_id === currentScene?.scene_id"
+                    @click="selectClip(item)"
+                  >
+                    {{ item.start }}–{{ item.end }} 秒
+                    <span v-if="item.scene.stale_tail"> · 待续接</span>
+                  </button>
                 </div>
               </div>
-              <details class="clip-dialogue">
-                <summary>编辑角色与台词</summary>
-              <div class="scene-item-header">
-                <div class="scene-meta-left">
-                  <span class="scene-badge">{{ taskDetail?.generation_mode === 'paired_5s'
-                    ? `第 ${Math.ceil(scene.scene_index / 2)} 部分 · ${scene.scene_index % 2 ? '前段' : '后段'}`
-                    : `镜头 ${scene.scene_index}` }}</span>
-                  <el-tag v-if="scene.stale_tail" type="warning" size="small">待续接</el-tag>
-                  <span class="scene-time">{{ scene.duration }} 秒</span>
-                </div>
-                <div class="scene-meta-right">
-                  <span class="speaker-label">角色：</span>
-                  <el-input
-                    v-model="scene.speaker"
-                    size="small"
-                    style="width: 120px"
-                    placeholder="说话人/角色"
+            </nav>
+
+            <div class="scenes-edit-list">
+              <div
+                v-for="scene in currentScene ? [currentScene] : []"
+                :key="scene.scene_id"
+                class="scene-edit-item"
+                v-loading="retryingSceneId === scene.scene_id"
+              >
+                <div class="clip-overview">
+                  <img
+                    v-if="scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path"
+                    :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path)"
+                    alt="当前片段首帧"
                   />
+                  <div>
+                    <div class="clip-overview-head">
+                      <strong>镜头 {{ scene.scene_index }} · {{ scene.duration }} 秒</strong>
+                      <span
+                        v-for="(choice, cIdx) in scene.reference_choices || []"
+                        :key="cIdx"
+                        class="ref-view-pill"
+                      >
+                        参考图：{{ viewLabel(choice.view) }}
+                      </span>
+                    </div>
+                    <p>{{ scene.motion_beats?.[0]?.action || scene.visual_description || '查看下方的动作与配音细节' }}</p>
+                  </div>
                 </div>
-              </div>
+                <details class="clip-dialogue">
+                  <summary>编辑角色与台词</summary>
+                  <div class="scene-item-header">
+                    <div class="scene-meta-left">
+                      <span class="scene-badge">{{ taskDetail?.generation_mode === 'paired_5s'
+                        ? `第 ${Math.ceil(scene.scene_index / 2)} 部分 · ${scene.scene_index % 2 ? '前段' : '后段'}`
+                        : `镜头 ${scene.scene_index}` }}</span>
+                      <el-tag v-if="scene.stale_tail" type="warning" size="small">待续接</el-tag>
+                      <span class="scene-time">{{ scene.duration }} 秒</span>
+                    </div>
+                    <div class="scene-meta-right">
+                      <span class="speaker-label">角色：</span>
+                      <el-input
+                        v-model="scene.speaker"
+                        size="small"
+                        style="width: 120px"
+                        placeholder="说话人/角色"
+                      />
+                    </div>
+                  </div>
 
-              <div class="scene-item-body">
-                <el-input
-                  v-model="scene.voiceover"
-                  type="textarea"
-                  :rows="2"
-                  placeholder="分镜台词/口播文案"
-                  class="voiceover-input"
-                />
-              </div>
+                  <div class="scene-item-body">
+                    <el-input
+                      v-model="scene.voiceover"
+                      type="textarea"
+                      :rows="2"
+                      placeholder="分镜台词/口播文案"
+                      class="voiceover-input"
+                    />
+                  </div>
 
-              <label>台词起点（段内秒数）
-                <el-input-number v-model="scene.voice_start" :min="0" :max="Math.max(0, scene.duration - 0.1)" :step="0.1" size="small" />
-                <el-button size="small" plain :loading="polishingSceneId === scene.scene_id"
-                  :disabled="polishingSceneId !== null || retryingSceneId !== null"
-                  @click="polishDialogue(scene)">重新优化旁白</el-button>
-              </label>
-              </details>
-              <AudioTimingEditor :scene="scene" :busy="retryingSceneId !== null"
-                @apply="lines => applyAudioTiming(scene, lines)" />
-              <div v-if="scene.transition_type === 'continue_action'" class="handoff-frames">
-                <figure v-if="storyboardData.find(item => item.scene_index === scene.scene_index - 1)?.last_frame_path">
-                  <img :src="mediaUrl(storyboardData.find(item => item.scene_index === scene.scene_index - 1).last_frame_path)" alt="上一段实际尾帧" />
-                  <figcaption>上一段当前尾帧</figcaption>
-                </figure>
-                <figure v-if="scene.actual_first_frame_path || scene.continuity_input_path">
-                  <img :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path)" :alt="scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧'" />
-                  <figcaption>{{ scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧' }}</figcaption>
-                </figure>
-              </div>
-              <p v-if="scene.join_review?.review_suggested" class="scene-markers">
-                首尾帧画面差异较大，建议对照检查姿态和构图。
-              </p>
-              <details v-if="scene.video_path || scene.camera_plan" class="scene-markers">
-                <summary>运镜计划和动作时间点</summary>
-                <p v-if="scene.camera_plan">{{ scene.camera_plan.purpose }} · {{ scene.camera_plan.framing }} · {{ scene.camera_plan.focus }}</p>
-                <p v-if="scene.opening_frame_review?.reason">首帧检查：{{ scene.opening_frame_review.reason }}</p>
-                <video v-if="scene.video_path" :id="'clip-' + scene.scene_id" :src="mediaUrl(scene.video_path)" controls playsinline preload="none" />
-                <div v-for="beat in scene.observed_handoff?.plan?.motion_beats || scene.motion_beats || []" :key="beat.start" class="cue-row">
-                  <button type="button" @click="seekScene(scene, beat.start)">{{ beat.start }} 秒</button>
-                  <span>{{ beat.action }}</span>
-                </div>
-                <div v-if="scene.voiceover" class="cue-row">
-                  <button type="button" @click="seekScene(scene, scene.voice_start ?? 0)">{{ scene.voice_start ?? 0 }} 秒</button>
-                  <span>台词 · {{ scene.voice_cue || scene.voiceover }}</span>
-                </div>
-                <div v-for="(cue, index) in scene.sound_cues || []" :key="'sfx-' + index" class="cue-row">
-                  <button type="button" @click="seekScene(scene, cue.start)">{{ cue.start }} 秒</button>
-                  <span>音效 · {{ cue.name }}</span>
-                </div>
-              </details>
-              <p v-if="pendingClip === scene.scene_id" class="rerun-impact">{{ impactText(scene) }}</p>
-              <div class="scene-item-actions">
-                <details class="secondary-actions">
-                  <summary>更多操作</summary>
-                  <el-button size="small" :disabled="retryingSceneId !== null" @click="handleRerunScene(scene, 'voice')">重录配音</el-button>
-                  <el-button v-if="scene.transition_type !== 'continue_action'" size="small"
-                    :disabled="retryingSceneId !== null" @click="handleRerunScene(scene, 'image')">重生底图</el-button>
+                  <label>台词起点（段内秒数）
+                    <el-input-number v-model="scene.voice_start" :min="0" :max="Math.max(0, scene.duration - 0.1)" :step="0.1" size="small" />
+                    <el-button
+                      size="small"
+                      plain
+                      :loading="polishingSceneId === scene.scene_id"
+                      :disabled="polishingSceneId !== null || retryingSceneId !== null"
+                      @click="polishDialogue(scene)"
+                    >重新优化旁白</el-button>
+                  </label>
                 </details>
-                <el-button
-                  size="small"
-                  type="primary"
-                  :disabled="retryingSceneId !== null"
-                  @click="confirmClip(scene)"
+                <AudioTimingEditor
+                  :scene="scene"
+                  :busy="retryingSceneId !== null"
+                  @apply="lines => applyAudioTiming(scene, lines)"
+                />
+                <div v-if="scene.transition_type === 'continue_action'" class="handoff-frames">
+                  <figure v-if="storyboardData.find(item => item.scene_index === scene.scene_index - 1)?.last_frame_path">
+                    <img :src="mediaUrl(storyboardData.find(item => item.scene_index === scene.scene_index - 1).last_frame_path)" alt="上一段实际尾帧" />
+                    <figcaption>上一段当前尾帧</figcaption>
+                  </figure>
+                  <figure v-if="scene.actual_first_frame_path || scene.continuity_input_path">
+                    <img :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path)" :alt="scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧'" />
+                    <figcaption>{{ scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧' }}</figcaption>
+                  </figure>
+                </div>
+                <p v-if="scene.join_review?.review_suggested" class="scene-markers">
+                  首尾帧画面差异较大，建议对照检查姿态和构图。
+                </p>
+                <details
+                  v-if="scene.video_path || scene.camera_plan"
+                  class="scene-markers"
+                  :open="autoOpenClipMarkers === scene.scene_id"
                 >
-                  {{ pendingClip === scene.scene_id ? "确认重拍" : "重拍视频" }}
-                </el-button>
+                  <summary>运镜计划和动作时间点</summary>
+                  <p v-if="scene.camera_plan">{{ scene.camera_plan.purpose }} · {{ scene.camera_plan.framing }} · {{ scene.camera_plan.focus }}</p>
+                  <p v-if="scene.opening_frame_review?.reason">首帧检查：{{ scene.opening_frame_review.reason }}</p>
+                  <video v-if="scene.video_path" :id="'clip-' + scene.scene_id" :src="mediaUrl(scene.video_path)" controls playsinline preload="none" />
+                  <div v-for="beat in scene.observed_handoff?.plan?.motion_beats || scene.motion_beats || []" :key="beat.start" class="cue-row">
+                    <button type="button" @click="seekScene(scene, beat.start)">{{ beat.start }} 秒</button>
+                    <span>{{ beat.action }}</span>
+                  </div>
+                  <div v-if="scene.voiceover" class="cue-row">
+                    <button type="button" @click="seekScene(scene, scene.voice_start ?? 0)">{{ scene.voice_start ?? 0 }} 秒</button>
+                    <span>台词 · {{ scene.voice_cue || scene.voiceover }}</span>
+                  </div>
+                  <div v-for="(cue, index) in scene.sound_cues || []" :key="'sfx-' + index" class="cue-row">
+                    <button type="button" @click="seekScene(scene, cue.start)">{{ cue.start }} 秒</button>
+                    <span>音效 · {{ cue.name }}</span>
+                  </div>
+                </details>
+                <p v-if="pendingClip === scene.scene_id" class="rerun-impact">{{ impactText(scene) }}</p>
+                <div class="scene-item-actions">
+                  <details class="secondary-actions">
+                    <summary>更多操作</summary>
+                    <el-button size="small" :disabled="retryingSceneId !== null" @click="handleRerunScene(scene, 'voice')">重录配音</el-button>
+                    <el-button
+                      v-if="scene.transition_type !== 'continue_action'"
+                      size="small"
+                      :disabled="retryingSceneId !== null"
+                      @click="handleRerunScene(scene, 'image')"
+                    >重生底图</el-button>
+                  </details>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    :disabled="retryingSceneId !== null"
+                    @click="confirmClip(scene)"
+                  >
+                    {{ pendingClip === scene.scene_id ? "确认重拍" : "重拍视频" }}
+                  </el-button>
+                </div>
               </div>
             </div>
-          </div>
-        </el-card>
-      </div>
+          </el-card>
+        </div>
+
         <div class="detail-wrapper">
           <!-- Info Details Card -->
           <el-card class="detail-card info-card" shadow="never">
@@ -206,6 +261,8 @@
             </div>
           </el-card>
 
+          <GenerationUsage v-if="taskId" scope-type="task" :scope-id="String(taskId)" />
+
           <details class="detail-card">
             <summary>更多导出</summary>
             <div class="downloads-grid">
@@ -226,13 +283,14 @@
 </template>
 
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, nextTick, ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import BasicLayout from '../layouts/BasicLayout.vue'
 import TaskProgress from './TaskProgress.vue'
 import VideoPlayerCard from '../components/VideoPlayerCard.vue'
 import AudioTimingEditor from '../components/AudioTimingEditor.vue'
+import GenerationUsage from '../components/GenerationUsage.vue'
 import { videoApi } from '../api/video'
 
 const route = useRoute()
@@ -240,6 +298,7 @@ const router = useRouter()
 const taskId = route.params.id
 const showProcess = ref(false)
 const previewVersion = ref(Date.now())
+const autoOpenClipMarkers = ref('')
 
 const loading = ref(true)
 const taskDetail = ref(null)
@@ -247,6 +306,59 @@ const scriptData = ref(null)
 const storyboardData = ref([])
 const retryingSceneId = ref(null)
 const polishingSceneId = ref(null)
+
+const viewLabel = (view) =>
+  ({ front: '正面', side: '侧面', profile: '侧面', full: '全身', whole: '全身' })[view] || view || '正面'
+
+const qualityIssues = computed(() => {
+  const report = taskDetail.value?.metadata?.quality_report
+  if (!report) return []
+  const visual = Array.isArray(report.visual_review?.issues) ? report.visual_review.issues : []
+  const semRaw = Array.isArray(report.semantic_review?.located_issues)
+    ? report.semantic_review.located_issues
+    : Array.isArray(report.semantic_review?.issues)
+      ? report.semantic_review.issues.map(raw => (typeof raw === 'string' ? { issue: raw } : raw))
+      : []
+  return [...visual, ...semRaw]
+})
+
+async function jumpToQualityIssue(item) {
+  let targetSceneId = item?.scene_id
+  let localOffset = item?.scene_offset
+  let fullTime = item?.time
+
+  let elapsed = 0
+  for (const s of storyboardData.value) {
+    const dur = Number(s.duration) || 0
+    if (targetSceneId && s.scene_id === targetSceneId) {
+      if (fullTime == null) fullTime = elapsed + Number(localOffset || 0)
+      if (localOffset == null) localOffset = Math.max(0, Number(fullTime || elapsed) - elapsed)
+      break
+    }
+    if (!targetSceneId && typeof fullTime === 'number' && fullTime >= elapsed && fullTime <= elapsed + dur) {
+      targetSceneId = s.scene_id
+      localOffset = Math.max(0, fullTime - elapsed)
+      break
+    }
+    elapsed += dur
+  }
+
+  if (targetSceneId) {
+    selectedClip.value = targetSceneId
+    pendingClip.value = null
+    autoOpenClipMarkers.value = targetSceneId
+  }
+  const mainPlayer = document.querySelector('.player-wrapper video')
+  if (mainPlayer && typeof fullTime === 'number') {
+    mainPlayer.currentTime = Math.max(0, fullTime)
+  }
+  await nextTick()
+  if (targetSceneId && typeof localOffset === 'number') {
+    const clipPlayer = document.getElementById('clip-' + targetSceneId)
+    if (clipPlayer) clipPlayer.currentTime = Math.max(0, localOffset)
+  }
+}
+
 async function applyAudioTiming(scene, lines) {
   retryingSceneId.value = scene.scene_id
   try {
@@ -261,6 +373,7 @@ async function applyAudioTiming(scene, lines) {
     retryingSceneId.value = null
   }
 }
+
 async function polishDialogue(scene) {
   const draft = { voiceover: scene.voiceover || '', speaker: scene.speaker || '旁白', voice_start: scene.voice_start ?? 0 }
   polishingSceneId.value = scene.scene_id
@@ -279,6 +392,7 @@ async function polishDialogue(scene) {
     polishingSceneId.value = null
   }
 }
+
 const selectedClip = ref(null)
 const pendingClip = ref(null)
 const currentScene = computed(() => storyboardData.value.find(scene =>
@@ -339,7 +453,6 @@ const handleRerunScene = async (scene, type) => {
       ElMessage.success(`镜头 ${scene.scene_index} ${typeText}生成成功并已重新合成！`)
     }
     storyboardData.value = await videoApi.getStoryboard(taskId)
-    // 重新获取任务详情以刷新播放器
     const data = await videoApi.getTask(taskId)
     taskDetail.value = data
     if (res?.scene) {
@@ -358,7 +471,9 @@ const handleRerunScene = async (scene, type) => {
 const getModeText = (mode) => {
   const modes = {
     key_scenes: '关键镜头动态 (推荐)',
-    full_dynamic: '全动态视频 (精美)'
+    full_dynamic: '全动态视频 (精美)',
+    native_10s: '原生 10 秒动态镜头',
+    paired_5s: '双 5 秒连续动作镜头'
   }
   return modes[mode] || mode
 }
@@ -402,19 +517,16 @@ const downloadStoryboard = () => {
 
 onMounted(async () => {
   try {
-    // 1. Fetch task details
     const data = await videoApi.getTask(taskId)
     taskDetail.value = data
-    
+
     if (data.status === 'success' && data.metadata?.video_path) {
-      // 2. Fetch script content
       try {
         scriptData.value = await videoApi.getScript(taskId)
       } catch (e) {
         console.warn('Script details not found', e)
       }
-      
-      // 3. Fetch storyboard content
+
       try {
         storyboardData.value = await videoApi.getStoryboard(taskId)
       } catch (e) {
@@ -583,6 +695,65 @@ onMounted(async () => {
   background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
 }
 
+.quality-jump-panel {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 10px;
+}
+.quality-jump-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: #92400e;
+}
+.quality-jump-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.quality-jump-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #fcd34d;
+  background: #ffffff;
+  color: #1e293b;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.quality-jump-btn:hover {
+  background: #fef3c7;
+}
+.jump-badge {
+  font-weight: 700;
+  color: #b45309;
+  white-space: nowrap;
+}
+.jump-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.jump-arrow {
+  font-size: 12px;
+  font-weight: 600;
+  color: #2563eb;
+  white-space: nowrap;
+}
+
 /* OpenCut / OpenMontage Studio Editing */
 .studio-editing-section {
   margin-top: 32px;
@@ -628,6 +799,21 @@ onMounted(async () => {
 .scene-edit-item:hover {
   border-color: #cbd5e1;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+.clip-overview-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.ref-view-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #f3e8ff;
+  color: #6b21a8;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .scene-item-header {

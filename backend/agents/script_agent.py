@@ -1,5 +1,6 @@
 import anyio
 from datetime import UTC, datetime
+from services.character_binding import series_prompt_context
 
 from core.database import mongodb
 from models.script_model import Script
@@ -54,7 +55,8 @@ class ScriptAgent:
                 }
 
             llm_service = get_llm_service()
-            task_plan = {**task_plan, "generation_mode": task.get("generation_mode", "full_dynamic")}
+            task_plan = {**task_plan, "generation_mode": task.get("generation_mode", "full_dynamic"),
+                         "series_context": series_prompt_context(task)}
             script_data = await anyio.to_thread.run_sync(
                 lambda _plan=task_plan: llm_service.generate_script(_plan)
             )

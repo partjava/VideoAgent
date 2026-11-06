@@ -12,6 +12,7 @@ class VideoTaskStatus(str, Enum):
     STORYBOARD_DONE = "storyboard_done"
     IMAGE_GENERATING = "image_generating"
     VIDEO_GENERATING = "video_generating"
+    AWAITING_SHOOT_REVIEW = "awaiting_shoot_review"
     VOICE_GENERATING = "voice_generating"
     SUBTITLE_GENERATING = "subtitle_generating"
     RENDERING = "rendering"
@@ -32,6 +33,8 @@ class VideoTask(BaseModel):
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
     generation_mode: str = Field(default="full_dynamic", description="Video generation mode")
+    pre_shoot_review: bool = False
+    generation_limit: int | None = Field(default=None, ge=1, le=10000)
     status: VideoTaskStatus = Field(default=VideoTaskStatus.CREATED)
     progress: int = Field(default=0, ge=0, le=100)
     current_agent: str | None = Field(default=None)
@@ -50,6 +53,9 @@ class CreateVideoTaskRequest(BaseModel):
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
     generation_mode: Literal["native_10s", "full_dynamic", "paired_5s", "key_scenes"] = "native_10s"
+    pre_shoot_review: bool = False
+    generation_limit: int | None = Field(default=None, ge=1, le=10000)
+    character_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class CreateVideoTaskResponse(BaseModel):

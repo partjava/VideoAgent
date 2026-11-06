@@ -3,6 +3,8 @@ from typing import Any
 
 
 class BaseImageService(ABC):
+    supports_reference_images = False
+
     @abstractmethod
     def generate_image(
         self,
@@ -11,5 +13,6 @@ class BaseImageService(ABC):
         image_prompt: str,
         negative_prompt: str | None = None,
         ratio: str = "9:16",
+        reference_images: list[str] | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError

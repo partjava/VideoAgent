@@ -27,6 +27,9 @@ from models.asset_model import Asset
 from services.generation_contract import MAX_VOICE_SPEED, continuity_input, voice_speed, voice_window
 from services.media_quality import extract_tail, inspect_video, resolve_media
 from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
+from services.character_binding import frozen_characters, reference_choices_for_scene, scene_voice_options, faster_voice_options
+from services.generation_dispatch import dispatch_generation
+from services.generation_usage import GenerationLimitExceeded
 
 
 router = APIRouter(prefix="/api/video", tags=["video"])
@@ -114,6 +117,8 @@ async def video_route_status() -> dict[str, str]:
 async def create_video_task(payload: CreateVideoTaskRequest) -> ApiResponse | JSONResponse:
     try:
         task = await task_service.create_task(payload)
+    except (ValueError, LookupError) as exc:
+        return error_response(str(exc), 400)
     except PyMongoError:
         return error_response("MongoDB unavailable", 503)
     return ApiResponse(status="success", data=task.model_dump())
@@ -159,6 +164,8 @@ async def run_video_pipeline(
         if task is None:
             return error_response("Task not found", 404)
 
+        if (task.get("metadata") or {}).get("series_context"):
+            return error_response("请在连载工作台继续或重新生成本集，以维护跨集状态", 409)
         if not resume:
             # 清理历史资产文件和数据库，准备重头开始生成
             await task_service.clear_task_assets(task_id)
@@ -256,6 +263,8 @@ async def delete_video_task(task_id: str) -> ApiResponse | JSONResponse:
         task = await task_service.get_task(task_id)
         if task is None:
             return error_response("Task not found", 404)
+        if (task.get("metadata") or {}).get("series_context") or task.get("series_id"):
+            return error_response("连载素材由剧集版本管理，请在连载列表归档项目", 409)
         deleted = await task_service.delete_task(task_id)
         return ApiResponse(status="success", data={"deleted": deleted})
     except PyMongoError:
@@ -317,12 +326,21 @@ async def rerun_scene_asset(
         updated_fields = {}
         if payload.rerun_type not in {"voice", "image", "video", "all"}:
             return error_response("Invalid rerun type", 400)
+        in_shoot_review = task.get("status") == VideoTaskStatus.AWAITING_SHOOT_REVIEW.value
+        series_context = (task.get("metadata") or {}).get("series_context")
+        if series_context and (
+            (payload.rerun_type in {"image", "video", "all"} and not (in_shoot_review and payload.rerun_type == "image"))
+            or (payload.voiceover is not None and clean_tts_text(payload.voiceover) != clean_tts_text(scene.get("voiceover") or ""))
+            or (payload.speaker is not None and payload.speaker != scene.get("speaker"))
+        ):
+            return error_response("连载剧情或画面修改请在剧集工作台重新生成本集，以保留版本与后续依赖。配音时间可直接调整。", 409)
+        scene["voice_profiles"] = frozen_characters(task)
         if scene.get("dialogue_lines") and payload.rerun_type in {"voice", "all"}:
             if payload.rerun_type != "voice":
                 return error_response("请先单独重新生成对白，再处理其他素材", 400)
             lines = await synthesize_dialogue(scene, backend_dir, task_id, f"{scene_id}_{uuid4().hex[:12]}")
             await mongodb.update_one("scenes", {"_id": scene["_id"]}, {"dialogue_audio": lines, "updated_at": now})
-            if task.get("status") == "failed":
+            if task.get("status") in {"failed", VideoTaskStatus.AWAITING_SHOOT_REVIEW.value}:
                 return ApiResponse(status="success", data={"message": "对白已保存，可以继续原任务"})
             await SubtitleAgent().run(task_id)
             await EditorAgent().run(task_id)
@@ -366,22 +384,22 @@ async def rerun_scene_asset(
         if payload.rerun_type in ("voice", "all"):
             voiceover = scene.get("voiceover", "")
             speaker = scene.get("speaker", "旁白")
-            voice_name = resolve_voice_for_speaker(speaker)
+            options = scene_voice_options(scene, speaker)
+            voice_name = options["voice"]
             audio_path = backend_dir / "assets" / task_id / "audio" / f"voice_{render_id}.mp3"
             _, duration = voice_window(scene)
 
             audio_duration = await tts_service.generate_voice(
                 text=voiceover,
                 output_path=str(audio_path),
-                voice=voice_name,
+                **options,
             )
             if duration < audio_duration <= duration * MAX_VOICE_SPEED:
                 rate_pct = min(25, max(5, int(round((audio_duration / duration - 1.0) * 100))))
                 audio_duration = await tts_service.generate_voice(
                     text=voiceover,
                     output_path=str(audio_path),
-                    voice=voice_name,
-                    rate=f"+{rate_pct}%",
+                    **faster_voice_options(options, rate_pct),
                 )
 
             voice_speed(scene_id, audio_duration, duration)
@@ -392,6 +410,7 @@ async def rerun_scene_asset(
             updated_fields["audio_text"] = voiceover
             updated_fields["speaker"] = speaker
             updated_fields["voice"] = voice_name
+            updated_fields["voice_options"] = options
             scene["audio_path"] = relative_audio
             scene["audio_duration"] = audio_duration
 
@@ -415,7 +434,14 @@ async def rerun_scene_asset(
             image_prompt = payload.prompt or scene.get("image_prompt")
             if image_prompt:
                 image_service = get_image_service()
-                img_res = await anyio.to_thread.run_sync(
+                choices = reference_choices_for_scene(task, scene)
+                reference_options = {"reference_images": [item["path"] for item in choices]} if choices else {}
+                if choices and not getattr(image_service, "supports_reference_images", False):
+                    return error_response("当前图片模型不支持角色参考图，请更换模型", 422)
+                img_res = await dispatch_generation(
+                    {"task_id": task_id, **(task or {})},
+                    "image",
+                    scene_id,
                     lambda: image_service.generate_image(
                         task_id=task_id,
                         scene_id=render_id,
@@ -423,11 +449,14 @@ async def rerun_scene_asset(
                         negative_prompt=(PHOTO_EXCLUSIONS + "，" if task.get("style") == "短剧" else "")
                         + (scene.get("image_negative_prompt") or scene.get("negative_prompt") or ""),
                         ratio=task.get("ratio", "9:16"),
-                    )
+                        **reference_options,
+                    ),
                 )
                 if img_res.get("status") == "success" and img_res.get("asset_path"):
                     updated_fields["image_path"] = img_res["asset_path"]
+                    updated_fields["reference_choices"] = choices
                     scene["image_path"] = img_res["asset_path"]
+                    scene["reference_choices"] = choices
                     await save_asset("image", img_res["asset_path"], img_res.get("source") or "image_provider")
                 else:
                     raise ValueError("Image rerun did not return an asset")
@@ -453,18 +482,27 @@ async def rerun_scene_asset(
             prompt_options = video_prompt_options(provider, prompt_scene)
             pending_key = render_signature(provider, first_digest, prompt, duration, task.get("ratio", "9:16"), **prompt_options)
             pending_job = scene.get("pending_video_rerun") or {}
+            resumed_pending = False
             if pending_job.get("key") == pending_key:
                 render_id = pending_job["render_id"]
+                resumed_pending = getattr(provider, "has_pending_render", lambda *a, **kw: False)(
+                    task_id, render_id, first, video_prompt=prompt, duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options
+                ) is True
             else:
                 await mongodb.update_one("scenes", {"_id": scene["_id"]}, {
                     "pending_video_rerun": {"key": pending_key, "render_id": render_id},
                     "observed_handoff": observed,
                 })
-            result = await anyio.to_thread.run_sync(
-                lambda: provider.generate_video(task_id=task_id, scene_id=render_id,
-                                                image_path=first, video_prompt=prompt,
-                                                duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options)
-            )
+            def _call_rerun_video():
+                return provider.generate_video(
+                    task_id=task_id, scene_id=render_id,
+                    image_path=first, video_prompt=prompt,
+                    duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options
+                )
+            if resumed_pending:
+                result = await anyio.to_thread.run_sync(_call_rerun_video)
+            else:
+                result = await dispatch_generation({"task_id": task_id, **(task or {})}, "video", scene_id, _call_rerun_video)
             if result.get("status") != "success" or not result.get("asset_path"):
                 raise ValueError("Video rerun did not return an asset")
             video_path = result["asset_path"]
@@ -494,8 +532,11 @@ async def rerun_scene_asset(
 
         updated_fields["updated_at"] = now
         await mongodb.update_one("scenes", {"_id": f"{task_id}_{scene_id}"}, updated_fields)
-        if task.get("status") == "failed" and payload.rerun_type == "voice":
-            return ApiResponse(status="success", data={"message": "配音已保存，可以继续原任务"})
+        if in_shoot_review or (task.get("status") == "failed" and payload.rerun_type == "voice"):
+            scene_data = {**scene, **updated_fields}
+            if "_id" in scene_data:
+                scene_data["_id"] = str(scene_data["_id"])
+            return ApiResponse(status="success", data={"message": "素材已保存，可继续试拍或确认开拍", "scene": scene_data})
 
         pending = await mongodb.find_many("scenes", {"task_id": task_id, "stale_tail": True}, limit=100)
         if pending:
@@ -523,5 +564,7 @@ async def rerun_scene_asset(
                 "quality": quality_res,
             },
         )
+    except GenerationLimitExceeded as exc:
+        return error_response(str(exc), 409)
     except Exception as exc:
         return error_response(f"Scene rerun failed: {str(exc)}", 500)

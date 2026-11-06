@@ -1,10 +1,72 @@
 from pathlib import Path
 import json
+import re
 
 import anyio
 from models.task_model import VideoTaskStatus
 
 from agents.agent_utils import mark_agent_failed, mark_agent_start, mark_agent_success
+
+
+def locate_quality_issues(issues: list[dict], scenes: list[dict], timeline: list[dict]) -> list[dict]:
+    entries = []
+    for idx, (scene, row) in enumerate(zip(scenes, timeline)):
+        entries.append({
+            "scene_id": str(scene.get("scene_id") or f"scene_{idx + 1}"),
+            "scene_index": int(scene.get("scene_index") or (idx + 1)),
+            "start": float(row.get("start") or 0.0),
+            "end": float(row.get("end") or 0.0),
+            "duration": float(row.get("duration") or scene.get("duration") or 0.0),
+        })
+    by_id = {entry["scene_id"]: entry for entry in entries}
+    located = []
+    for raw in issues or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        time_val = item.get("time")
+        has_time = isinstance(time_val, (int, float)) and not isinstance(time_val, bool)
+        entry = by_id.get(str(item.get("scene_id") or ""))
+        if entry is None and has_time and entries:
+            t = float(time_val)
+            entry = next((e for e in entries if e["start"] <= t <= e["end"]), None)
+            if entry is None:
+                entry = entries[-1] if t > entries[-1]["end"] else entries[0]
+        if entry is not None:
+            item["scene_id"] = entry["scene_id"]
+            item["scene_index"] = entry["scene_index"]
+            t = float(time_val) if has_time else entry["start"]
+            item["time"] = round(t, 2)
+            item["scene_offset"] = round(max(0.0, min(entry["duration"], t - entry["start"])), 2)
+        located.append(item)
+    return located
+
+
+def locate_semantic_issues(issues: list, scenes: list[dict], timeline: list[dict]) -> list[dict]:
+    entries = {}
+    by_index = {}
+    for idx, (scene, row) in enumerate(zip(scenes, timeline)):
+        sid = str(scene.get("scene_id") or f"scene_{idx + 1}")
+        sidx = int(scene.get("scene_index") or (idx + 1))
+        info = {"scene_id": sid, "scene_index": sidx, "time": round(float(row.get("start") or 0.0), 2), "scene_offset": 0.0}
+        entries[sid] = info
+        by_index[sidx] = info
+    located = []
+    for raw in issues or []:
+        text = raw.get("issue") if isinstance(raw, dict) else str(raw or "")
+        if not text:
+            continue
+        match_info = None
+        for sid, info in entries.items():
+            if sid in text:
+                match_info = info
+                break
+        if match_info is None:
+            m = re.search(r"(?:scene_|分镜\s*|镜头\s*)(\d+)", text, re.IGNORECASE)
+            if m:
+                match_info = by_index.get(int(m.group(1)))
+        located.append({"issue": text, **(match_info or {})})
+    return located
 
 
 class QualityAgent:
@@ -80,10 +142,12 @@ class QualityAgent:
                         get_llm_service().review_story_coverage, task.get("user_input", ""),
                         plan.get("plot_beats", []), review_inputs,
                     )
+                    raw_sem_issues = review.get("issues", [])
                     result["semantic_review"] = {
                         "scope": "script_and_planned_visuals",
                         "verdict": "pass" if review.get("verdict") == "pass" else "needs_review",
-                        "issues": review.get("issues", []),
+                        "issues": raw_sem_issues,
+                        "located_issues": locate_semantic_issues(raw_sem_issues, scenes, timeline),
                     }
                 except Exception:
                     result["semantic_review"] = {"scope": "script_and_planned_visuals", "verdict": "unavailable"}
@@ -98,6 +162,7 @@ class QualityAgent:
                         ))
                     except Exception:
                         unavailable.append(scene["scene_id"])
+                issues = locate_quality_issues(issues, scenes, timeline)
                 result["visual_review"] = {
                     "scope": "sampled_actual_frames", "issues": issues, "unavailable_scenes": unavailable,
                     "verdict": "needs_review" if issues else "incomplete" if unavailable else "pass",

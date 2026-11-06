@@ -55,6 +55,19 @@ def _style_template(style: str | None) -> dict[str, str]:
     return STYLE_TEMPLATES[DEFAULT_STYLE]
 
 
+def _normalize_openai_base_url(url: str) -> str:
+    from urllib.parse import urlsplit
+    cleaned = (url or "").strip().rstrip("/")
+    if not cleaned:
+        return "https://api.deepseek.com/v1"
+    if cleaned == "https://dashscope.aliyuncs.com":
+        return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    parsed = urlsplit(cleaned)
+    if parsed.path in ("", "/"):
+        return f"{cleaned}/v1"
+    return cleaned
+
+
 class DeepSeekService(BaseLLMService):
     def _call_api(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> dict[str, Any]:
         if not settings.enable_paid_api:
@@ -67,7 +80,7 @@ class DeepSeekService(BaseLLMService):
         llm = ChatOpenAI(
             model=profile["model"],
             api_key=profile["key"],
-            base_url=profile["url"],
+            base_url=_normalize_openai_base_url(profile["url"]),
             temperature=0.65,
             max_tokens=max_tokens,
             timeout=300,
@@ -330,6 +343,7 @@ class DeepSeekService(BaseLLMService):
 - 复杂交接优先改成借桌面等支撑面完成，或把交接前后分配给已有的相邻段落。关键对白时保留说话者或反应主体的面部。
 - 若镜头从接物者取物开始，把道具已落稳、递物者已松手、接物者尚未接触写入 start_state，并交代支撑面。
 - reaction_focus 写明关键配音时观众必须看清的具体主体：剧情人物的反应、产品演示结果或科普现象。只写本镜已经存在的可见主体。
+- 有注册角色时，character_ids 只填写本镜可见角色的原始character_id，不得自造ID。画外说话者不放入可见角色列表，空镜返回空数组。对白speaker使用已绑定角色的原名。
 - 先用一个贯穿本段的可见事件串起起因、动作、结果和反应，再写 visual_description。后一个动作必须由前一个动作的可见结果或台词触发。预留交互完成和人物反应的时间，删去挤占揭晓或反应的次要动作、额外转场和结尾字卡。
 - 重要道具每次换手、落到支撑面、翻面或离开画面，都交代动作过程及完成后的状态。情节依赖观众看见的线索，提前选好能看清线索的构图。
 - transition_type 为 cut（切镜或换机位）、continue_action（同机位同构图连续动作，必须继承上一镜尾帧）、scene_change（明确换场）。首镜必须为 cut。
@@ -372,6 +386,7 @@ class DeepSeekService(BaseLLMService):
 - start_state
 - end_state
 - reaction_focus
+- character_ids
 
 返回 JSON：{{"scenes": [...]}}
 """

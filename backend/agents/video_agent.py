@@ -37,6 +37,8 @@ from services.video.base import VideoRenderRejected
 from services.video_vision import replan_from_tail, review_enabled, review_opening_frame
 from services.audio_timing import narration_speed
 from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
+from services.generation_dispatch import dispatch_generation
+from services.generation_usage import record_reuse
 
 
 OVERLAY_DIRECTION = re.compile(
@@ -250,9 +252,10 @@ def video_service_for_task(task):
 class VideoAgent:
     agent_name = "VideoAgent"
 
-    async def run(self, task_id: str) -> list[dict[str, object]]:
+    async def run(self, task_id: str, *, trial_scene_id: str | None = None) -> list[dict[str, object]]:
         try:
-            await mark_agent_start(task_id, self.agent_name, progress=88, status=VideoTaskStatus.VIDEO_GENERATING)
+            if trial_scene_id is None:
+                await mark_agent_start(task_id, self.agent_name, progress=88, status=VideoTaskStatus.VIDEO_GENERATING)
             query = {"task_id": task_id}
             scenes = await mongodb.find_many(SCENES_COLLECTION, query, limit=100)
             scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
@@ -272,8 +275,13 @@ class VideoAgent:
                     validate_motion_beats(scene.get("motion_beats"), 10, detailed=True, per_second=True)
             else:
                 validate_scene_durations(scenes, task.get("duration"), whole=task.get("generation_mode") == WHOLE_GENERATION_MODE)
+            selected = list(enumerate(scenes))
+            if trial_scene_id is not None:
+                selected = [(i, scene) for i, scene in selected if scene["scene_id"] == trial_scene_id]
+                if not selected or not needs_video(selected[0][1]):
+                    raise ValueError("请选择需要生成动态片段的镜头试拍")
             # Fail before submitting paid clips if the soundtrack cannot fit the timeline.
-            for scene in scenes:
+            for _, scene in selected:
                 if scene.get("dialogue_lines"):
                     audio = scene.get("dialogue_audio") or []
                     if len(audio) != len(scene["dialogue_lines"]) or not all(resolve_media(line["path"]).is_file() for line in audio):
@@ -293,7 +301,7 @@ class VideoAgent:
             service = video_service_for_task(task)
             assets = []
             previous_tail = None
-            for index, scene in enumerate(scenes):
+            for index, scene in selected:
                 sid = str(scene["scene_id"])
                 key = {"_id": f"{task_id}_{sid}"}
                 image = scene.get("image_path") or images.get(sid, {}).get("path")
@@ -303,6 +311,15 @@ class VideoAgent:
                     previous_tail = str(image)
                     continue
 
+                previous = scenes[index - 1] if index else None
+                if trial_scene_id is not None and scene.get("transition_type") == "continue_action":
+                    if previous and not previous.get("stale_tail"):
+                        if needs_video(previous):
+                            previous_tail = previous.get("last_frame_path") if previous.get("video_path") else None
+                        else:
+                            previous_tail = previous.get("image_path") or images.get(previous["scene_id"], {}).get("path")
+                    if not previous_tail or not resolve_media(previous_tail).is_file():
+                        raise ValueError("这个镜头需要上一镜头的实际尾帧，请先试拍上一镜头")
                 first = continuity_input(scene, previous_tail, image)
                 if not first or not resolve_media(first).is_file():
                     raise ValueError(f"Missing first frame for scene: {sid}")
@@ -310,7 +327,6 @@ class VideoAgent:
                 asset = videos.get(sid)
                 cached_path = asset.get("path") if asset else None
                 first_digest = sha256(resolve_media(first).read_bytes()).hexdigest()
-                previous = scenes[index - 1] if index else None
                 prompt, observed = await prepare_motion_prompt(scene, previous, first, first_digest)
                 prompt_options = video_prompt_options(service, scene)
                 signature = render_signature(service, first_digest, prompt, duration, ratio, **prompt_options)
@@ -326,14 +342,22 @@ class VideoAgent:
                             raise ValueError(f"首帧构图不符合分组运镜计划（{sid}）：{saved_check.get('reason') or '关键接触位置不可见'}")
                     if observed:
                         await mongodb.update_one(SCENES_COLLECTION, key, {"observed_handoff": observed})
+                    task_doc = {"task_id": task_id, **(task or {})}
                     try:
-                        result = await anyio.to_thread.run_sync(
-                            lambda: service.generate_video(task_id=task_id, scene_id=sid, image_path=first,
-                                                           video_prompt=prompt, duration=duration, ratio=ratio,
-                                                           **prompt_options)
-                        )
+                        has_pending = getattr(service, "has_pending_render", lambda *a, **kw: False)(
+                            task_id, sid, first, video_prompt=prompt, duration=duration, ratio=ratio, **prompt_options
+                        ) is True
+                        def _call_video(_sid=sid, _first=first, _prompt=prompt, _dur=duration, _opts=prompt_options):
+                            return service.generate_video(
+                                task_id=task_id, scene_id=_sid, image_path=_first,
+                                video_prompt=_prompt, duration=_dur, ratio=ratio, **_opts
+                            )
+                        if has_pending:
+                            result = await anyio.to_thread.run_sync(_call_video)
+                        else:
+                            result = await dispatch_generation(task_doc, "video", sid, _call_video)
                     except Exception as exc:
-                        if paired or native or task.get("generation_mode") == WHOLE_GENERATION_MODE or (not isinstance(exc, VideoRenderRejected) and not isinstance(exc.__cause__, VideoRenderRejected)):
+                        if trial_scene_id is not None or paired or native or task.get("generation_mode") == WHOLE_GENERATION_MODE or (not isinstance(exc, VideoRenderRejected) and not isinstance(exc.__cause__, VideoRenderRejected)):
                             raise
                         await mongodb.update_one(SCENES_COLLECTION, key, {
                             "video_path": None, "image_path": first, "need_dynamic_video": False,
@@ -359,12 +383,14 @@ class VideoAgent:
                                               "submitted_video_prompt": prompt,
                                               "continuity_input_path": first, "need_dynamic_video": True, "stale_tail": False,
                                               "status": "video_done", "updated_at": now})
-                elif scene.get("stale_tail") or scene.get("video_path") != cached_path or (
-                    scene.get("transition_type") == "continue_action" and scene.get("continuity_input_path") != first
-                ):
-                    await mongodb.update_one(SCENES_COLLECTION, key, {"video_path": cached_path,
-                                              "continuity_input_path": first,
-                                              "need_dynamic_video": True, "stale_tail": False, "status": "video_done"})
+                else:
+                    if scene.get("stale_tail") or scene.get("video_path") != cached_path or (
+                        scene.get("transition_type") == "continue_action" and scene.get("continuity_input_path") != first
+                    ):
+                        await mongodb.update_one(SCENES_COLLECTION, key, {"video_path": cached_path,
+                                                  "continuity_input_path": first,
+                                                  "need_dynamic_video": True, "stale_tail": False, "status": "video_done"})
+                    await record_reuse({"task_id": task_id, **(task or {})}, "video", sid)
                 scene["video_path"] = asset["path"]
                 effective = align_measured_motion(scene)
                 await mongodb.update_one(SCENES_COLLECTION, key, {
@@ -391,10 +417,12 @@ class VideoAgent:
                     previous_tail = destination
                     await mongodb.update_one(SCENES_COLLECTION, key, {"last_frame_path": previous_tail})
 
-            await mark_agent_success(task_id, self.agent_name, progress=92, status=VideoTaskStatus.VIDEO_GENERATING,
-                                     message="Required video clips are ready",
-                                     extra_fields={"metadata.dynamic_video_count": len(assets)})
+            if trial_scene_id is None:
+                await mark_agent_success(task_id, self.agent_name, progress=92, status=VideoTaskStatus.VIDEO_GENERATING,
+                                         message="Required video clips are ready",
+                                         extra_fields={"metadata.dynamic_video_count": len(assets)})
             return assets
         except Exception as exc:
-            await mark_agent_failed(task_id, self.agent_name, exc)
+            if trial_scene_id is None:
+                await mark_agent_failed(task_id, self.agent_name, exc)
             raise

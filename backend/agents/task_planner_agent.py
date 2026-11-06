@@ -1,4 +1,5 @@
 import anyio
+from services.character_binding import frozen_characters, series_prompt_context
 
 from models.task_model import VideoTaskStatus
 from services.provider_factory import get_llm_service
@@ -38,7 +39,7 @@ class TaskPlannerAgent:
             )
 
             llm_service = get_llm_service()
-            _user_input = str(task["user_input"])
+            _user_input = str(task["user_input"]) + series_prompt_context(task)
             _duration = task.get("duration") if isinstance(task.get("duration"), int) else None
             _style = task.get("style") if isinstance(task.get("style"), str) else None
             _platform = task.get("platform") if isinstance(task.get("platform"), str) else None
@@ -55,6 +56,12 @@ class TaskPlannerAgent:
                         generation_mode=_g,
                     )
             )
+            profiles = frozen_characters(task)
+            if profiles:
+                task_plan["characters"] = [
+                    {**profile, "appearance": profile["face_dna"] + "；默认服装：" + profile["signature_clothing"]}
+                    for profile in profiles
+                ]
 
             await mark_agent_success(
                 task_id,

@@ -2,6 +2,9 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
+from services.character_binding import frozen_characters, reference_choices_for_scene
+from services.generation_dispatch import dispatch_generation
+from services.generation_usage import GenerationLimitExceeded, record_reuse
 from uuid import uuid4
 
 import anyio
@@ -42,6 +45,8 @@ class ImageAgent:
             image_service = get_image_service()
             # 获取任务比例，后续传给生图服务
             task = await mongodb.find_one("video_tasks", {"_id": task_id})
+            if frozen_characters(task or {}) and not getattr(image_service, "supports_reference_images", False):
+                raise ValueError("连载角色需要支持参考图的图片模型，请先在模型配置中更换型号")
             task_ratio = str(task.get("ratio", "9:16")) if task else "9:16"
 
             assets: list[dict[str, object]] = []
@@ -84,12 +89,14 @@ class ImageAgent:
                             upsert=True,
                         )
                         existing_asset = asset.model_dump()
+                    choices = reference_choices_for_scene(task or {}, scene)
                     await mongodb.update_one(
                         SCENES_COLLECTION,
                         {"_id": f"{task_id}_{scene_id}"},
-                        {"image_path": rel_path, "status": "image_done", "updated_at": now},
+                        {"image_path": rel_path, "reference_choices": choices, "status": "image_done", "updated_at": now},
                     )
                     assets.append(existing_asset)
+                    await record_reuse(task or {"task_id": task_id}, "image", scene_id)
                     print(f"[ImageAgent] Image already exists for {scene_id}, reused existing file.")
                     continue
 
@@ -119,19 +126,26 @@ class ImageAgent:
                 )
                 if (task or {}).get("style") == "短剧":
                     negative_prompt = PHOTO_EXCLUSIONS + "，" + (negative_prompt or "")
+                choices = reference_choices_for_scene(task or {}, scene)
+                reference_options = {"reference_images": [item["path"] for item in choices]} if choices else {}
                 try:
-                    result = await anyio.to_thread.run_sync(
-                        lambda _sid=scene_id, _ip=image_prompt, _np=negative_prompt, _ratio=task_ratio:
+                    result = await dispatch_generation(task or {"task_id": task_id}, "image", scene_id,
+                        lambda _sid=scene_id, _ip=image_prompt, _np=negative_prompt, _ratio=task_ratio, _ro=reference_options:
                             image_service.generate_image(
                                 task_id=task_id,
                                 scene_id=_sid,
                                 image_prompt=_ip,
                                 negative_prompt=_np,
                                 ratio=_ratio,
+                                **_ro,
                             )
                     )
+                    if isinstance(result, dict):
+                        result["reference_choices"] = choices
                     print(f"[ImageAgent] Scene {scene_id} image generated successfully.")
                     return result
+                except GenerationLimitExceeded:
+                    raise
                 except Exception as e:
                     print(f"[ImageAgent] Scene {scene_id} image generation failed: {e}")
                     return None
@@ -167,6 +181,7 @@ class ImageAgent:
                     {"_id": f"{task_id}_{scene_id}"},
                     {
                         "image_path": asset.path,
+                        "reference_choices": image_result.get("reference_choices") or [],
                         "status": "image_done",
                         "updated_at": now,
                     },

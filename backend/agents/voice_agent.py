@@ -2,6 +2,7 @@ import anyio
 import math
 from services.provider_factory import get_llm_service
 from services.generation_contract import MAX_VOICE_SPEED
+from services.character_binding import frozen_characters, scene_voice_options, faster_voice_options
 import os
 import re
 from datetime import UTC, datetime
@@ -66,14 +67,14 @@ async def synthesize_dialogue(scene, backend_dir, task_id, render_id):
     durations = []
     for index, line in enumerate(lines):
         text = clean_tts_text(line["text"])
-        voice = resolve_voice_for_speaker(line["speaker"])
+        options = scene_voice_options(scene, line["speaker"])
         path = f"assets/{task_id}/audio/dialogue_{render_id}_{index}.mp3"
-        duration = await tts_service.generate_voice(text, str(backend_dir / path), voice=voice)
+        duration = await tts_service.generate_voice(text, str(backend_dir / path), **options)
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError(f"Invalid audio duration for scene {scene['scene_id']}")
         durations.append(duration)
         rendered.append({"speaker": line["speaker"], "text": text, "path": f"backend/{path}",
-                         "source_duration": duration})
+                         "source_duration": duration, "voice_options": options})
 
     if all(duration <= slot * MAX_VOICE_SPEED for duration, slot in zip(durations, slots)):
         speeds = [voice_speed(scene["scene_id"], duration, slot) for duration, slot in zip(durations, slots)]
@@ -122,6 +123,10 @@ class VoiceAgent:
             scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
             task_scenes = [scene for scene in scenes]
             task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
+            task = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
+            profiles = frozen_characters(task)
+            for scene in task_scenes:
+                scene["voice_profiles"] = profiles
 
             scene_voiceovers = []
             for scene in task_scenes:
@@ -140,7 +145,7 @@ class VoiceAgent:
             )
             has_dialogue = any(scene.get("dialogue_lines") for scene in task_scenes)
             combined_text = "\n".join(scene_voiceovers).strip()
-            if (not has_dialogue and existing_voice and combined_voice_path.exists() and can_reuse
+            if (not profiles and not has_dialogue and existing_voice and combined_voice_path.exists() and can_reuse
                     and existing_voice.get("text") == combined_text):
                 for scene in task_scenes:
                     if clean_tts_text(str(scene.get("voiceover") or "")):
@@ -175,7 +180,11 @@ class VoiceAgent:
                 scene_id = str(scene["scene_id"])
                 if scene.get("dialogue_lines"):
                     audio = scene.get("dialogue_audio") or []
-                    if len(audio) != len(scene["dialogue_lines"]) or not all(resolve_media(line["path"]).is_file() for line in audio):
+                    binding_changed = profiles and any(
+                        item.get("voice_options") != scene_voice_options(scene, line["speaker"])
+                        for item, line in zip(audio, scene["dialogue_lines"])
+                    )
+                    if len(audio) != len(scene["dialogue_lines"]) or binding_changed or not all(resolve_media(line["path"]).is_file() for line in audio):
                         audio = await synthesize_dialogue(scene, backend_dir, task_id, scene_id)
                         await mongodb.update_one(SCENES_COLLECTION, {"_id": scene["_id"]}, {"dialogue_audio": audio})
                     total_duration += sum(line["end"] - line["start"] for line in audio)
@@ -188,7 +197,8 @@ class VoiceAgent:
                 scene_audio_path = backend_dir / "assets" / task_id / "audio" / f"voice_{scene_id}.mp3"
 
                 speaker = str(scene.get("speaker") or "").strip()
-                scene_voice = resolve_voice_for_speaker(speaker)
+                options = scene_voice_options(scene, speaker)
+                scene_voice = options["voice"]
 
                 # 跳过已存在的分镜配音
                 existing_asset = await mongodb.find_one(
@@ -202,9 +212,10 @@ class VoiceAgent:
                         scene_audio_relative = scene["audio_path"]
                 _, slot = voice_window(scene)
                 cached = (existing_asset and scene_audio_path.exists() and scene.get("audio_text") == voiceover
+                          and (not profiles or scene.get("voice_options") == options)
                           and scene.get("audio_duration") and scene.get("voice") == scene_voice)
                 scene_duration = float(scene["audio_duration"]) if cached else await tts_service.generate_voice(
-                    text=voiceover, output_path=str(scene_audio_path), voice=scene_voice
+                    text=voiceover, output_path=str(scene_audio_path), **options
                 )
 
                 # 原生语速优化：若音频略长于分镜时长，通过 edge-tts 原生 rate 微调，避免 MoviePy 变调失真
@@ -212,7 +223,7 @@ class VoiceAgent:
                     rate_pct = min(25, max(5, int(round((scene_duration / slot - 1.0) * 100))))
                     try:
                         adjusted_duration = await tts_service.generate_voice(
-                            text=voiceover, output_path=str(scene_audio_path), voice=scene_voice, rate=f"+{rate_pct}%"
+                            text=voiceover, output_path=str(scene_audio_path), **faster_voice_options(options, rate_pct)
                         )
                         scene_duration = adjusted_duration
                     except Exception:
@@ -236,12 +247,12 @@ class VoiceAgent:
                     candidate = scene_audio_path.with_suffix(".repair.mp3")
                     try:
                         scene_duration = await tts_service.generate_voice(
-                            text=shorter, output_path=str(candidate), voice=scene_voice
+                            text=shorter, output_path=str(candidate), **options
                         )
                         if slot < scene_duration <= slot * MAX_VOICE_SPEED:
                             rate_pct = min(25, max(5, int(round((scene_duration / slot - 1.0) * 100))))
                             scene_duration = await tts_service.generate_voice(
-                                text=shorter, output_path=str(candidate), voice=scene_voice, rate=f"+{rate_pct}%"
+                                text=shorter, output_path=str(candidate), **faster_voice_options(options, rate_pct)
                             )
                         voice_speed(scene_id, scene_duration, slot)
                         candidate.replace(scene_audio_path)
@@ -283,6 +294,7 @@ class VoiceAgent:
                         "audio_text": voiceover,
                         "speaker": speaker or "旁白",
                         "voice": scene_voice,
+                        "voice_options": options,
                         "updated_at": now,
                     },
                 )

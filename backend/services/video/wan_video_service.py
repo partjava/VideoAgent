@@ -21,8 +21,13 @@ FLASH_MODEL = "wan2.6-i2v-flash"
 
 class WanVideoService(BaseVideoService):
     @property
+    def _normalized_model_name(self):
+        return (self.model or "").rsplit("/", 1)[-1]
+
+    @property
     def supports_negative_prompt(self):
-        return self.model == FLASH_MODEL or self.model in SILENT_OUTPUT_MODELS
+        name = self._normalized_model_name
+        return name == FLASH_MODEL or name in SILENT_OUTPUT_MODELS
 
     def __init__(self, model=None, storage_root=None):
         profile = model_config("video", settings)
@@ -33,7 +38,27 @@ class WanVideoService(BaseVideoService):
 
     @property
     def api_base(self):
-        return self.api_url
+        cleaned = (self.api_url or "").strip().rstrip("/")
+        for suffix in ("/compatible-mode/v1", "/api/v1", "/v1"):
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)].rstrip("/")
+        return cleaned or self.api_url
+
+    def _render_paths(self, task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt):
+        source = Path(image_path)
+        if not source.is_absolute():
+            source = self.storage_root / str(image_path).replace("backend/", "", 1)
+        fingerprint = sha256(source.read_bytes())
+        fingerprint.update(json.dumps([self.model, video_prompt, duration, ratio]).encode())
+        if negative_prompt and self.supports_negative_prompt:
+            fingerprint.update(negative_prompt.encode("utf-8"))
+        job = self.storage_root / "assets" / task_id / "video_jobs" / f"{scene_id}-{fingerprint.hexdigest()}.json"
+        return source, job
+
+    def has_pending_render(self, task_id, scene_id, image_path, video_prompt=None,
+                           duration=5, ratio="9:16", negative_prompt=None):
+        _, job = self._render_paths(task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt)
+        return job.is_file()
 
     def _upload_file(self, file_path: str) -> str:
         upload_url = f"{self.api_base}/api/v1/files"
@@ -133,9 +158,10 @@ class WanVideoService(BaseVideoService):
         if not self.api_key:
             raise ValueError("未找到 DASHSCOPE_API_KEY，请在环境变量中配置。")
 
-        flash = self.model == FLASH_MODEL
-        wan3 = self.model in WAN3_MODELS
-        if not (flash or wan3 or self.model in SILENT_OUTPUT_MODELS):
+        model_name = self._normalized_model_name
+        flash = model_name == FLASH_MODEL
+        wan3 = model_name in WAN3_MODELS
+        if not (flash or wan3 or model_name in SILENT_OUTPUT_MODELS):
             raise ValueError(
                 f"当前模型 {self.model} 无法确认支持无声生成，未提交任务。"
                 "请在模型设置中选择 wan2.6-i2v-flash、wan3.0-video 或 wan3.0-video-prime。"
@@ -148,19 +174,10 @@ class WanVideoService(BaseVideoService):
         try:
             # 1. 如果是相对路径，则按 backend 根目录解析本地图片路径
             backend_dir = self.storage_root
-            resolved_image_path = image_path
-            if not Path(image_path).is_absolute():
-                # 如果数据库相对路径以 backend/ 开头，则先去掉这段前缀
-                clean_path = image_path.replace("backend/", "")
-                resolved_image_path = str(backend_dir / clean_path)
-
-            fingerprint = sha256(Path(resolved_image_path).read_bytes())
-            fingerprint.update(json.dumps([self.model, video_prompt, duration, ratio]).encode())
-            if negative_prompt and self.supports_negative_prompt:
-                fingerprint.update(negative_prompt.encode("utf-8"))
-            job_dir = backend_dir / "assets" / task_id / "video_jobs"
-            job_dir.mkdir(parents=True, exist_ok=True)
-            job = job_dir / f"{scene_id}-{fingerprint.hexdigest()}.json"
+            resolved_image_path, job = self._render_paths(
+                task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt
+            )
+            job.parent.mkdir(parents=True, exist_ok=True)
             api_task_id = None
             if job.is_file():
                 api_task_id = json.loads(job.read_text(encoding="utf-8")).get("task_id")

@@ -60,7 +60,20 @@ class TaskService:
             updated_at=now,
         )
 
-        await mongodb.insert_one(VIDEO_TASKS_COLLECTION, _task_to_document(task))
+        document = _task_to_document(task)
+        document["pre_shoot_review"] = payload.pre_shoot_review
+        document["generation_limit"] = payload.generation_limit
+        if getattr(payload, "character_ids", None):
+            from services.character_service import get_confirmed_profiles
+
+            bound_profiles = await get_confirmed_profiles(list(payload.character_ids))
+            document.setdefault("metadata", {})["bound_characters"] = bound_profiles
+            document["metadata"]["character_ids"] = list(payload.character_ids)
+        await mongodb.insert_one(VIDEO_TASKS_COLLECTION, document)
+        if payload.generation_limit is not None:
+            from services.generation_usage import set_limit
+
+            await set_limit("task", task.task_id, payload.generation_limit)
         await agent_log_service.write_log(
             CreateAgentLogRequest(
                 task_id=task.task_id,
@@ -85,7 +98,7 @@ class TaskService:
         return _document_to_task(document)
 
     async def list_tasks(self, limit: int = 50) -> list[dict[str, object]]:
-        documents = await mongodb.find_many(VIDEO_TASKS_COLLECTION, limit=limit)
+        documents = await mongodb.find_many(VIDEO_TASKS_COLLECTION, {"series_id": {"$exists": False}}, limit=limit)
         return [_document_to_task(document) for document in documents]
 
     async def update_task_fields(self, task_id: str, values: dict[str, object]) -> bool:

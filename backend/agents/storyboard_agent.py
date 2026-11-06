@@ -1,6 +1,7 @@
 import anyio
 import re
 from datetime import UTC, datetime
+from services.character_binding import series_prompt_context, validate_series_scene
 
 from core.database import mongodb
 from models.scene_model import Scene
@@ -133,6 +134,7 @@ class StoryboardAgent:
             plan = task.get("metadata", {}).get("task_plan") or {}
             storyboard_context = {**script, "video_type": plan.get("video_type", "story"),
                                   "visual_style": task.get("style"),
+                                  "series_context": series_prompt_context(task),
                                   "content_beats": plan.get("plot_beats", []), "characters": plan.get("characters", []),
                                   "visual_world": plan.get("visual_world", "")}
             _generation_mode = str(task.get("generation_mode", "full_dynamic"))
@@ -174,8 +176,10 @@ class StoryboardAgent:
 
             saved_scenes: list[dict[str, object]] = []
             for item in scenes_data:
+                validate_series_scene(task, item)
                 now = datetime.now(UTC)
                 scene = Scene(
+                    character_ids=item.get("character_ids") or [],
                     scene_id=str(item["scene_id"]),
                     task_id=task_id,
                     scene_index=int(item["scene_index"]),

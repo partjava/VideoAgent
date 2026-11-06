@@ -13,3 +13,4 @@ langchain-core>=0.3.0
 httpx>=0.28,<1
 websocket-client>=1.8,<2
 imageio-ffmpeg>=0.6,<1
+Pillow>=10,<13

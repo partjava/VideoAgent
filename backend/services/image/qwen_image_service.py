@@ -1,4 +1,5 @@
 import os
+import base64
 import httpx
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,47 @@ from services.model_config import model_config
 from services.image.base import BaseImageService
 
 
+# Official API: https://www.alibabacloud.com/help/en/model-studio/qwen-image-edit-api
+# Image entries contain public URLs or data:image/...;base64 data, alongside text.
+REFERENCE_MODELS = {
+    "qwen-image-2.0", "qwen-image-2.0-pro", "qwen-image-2.1-pro", "qwen-image-2.1-turbo",
+    "qwen-image-3.0", "qwen-image-3.0-pro",
+    "qwen-image-2.0-pro-2026-06-22", "qwen-image-2.0-pro-2026-04-22",
+    "qwen-image-2.0-pro-2026-03-03", "qwen-image-2.0-2026-03-03",
+}
+
+
+def _normalize_dashscope_base(url: str) -> str:
+    cleaned = (url or "").strip().rstrip("/")
+    for suffix in ("/compatible-mode/v1", "/api/v1", "/v1"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+    return cleaned or (url or "").strip().rstrip("/")
+
+
 class QwenImageService(BaseImageService):
+    @property
+    def supports_reference_images(self) -> bool:
+        model = model_config("image", settings)["model"]
+        short_name = (model or "").rsplit("/", 1)[-1]
+        return model in REFERENCE_MODELS or short_name in REFERENCE_MODELS
+
+    def _reference_content(self, paths, model):
+        from services.character_service import local_asset, validate_image
+        short_name = (model or "").rsplit("/", 1)[-1]
+        if model not in REFERENCE_MODELS and short_name not in REFERENCE_MODELS:
+            raise ValueError(f"Configured image model {model} does not support reference images")
+        limit = 10 if short_name in {"qwen-image-2.1-pro", "qwen-image-2.1-turbo"} else 3
+        if len(paths) > limit:
+            raise ValueError(f"Configured image model supports at most {limit} reference images")
+        content = []
+        for path in paths:
+            data = local_asset(path).read_bytes()
+            validate_image(data)
+            mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
+            content.append({"image": f"data:{mime};base64,{base64.b64encode(data).decode()}"})
+        return content
+
     def generate_image(
         self,
         task_id: str,
@@ -15,7 +56,10 @@ class QwenImageService(BaseImageService):
         image_prompt: str,
         negative_prompt: str | None = None,
         ratio: str = "9:16",
+        reference_images: list[str] | None = None,
     ) -> dict[str, Any]:
+        profile = model_config("image", settings)
+        reference_content = self._reference_content(reference_images, profile["model"]) if reference_images else []
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true 开启。")
 
@@ -25,13 +69,14 @@ class QwenImageService(BaseImageService):
 
         try:
             # 1. 同步提交文生图任务（不使用异步请求头）
-            submit_url = f"{profile['url']}/api/v1/services/aigc/multimodal-generation/generation"
+            base_url = _normalize_dashscope_base(profile["url"])
+            submit_url = f"{base_url}/api/v1/services/aigc/multimodal-generation/generation"
             headers = {
                 "Authorization": f"Bearer {profile['key']}",
                 "Content-Type": "application/json"
             }
             
-            content_list = [{"text": image_prompt}]
+            content_list = reference_content + [{"text": image_prompt}]
             payload = {
                 "model": profile["model"],
                 "input": {
@@ -47,10 +92,11 @@ class QwenImageService(BaseImageService):
                 }
             }
             if negative_prompt:
-                if profile["model"].startswith("qwen-image-2.0"):
+                short_name = (profile["model"] or "").rsplit("/", 1)[-1]
+                if short_name.startswith("qwen-image-2.0"):
                     payload["parameters"]["negative_prompt"] = negative_prompt[:500]
                 else:
-                    content_list[0]["text"] = f"{image_prompt}\n请避免出现：{negative_prompt}"
+                    content_list[-1]["text"] = f"{image_prompt}\n请避免出现：{negative_prompt}"
 
             import time
             res = None

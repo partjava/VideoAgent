@@ -9,6 +9,7 @@ class Scene(BaseModel):
     scene_index: int = Field(..., ge=1)
     duration: int = Field(..., ge=1)
     speaker: str | None = None
+    character_ids: list[str] = Field(default_factory=list)
     voiceover: str | None = None
     dialogue_lines: list[dict] = Field(default_factory=list)
     subtitle: str | None = None

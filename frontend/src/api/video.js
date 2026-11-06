@@ -71,5 +71,13 @@ export const videoApi = {
   },
   applyAudioTiming(taskId, sceneId, payload) {
     return client.post(`/${taskId}/scene/${sceneId}/audio-timing`, payload, { timeout: 300000 })
+  },
+
+  trialShot(taskId, sceneId) {
+    return client.post(`/${taskId}/shoot-review/trial`, { scene_id: sceneId })
+  },
+
+  approveShoot(taskId) {
+    return client.post(`/${taskId}/shoot-review/approve`)
   }
 }

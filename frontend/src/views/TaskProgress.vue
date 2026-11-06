@@ -11,6 +11,7 @@
             <span v-if="task?.ratio">{{ task.ratio }}</span>
             <span v-if="task?.style">{{ task.style }}</span>
             <span>{{ scenes.length }} 个镜头</span>
+            <span v-if="task?.pre_shoot_review">已开启开拍前预审</span>
           </div>
         </div>
         <div class="hero-progress">
@@ -19,7 +20,15 @@
           <div class="meter" role="progressbar" aria-label="制作进度" :aria-valuenow="progress" aria-valuemin="0" aria-valuemax="100">
             <div :style="{ width: progress + '%' }"></div>
           </div>
-        <RouterLink v-if="status === 'success' && !embedded" class="primary" :to="'/preview/' + taskId">观看成片 →</RouterLink>
+          <RouterLink v-if="status === 'success' && !embedded" class="primary" :to="'/preview/' + taskId">观看成片 →</RouterLink>
+          <button
+            v-else-if="status === 'awaiting_shoot_review'"
+            class="primary"
+            :disabled="approvingShoot || !!activeTrial"
+            @click="approveAllShoot"
+          >
+            {{ approvingShoot ? '正在开拍…' : activeTrial ? '试拍进行中…' : '确认开拍生成整集' }}
+          </button>
           <button v-else-if="status === 'failed' || task?.status === 'created'" class="primary" :disabled="starting || !!voiceRetry" @click="resume">
             {{ starting ? '正在启动…' : status === 'failed' ? '继续生成' : '开始生成' }}
           </button>
@@ -27,6 +36,34 @@
       </section>
 
       <div v-if="failure || connectionIssue" class="notice" role="status">{{ failure || connectionIssue }}</div>
+
+      <section v-if="status === 'awaiting_shoot_review'" class="panel shoot-review-banner" aria-label="开拍前预审控制台">
+        <div class="shoot-review-main">
+          <div>
+            <span class="eyebrow">PRE-SHOOT REVIEW · 开拍前预审</span>
+            <h2>首帧与配音已就绪，请检查分镜或试拍单镜</h2>
+            <p>
+              你可以在下方时间线逐镜检查首帧构图、参考图视角和配音时长。对重点镜头点击「试拍本镜」只生成该 10 秒片段，确认满意后点击右侧按钮批量合成整集。
+            </p>
+            <p v-if="activeTrial" class="trial-status running">
+              正在试拍镜头 <strong>{{ activeTrial.scene_id }}</strong>，请稍候…
+            </p>
+            <p v-else-if="lastTrial" class="trial-status" :class="lastTrial.status">
+              最近试拍镜头 <strong>{{ lastTrial.scene_id }}</strong>：{{ lastTrial.status === 'success' ? '试拍完成，可在对应镜头直接播放预览' : `试拍失败（${lastTrial.error || '请检查配置'}）` }}
+            </p>
+          </div>
+          <div class="shoot-review-actions">
+            <button
+              type="button"
+              class="approve-btn"
+              :disabled="approvingShoot || !!activeTrial"
+              @click="approveAllShoot"
+            >
+              {{ approvingShoot ? '正在提交整集开拍…' : '确认开拍生成整集 →' }}
+            </button>
+          </div>
+        </div>
+      </section>
 
       <div class="studio-grid">
         <aside class="panel workflow">
@@ -68,18 +105,44 @@
               <p class="script">{{ script.content }}</p>
             </div>
             <div v-else-if="active.key === 'QualityAgent' && report" class="stage-output">
-              <p>{{ report.semantic_review?.verdict === 'pass' ? '内容覆盖检查通过' : report.semantic_review?.verdict === 'needs_review' ? '部分内容建议复核' : '媒体与时间轴检查通过' }}</p>
-              <ul v-if="Array.isArray(report.semantic_review?.issues)" class="beats">
-                <li v-for="(issue, i) in report.semantic_review.issues" :key="i">{{ issue }}</li>
+              <p>{{ report.semantic_review?.verdict === 'pass' ? '内容覆盖检查通过' : report.semantic_review?.verdict === 'needs_review' ? '部分内容建议复核（点击问题可定位分镜）' : '媒体与时间轴检查通过' }}</p>
+              <ul v-if="semanticIssues.length" class="beats issue-list">
+                <li v-for="(item, i) in semanticIssues" :key="i" class="issue-row">
+                  <span>{{ item.issue }}</span>
+                  <button
+                    v-if="item.scene_id"
+                    type="button"
+                    class="locate-btn"
+                    @click="jumpToIssue(item)"
+                  >
+                    定位镜头 {{ item.scene_index ? String(item.scene_index).padStart(2, '0') : item.scene_id }} →
+                  </button>
+                </li>
               </ul>
-              <p v-if="report.visual_review?.verdict">画面抽检：{{ ({ pass: '已通过', needs_review: '建议复核', incomplete: '部分未完成', disabled: '未配置视觉模型' })[report.visual_review.verdict] }}</p>
-              <ul v-if="report.visual_review?.issues?.length" class="beats">
-                <li v-for="(item, i) in report.visual_review.issues" :key="i">{{ item.time.toFixed(1) }} 秒 · {{ item.issue }}</li>
+              <p v-if="report.visual_review?.verdict">画面抽检：{{ ({ pass: '已通过', needs_review: '建议复核（点击时间戳定位分镜与秒数）', incomplete: '部分未完成', disabled: '未配置视觉模型' })[report.visual_review.verdict] }}</p>
+              <ul v-if="report.visual_review?.issues?.length" class="beats issue-list">
+                <li v-for="(item, i) in report.visual_review.issues" :key="i" class="issue-row">
+                  <span>
+                    <strong>{{ Number(item.time || 0).toFixed(1) }} 秒</strong>
+                    <template v-if="item.scene_index || item.scene_id">
+                      （镜头 {{ item.scene_index ? String(item.scene_index).padStart(2, '0') : item.scene_id }}
+                      <template v-if="item.scene_offset != null"> · 镜内 {{ Number(item.scene_offset).toFixed(1) }}s</template>）
+                    </template>
+                    · {{ item.issue }}
+                  </span>
+                  <button
+                    type="button"
+                    class="locate-btn"
+                    @click="jumpToIssue(item)"
+                  >
+                    定位并跳到该秒 →
+                  </button>
+                </li>
               </ul>
               <p v-if="report.static_fallbacks?.length">使用静态画面的镜头 {{ report.static_fallbacks.join('、') }}</p>
             </div>
             <div v-else-if="['EditorAgent', 'ExportAgent'].includes(active.key) && finalVideo" class="stage-output">
-              <video class="final-video" :src="finalVideo" controls preload="metadata" playsinline></video>
+              <video ref="finalVideoRef" class="final-video" :src="finalVideo" controls preload="metadata" playsinline></video>
               <div class="links"><a :href="finalVideo" download>下载成片</a><a v-if="task?.metadata?.cover_path" :href="mediaUrl(task.metadata.cover_path)" download>下载封面</a><a v-if="subtitleFile" :href="subtitleFile" download>下载字幕</a></div>
             </div>
             <div v-else class="stage-output summary">
@@ -100,90 +163,149 @@
               <div v-if="task?.generation_mode === 'paired_5s' && i % 2 === 0" class="story-section-label">
                 段落 {{ Math.floor(i / 2) + 1 }} · {{ shotTimes[i] }}
               </div>
-              <article :id="'shot-output-' + scene.scene_id" class="shot">
-              <div class="shot-media" :class="{ 'focused-media': (selected === 'ImageAgent' && firstFrame(scene)) || (selected === 'VideoAgent' && scene.video_path) }">
-                <img v-if="selected === 'ImageAgent' && firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
-                <video v-else-if="scene.video_path" :src="mediaUrl(scene.video_path)" controls preload="metadata" playsinline></video>
-                <img v-else-if="firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
-                <div v-else class="frame-placeholder"><span>◫</span><small>等待画面</small></div>
-              </div>
-              <div class="shot-body">
-                <div class="shot-title"><h3>镜头 {{ String(i + 1).padStart(2, '0') }}</h3><span>{{ shotTimes[i] }} · {{ scene.duration }} 秒</span></div>
-                <p v-if="scene.visual_description" :class="{ 'selected-output': selected === 'StoryboardAgent' }">{{ scene.visual_description }}</p>
-                <p v-if="scene.voiceover" class="narration" :class="{ 'selected-output': selected === 'DialoguePolishAgent' }">{{ scene.voiceover }}</p>
-                <p v-if="scene.audio_text"><strong>实际配音稿</strong> {{ scene.audio_text }}</p>
-                <div v-for="(line, index) in scene.dialogue_audio || []" :key="index" class="voice-output">
-                  <p><strong>{{ line.speaker }}</strong> · {{ seconds(line.start) }}–{{ seconds(line.end) }} 秒 · {{ line.text }}</p>
-                  <audio :src="mediaUrl(line.path)" controls preload="none"></audio>
+              <article
+                :id="'shot-output-' + scene.scene_id"
+                class="shot"
+                :class="{ 'shot-highlighted': highlightedSceneId === scene.scene_id }"
+              >
+                <div class="shot-media" :class="{ 'focused-media': (selected === 'ImageAgent' && firstFrame(scene)) || (selected === 'VideoAgent' && scene.video_path) }">
+                  <img v-if="selected === 'ImageAgent' && firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+                  <video v-else-if="scene.video_path" :src="mediaUrl(scene.video_path)" controls preload="metadata" playsinline></video>
+                  <img v-else-if="firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+                  <div v-else class="frame-placeholder"><span>◫</span><small>等待画面</small></div>
                 </div>
-                <template v-if="status === 'failed' && stepState(steps.find(step => step.key === 'VoiceAgent')) === 'failed' && !scene.audio_path && !scene.dialogue_audio?.length && scene.voiceover">
-                  <label v-if="!scene.dialogue_lines?.length">配音重试稿
-                    <textarea v-model="scene.voiceover" rows="3" :disabled="!!voiceRetry"></textarea>
-                  </label>
-                  <button type="button" class="copy-prompt" :disabled="!!voiceRetry || starting" @click="retryVoice(scene)">
-                    {{ voiceRetry === scene.scene_id ? '正在重新配音…' : '重新生成配音' }}
-                  </button>
-                </template>
-                <p v-if="voiceFeedback.sceneId === scene.scene_id" role="status">{{ voiceFeedback.text }}</p>
-                <details v-if="scene.previous_segment_context" class="segment-context">
-                  <summary>写提示词时参考的上一段</summary>
-                  <p v-if="scene.previous_segment_context.key_action || scene.previous_segment_context.visual_description"><strong>关键动作</strong> {{ scene.previous_segment_context.key_action || scene.previous_segment_context.visual_description }}</p>
-                  <p v-if="scene.previous_segment_context.voiceover"><strong>旁白</strong> {{ scene.previous_segment_context.voiceover }}</p>
-                  <p v-if="scene.previous_segment_context.final_second?.end_state"><strong>秒末人物与道具状态</strong> {{ scene.previous_segment_context.final_second.end_state }}</p>
-                  <p v-if="scene.previous_segment_context.closing_composition || scene.previous_segment_context.final_second?.camera"><strong>计划收尾构图</strong> {{ scene.previous_segment_context.closing_composition || scene.previous_segment_context.final_second.camera }}</p>
-                </details>
-                <div class="shot-tags">
-                  <span v-if="scene.status === 'static_fallback'" class="badge failed">静态替代</span>
-                  <span v-else-if="scene.video_path" class="badge success">片段已生成</span>
-                  <span v-else-if="scene.image_path" class="badge neutral">首帧就绪</span>
-                  <span v-if="scene.audio_path" class="badge neutral">配音就绪</span>
-                </div>
-                <div v-if="scene.audio_path" class="voice-output" :class="{ 'selected-output': selected === 'VoiceAgent' }">
-                  <audio :src="mediaUrl(scene.audio_path)" :aria-label="'镜头 ' + (i + 1) + ' 配音'" controls preload="none"></audio>
-                  <p v-if="scene.audio_duration > 0">
-                    画面 {{ seconds(scene.duration) }} 秒 · 旁白起点 {{ seconds(scene.voice_start || 0) }} 秒
-                    · 原始读时 {{ seconds(scene.audio_duration) }} 秒
-                    <template v-if="scene.voice_end != null">
-                      · 合成后旁白结束于第 {{ seconds(scene.voice_end) }} 秒
-                      · 结尾留白 {{ seconds(Math.max(0, scene.duration - scene.voice_end)) }} 秒
-                    </template>
-                  </p>
-                  <p v-if="scene.duration === 10 && scene.voice_end != null && scene.voice_end - (scene.voice_start || 0) < 5">
-                    这段旁白实读不足 5 秒，可先试听，确认是否需要留白。
-                  </p>
-                </div>
-                <details v-if="scene.motion_beats?.length || scene.image_prompt || scene.video_prompt" :class="{ 'selected-output': selected === 'PromptAgent' }" :open="selected === 'PromptAgent'">
-                  <summary>动作节拍与生成提示</summary>
-                  <ol v-if="scene.motion_beats?.length" class="beats">
-                    <li v-for="(beat, j) in scene.motion_beats" :key="j">
-                      <template v-if="typeof beat === 'string'">{{ beat }}</template>
-                      <template v-else>
-                        <strong>{{ beat.start ?? '—' }}–{{ beat.end ?? '—' }} 秒</strong>
-                        <p v-if="beat.camera"><strong>构图与机位</strong> {{ beat.camera }}</p>
-                        <p v-if="beat.start_state"><strong>起始画面</strong> {{ beat.start_state }}</p>
-                        <p><strong>可见动作</strong> {{ beat.subject }} {{ beat.action }}</p>
-                        <p v-if="beat.end_state"><strong>秒末画面</strong> {{ beat.end_state }}</p>
+                <div class="shot-body">
+                  <div class="shot-title">
+                    <h3>镜头 {{ String(i + 1).padStart(2, '0') }}</h3>
+                    <span>{{ shotTimes[i] }} · {{ scene.duration }} 秒</span>
+                  </div>
+                  <p v-if="scene.visual_description" :class="{ 'selected-output': selected === 'StoryboardAgent' }">{{ scene.visual_description }}</p>
+                  <p v-if="scene.voiceover" class="narration" :class="{ 'selected-output': selected === 'DialoguePolishAgent' }">{{ scene.voiceover }}</p>
+                  <p v-if="scene.audio_text"><strong>实际配音稿</strong> {{ scene.audio_text }}</p>
+                  <div v-for="(line, index) in scene.dialogue_audio || []" :key="index" class="voice-output">
+                    <p><strong>{{ line.speaker }}</strong> · {{ seconds(line.start) }}–{{ seconds(line.end) }} 秒 · {{ line.text }}</p>
+                    <audio :src="mediaUrl(line.path)" controls preload="none"></audio>
+                  </div>
+                  <template v-if="status === 'failed' && stepState(steps.find(step => step.key === 'VoiceAgent')) === 'failed' && !scene.audio_path && !scene.dialogue_audio?.length && scene.voiceover">
+                    <label v-if="!scene.dialogue_lines?.length">配音重试稿
+                      <textarea v-model="scene.voiceover" rows="3" :disabled="!!voiceRetry"></textarea>
+                    </label>
+                    <button type="button" class="copy-prompt" :disabled="!!voiceRetry || starting" @click="retryVoice(scene)">
+                      {{ voiceRetry === scene.scene_id ? '正在重新配音…' : '重新生成配音' }}
+                    </button>
+                  </template>
+                  <p v-if="voiceFeedback.sceneId === scene.scene_id" role="status">{{ voiceFeedback.text }}</p>
+                  <details v-if="scene.previous_segment_context" class="segment-context">
+                    <summary>写提示词时参考的上一段</summary>
+                    <p v-if="scene.previous_segment_context.key_action || scene.previous_segment_context.visual_description"><strong>关键动作</strong> {{ scene.previous_segment_context.key_action || scene.previous_segment_context.visual_description }}</p>
+                    <p v-if="scene.previous_segment_context.voiceover"><strong>旁白</strong> {{ scene.previous_segment_context.voiceover }}</p>
+                    <p v-if="scene.previous_segment_context.final_second?.end_state"><strong>秒末人物与道具状态</strong> {{ scene.previous_segment_context.final_second.end_state }}</p>
+                    <p v-if="scene.previous_segment_context.closing_composition || scene.previous_segment_context.final_second?.camera"><strong>计划收尾构图</strong> {{ scene.previous_segment_context.closing_composition || scene.previous_segment_context.final_second.camera }}</p>
+                  </details>
+                  <div class="shot-tags">
+                    <span v-if="scene.status === 'static_fallback'" class="badge failed">静态替代</span>
+                    <span v-else-if="scene.video_path" class="badge success">片段已生成</span>
+                    <span v-else-if="scene.image_path" class="badge neutral">首帧就绪</span>
+                    <span v-if="scene.audio_path || scene.dialogue_audio?.length" class="badge neutral">配音就绪</span>
+                    <span v-if="scene.transition_type === 'continue_action'" class="badge running">承接上镜尾帧</span>
+                    <span
+                      v-for="(choice, cIdx) in scene.reference_choices || []"
+                      :key="cIdx"
+                      class="badge ref-badge"
+                    >
+                      参考图：{{ viewLabel(choice.view) }}
+                    </span>
+                  </div>
+
+                  <div v-if="status === 'awaiting_shoot_review'" class="pre-shoot-shot-tools">
+                    <button
+                      v-if="scene.need_dynamic_video !== false"
+                      type="button"
+                      class="trial-shot-btn"
+                      :disabled="!!activeTrial || trialSubmitting === scene.scene_id || !canTrialShot(scene, i)"
+                      @click="runTrialShot(scene)"
+                    >
+                      {{ activeTrial?.scene_id === scene.scene_id || trialSubmitting === scene.scene_id
+                        ? '正在试拍本镜…'
+                        : scene.video_path
+                          ? '重新试拍本镜'
+                          : '试拍本镜（单镜生成）' }}
+                    </button>
+                    <button
+                      v-if="scene.transition_type !== 'continue_action'"
+                      type="button"
+                      class="copy-prompt"
+                      :disabled="!!imageRerunId || !!activeTrial"
+                      @click="rerunShotImage(scene)"
+                    >
+                      {{ imageRerunId === scene.scene_id ? '正在重绘首帧…' : '重绘本镜首帧' }}
+                    </button>
+                    <button
+                      v-if="scene.voiceover"
+                      type="button"
+                      class="copy-prompt"
+                      :disabled="!!voiceRetry || !!activeTrial"
+                      @click="retryVoice(scene)"
+                    >
+                      {{ voiceRetry === scene.scene_id ? '正在重生成配音…' : '重生成本镜配音' }}
+                    </button>
+                    <small v-if="!canTrialShot(scene, i)" class="trial-hint">
+                      此镜头承接上一镜头尾帧，请先试拍上一镜头
+                    </small>
+                  </div>
+
+                  <div v-if="scene.audio_path" class="voice-output" :class="{ 'selected-output': selected === 'VoiceAgent' }">
+                    <audio :src="mediaUrl(scene.audio_path)" :aria-label="'镜头 ' + (i + 1) + ' 配音'" controls preload="none"></audio>
+                    <p v-if="scene.audio_duration > 0">
+                      画面 {{ seconds(scene.duration) }} 秒 · 旁白起点 {{ seconds(scene.voice_start || 0) }} 秒
+                      · 原始读时 {{ seconds(scene.audio_duration) }} 秒
+                      <template v-if="scene.voice_end != null">
+                        · 合成后旁白结束于第 {{ seconds(scene.voice_end) }} 秒
+                        · 结尾留白 {{ seconds(Math.max(0, scene.duration - scene.voice_end)) }} 秒
                       </template>
-                    </li>
-                  </ol>
-                  <p v-if="scene.image_prompt"><strong>首帧</strong> {{ scene.image_prompt }}</p>
-                  <p v-if="scene.video_prompt"><strong>运动</strong> {{ scene.video_prompt }}</p>
-                  <details v-if="scene.planned_video_prompt" class="prompt-version">
-                    <summary>待提交视频提示词</summary>
-                    <pre>{{ scene.planned_video_prompt }}</pre>
-                    <button type="button" class="copy-prompt" @click="copyPrompt(scene, scene.planned_video_prompt, '待提交')">复制待提交提示词</button>
+                    </p>
+                    <p v-if="scene.duration === 10 && scene.voice_end != null && scene.voice_end - (scene.voice_start || 0) < 5">
+                      这段旁白实读不足 5 秒，可先试听，确认是否需要留白。
+                    </p>
+                  </div>
+                  <details
+                    v-if="scene.motion_beats?.length || scene.image_prompt || scene.video_prompt"
+                    :class="{ 'selected-output': selected === 'PromptAgent' }"
+                    :open="selected === 'PromptAgent' || highlightedSceneId === scene.scene_id"
+                  >
+                    <summary>动作节拍与生成提示</summary>
+                    <ol v-if="scene.motion_beats?.length" class="beats">
+                      <li v-for="(beat, j) in scene.motion_beats" :key="j">
+                        <template v-if="typeof beat === 'string'">{{ beat }}</template>
+                        <template v-else>
+                          <strong>{{ beat.start ?? '—' }}–{{ beat.end ?? '—' }} 秒</strong>
+                          <p v-if="beat.camera"><strong>构图与机位</strong> {{ beat.camera }}</p>
+                          <p v-if="beat.start_state"><strong>起始画面</strong> {{ beat.start_state }}</p>
+                          <p><strong>可见动作</strong> {{ beat.subject }} {{ beat.action }}</p>
+                          <p v-if="beat.end_state"><strong>秒末画面</strong> {{ beat.end_state }}</p>
+                        </template>
+                      </li>
+                    </ol>
+                    <p v-if="scene.image_prompt"><strong>首帧</strong> {{ scene.image_prompt }}</p>
+                    <p v-if="scene.video_prompt"><strong>运动</strong> {{ scene.video_prompt }}</p>
+                    <details v-if="scene.planned_video_prompt" class="prompt-version">
+                      <summary>待提交视频提示词</summary>
+                      <pre>{{ scene.planned_video_prompt }}</pre>
+                      <button type="button" class="copy-prompt" @click="copyPrompt(scene, scene.planned_video_prompt, '待提交')">复制待提交提示词</button>
+                    </details>
+                    <details v-if="scene.submitted_video_prompt" class="prompt-version">
+                      <summary>实际提交的视频提示词</summary>
+                      <pre>{{ scene.submitted_video_prompt }}</pre>
+                      <button type="button" class="copy-prompt" @click="copyPrompt(scene, scene.submitted_video_prompt, '实际提交')">复制实际提交提示词</button>
+                    </details>
+                    <small v-if="copyFeedback.sceneId === scene.scene_id" role="status">{{ copyFeedback.text }}</small>
                   </details>
-                  <details v-if="scene.submitted_video_prompt" class="prompt-version">
-                    <summary>实际提交的视频提示词</summary>
-                    <pre>{{ scene.submitted_video_prompt }}</pre>
-                    <button type="button" class="copy-prompt" @click="copyPrompt(scene, scene.submitted_video_prompt, '实际提交')">复制实际提交提示词</button>
-                  </details>
-                  <small v-if="copyFeedback.sceneId === scene.scene_id" role="status">{{ copyFeedback.text }}</small>
-                </details>
-              </div>
+                </div>
               </article>
             </template>
           </section>
+
+          <GenerationUsage v-if="taskId" scope-type="task" :scope-id="taskId" />
         </div>
       </div>
     </main>
@@ -194,7 +316,9 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import BasicLayout from '../layouts/BasicLayout.vue'
+import GenerationUsage from '../components/GenerationUsage.vue'
 import { videoApi } from '../api/video'
+import { seriesApi } from '../api/series'
 
 const steps = [
   { key: 'TaskPlannerAgent', title: '创意规划', description: '理解你的描述，确定题材、时长、风格和内容结构。' },
@@ -214,8 +338,18 @@ const stateLabels = { success: '已完成', running: '进行中', failed: '失�
 const route = useRoute()
 const taskId = computed(() => String(route.params.id || ''))
 defineProps({ embedded: Boolean })
+
 const voiceRetry = ref(null)
+const imageRerunId = ref(null)
 const voiceFeedback = ref({})
+const trialSubmitting = ref(null)
+const approvingShoot = ref(false)
+const highlightedSceneId = ref('')
+const finalVideoRef = ref(null)
+
+const viewLabel = (view) =>
+  ({ front: '正面', side: '侧面', profile: '侧面', full: '全身', whole: '全身' })[view] || view || '正面'
+
 async function retryVoice(scene) {
   voiceRetry.value = scene.scene_id
   voiceFeedback.value = {}
@@ -225,13 +359,79 @@ async function retryVoice(scene) {
       ...(scene.dialogue_lines?.length ? {} : { voiceover: scene.voiceover }),
     })
     scenes.value = await videoApi.getStoryboard(taskId.value)
-    voiceFeedback.value = { sceneId: scene.scene_id, text: '配音已保存，可以继续生成。' }
+    voiceFeedback.value = { sceneId: scene.scene_id, text: '配音已保存，可以继续。' }
   } catch (error) {
     voiceFeedback.value = { sceneId: scene.scene_id, text: error.message }
   } finally {
     voiceRetry.value = null
   }
 }
+
+async function rerunShotImage(scene) {
+  imageRerunId.value = scene.scene_id
+  voiceFeedback.value = {}
+  try {
+    await videoApi.rerunScene(taskId.value, scene.scene_id, {
+      rerun_type: 'image',
+      prompt: scene.image_prompt,
+    })
+    scenes.value = await videoApi.getStoryboard(taskId.value)
+    voiceFeedback.value = { sceneId: scene.scene_id, text: '首帧已重新生成。' }
+  } catch (error) {
+    voiceFeedback.value = { sceneId: scene.scene_id, text: error.message }
+  } finally {
+    imageRerunId.value = null
+  }
+}
+
+function canTrialShot(scene, index) {
+  if (scene.transition_type !== 'continue_action' || index === 0) return true
+  const prev = scenes.value[index - 1]
+  if (!prev) return false
+  if (prev.need_dynamic_video === false) return Boolean(prev.image_path)
+  return Boolean(prev.video_path && !prev.stale_tail)
+}
+
+async function runTrialShot(scene) {
+  trialSubmitting.value = scene.scene_id
+  connectionIssue.value = ''
+  try {
+    const trial = await videoApi.trialShot(taskId.value, scene.scene_id)
+    if (task.value) {
+      task.value = {
+        ...task.value,
+        metadata: { ...(task.value.metadata || {}), shoot_review_trial: trial },
+      }
+    }
+    refreshNow()
+  } catch (error) {
+    connectionIssue.value = error.message || '试拍启动失败'
+  } finally {
+    trialSubmitting.value = null
+  }
+}
+
+async function approveAllShoot() {
+  approvingShoot.value = true
+  connectionIssue.value = ''
+  try {
+    const seriesId = task.value?.series_id || task.value?.metadata?.series_context?.series_id
+    if (seriesId) {
+      await seriesApi.approveShoot(seriesId, taskId.value)
+    } else {
+      await videoApi.approveShoot(taskId.value)
+    }
+    if (task.value) {
+      task.value = { ...task.value, status: 'video_generating' }
+    }
+    refreshNow()
+  } catch (error) {
+    connectionIssue.value = error.message || '确认开拍失败'
+  } finally {
+    approvingShoot.value = false
+  }
+}
+
 const task = ref(null)
 const script = ref(null)
 const scenes = ref([])
@@ -239,6 +439,7 @@ const selected = ref('')
 const copyFeedback = ref({})
 const seconds = value => Number(value).toFixed(1)
 const firstFrame = scene => scene.continuity_input_path || scene.image_path
+
 async function copyPrompt(scene, prompt, version) {
   try {
     await navigator.clipboard.writeText(prompt)
@@ -247,6 +448,7 @@ async function copyPrompt(scene, prompt, version) {
     copyFeedback.value = { sceneId: scene.scene_id, text: '复制失败，请检查浏览器剪贴板权限' }
   }
 }
+
 const stagePanel = ref(null)
 const selectedArtifactId = computed(() => {
   const ready = {
@@ -256,12 +458,47 @@ const selectedArtifactId = computed(() => {
   }[selected.value]
   return ready ? scenes.value.find(ready)?.scene_id : null
 })
+
 function jumpToArtifact() {
   document.getElementById('shot-output-' + selectedArtifactId.value)?.scrollIntoView({
     block: 'start',
     behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
   })
 }
+
+async function jumpToIssue(item) {
+  let targetSceneId = item?.scene_id
+  let localOffset = item?.scene_offset
+  if (!targetSceneId && typeof item?.time === 'number') {
+    let elapsed = 0
+    for (const s of scenes.value) {
+      const dur = Number(s.duration) || 0
+      if (item.time >= elapsed && item.time <= elapsed + dur) {
+        targetSceneId = s.scene_id
+        localOffset = Math.max(0, item.time - elapsed)
+        break
+      }
+      elapsed += dur
+    }
+  }
+  if (targetSceneId) {
+    highlightedSceneId.value = targetSceneId
+    await nextTick()
+    const el = document.getElementById('shot-output-' + targetSceneId)
+    el?.scrollIntoView({
+      block: 'center',
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+    })
+    const videoEl = el?.querySelector('video')
+    if (videoEl && typeof localOffset === 'number') {
+      videoEl.currentTime = Math.max(0, localOffset)
+    }
+  }
+  if (finalVideoRef.value && typeof item?.time === 'number') {
+    finalVideoRef.value.currentTime = Math.max(0, item.time)
+  }
+}
+
 async function selectStep(key) {
   selected.value = key
   await nextTick()
@@ -270,12 +507,30 @@ async function selectStep(key) {
     behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
   })
 }
+
 const starting = ref(false)
 const connectionIssue = ref('')
 const plan = computed(() => task.value?.metadata?.task_plan)
 const report = computed(() => task.value?.metadata?.quality_report)
+const activeTrial = computed(() => task.value?.metadata?.shoot_review_trial || null)
+const lastTrial = computed(() => task.value?.metadata?.last_shoot_trial || null)
+const semanticIssues = computed(() => {
+  const sem = report.value?.semantic_review
+  if (!sem) return []
+  if (Array.isArray(sem.located_issues) && sem.located_issues.length) return sem.located_issues
+  if (Array.isArray(sem.issues)) {
+    return sem.issues.map(raw => (typeof raw === 'string' ? { issue: raw } : raw))
+  }
+  return []
+})
 const status = computed(() => task.value?.status || 'loading')
-const statusLabel = computed(() => ({ success: '已交付', failed: '生成中断', created: '等待启动', loading: '正在连接' }[status.value] || '正在制作'))
+const statusLabel = computed(() => ({
+  success: '已交付',
+  failed: '生成中断',
+  created: '等待启动',
+  awaiting_shoot_review: '待开拍预审',
+  loading: '正在连接'
+}[status.value] || '正在制作'))
 const progress = computed(() => Math.max(0, Math.min(100, Number(task.value?.progress) || 0)))
 const failure = computed(() => status.value === 'failed' ? task.value?.metadata?.last_error || '生成中断，可以从当前进度继续。' : '')
 const mediaUrl = path => path ? '/' + path.replace(/^backend\//, '').replace(/^\/+/, '') : ''
@@ -323,7 +578,9 @@ const stageSummary = computed(() => {
       : `已保存 ${count('motion_beats')} 段逐秒提示词`,
     ImageAgent: `已有 ${count('image_path')} 张首帧`,
     VoiceAgent: `已有 ${scenes.value.filter(scene => scene.audio_path || scene.dialogue_audio?.length).length} 段配音`,
-    VideoAgent: `已有 ${count('video_path')} 个动态片段`
+    VideoAgent: status.value === 'awaiting_shoot_review'
+      ? `待开拍预审 · 已试拍 ${count('video_path')} 个动态片段`
+      : `已有 ${count('video_path')} 个动态片段`
   }
   return summaries[active.value.key] || stateLabels[stepState(active.value)]
 })
@@ -359,13 +616,17 @@ watch(taskId, (id, _, onCleanup) => {
         scenes.value = [...storyboard.value].sort((a, b) => a.scene_index - b.scene_index)
       }
       if (draft.status === 'fulfilled') script.value = draft.value
-      if (!script.value && detail.status === 'fulfilled' && ['success', 'failed'].includes(status.value) && progress.value >= 30) {
+      if (!script.value && detail.status === 'fulfilled' && ['success', 'failed', 'awaiting_shoot_review'].includes(status.value) && progress.value >= 30) {
         const savedScript = await videoApi.getScript(id).catch(() => null)
         if (!disposed) script.value = savedScript
       }
     } finally {
       refreshing = false
-      if (!disposed && (!['success', 'failed'].includes(status.value) || connectionIssue.value)) {
+      const shouldPoll =
+        (!['success', 'failed', 'awaiting_shoot_review'].includes(status.value)) ||
+        Boolean(activeTrial.value) ||
+        Boolean(connectionIssue.value)
+      if (!disposed && shouldPoll) {
         timer = setTimeout(refresh, 2000)
       }
     }
@@ -416,6 +677,17 @@ h1, h2, h3, p { margin: 0; }
 .meter div { height: 100%; background: var(--accent); border-radius: inherit; transition: width .35s ease; }
 .primary { display: inline-block; margin-top: 15px; color: #172616; background: var(--accent); border: 0; border-radius: 8px; padding: 9px 13px; font: inherit; font-weight: 700; text-decoration: none; cursor: pointer; }
 .primary:disabled { opacity: .6; cursor: wait; }
+
+.shoot-review-banner { margin-bottom: 22px; padding: 20px 24px; background: linear-gradient(135deg, #eff6ff, #f8fafc); border-color: #93c5fd; }
+.shoot-review-main { display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap; }
+.shoot-review-main h2 { font-size: 20px; margin: 6px 0 8px; color: #1e3a8a; }
+.shoot-review-main p { color: #334155; font-size: 13px; line-height: 1.6; max-width: 820px; }
+.trial-status { margin-top: 8px; font-weight: 600; color: #1d4ed8; }
+.trial-status.failed { color: #b91c1c; }
+.trial-status.success { color: #15803d; }
+.approve-btn { padding: 11px 18px; border-radius: 10px; border: none; background: #2563eb; color: #fff; font-weight: 700; font-size: 14px; cursor: pointer; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25); }
+.approve-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
 .studio-grid { display: grid; grid-template-columns: minmax(210px, 265px) minmax(0, 1fr); gap: 22px; align-items: start; }
 @media (width > 980px) {
   .studio-grid > .workflow {
@@ -446,7 +718,7 @@ h1, h2, h3, p { margin: 0; }
 .shot-body .selected-output { background: #eef2ff; color: #312e81; border-radius: 6px; padding: 8px 10px; font-weight: 650; }
 .shot-media.focused-media { outline: 3px solid #818cf8; outline-offset: 3px; }
 .voice-output { margin-top: 8px; }
-.copy-prompt { margin: 8px 8px 0 0; padding: 5px 9px; border: 1px solid #a5b4fc; border-radius: 6px; background: white; color: #3730a3; cursor: pointer; }
+.copy-prompt { margin: 8px 8px 0 0; padding: 5px 9px; border: 1px solid #a5b4fc; border-radius: 6px; background: white; color: #3730a3; cursor: pointer; font-size: 12px; }
 .prompt-version pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-weight: 400; }
 .step-index { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 7px; background: #edf1f6; font-size: 11px; font-weight: 750; color: #58677d; }
 .steps .success .step-index { background: #e5f5eb; color: #276342; }
@@ -457,15 +729,22 @@ h1, h2, h3, p { margin: 0; }
 .stage-output { margin: 0 23px 20px; padding: 14px 16px; background: #f4f7fb; border-radius: 10px; line-height: 1.65; overflow-wrap: anywhere; }
 .stage-output p + p, .stage-output h3 + p { margin-top: 8px; }
 .stage-output.summary { display: flex; gap: 9px; align-items: center; font-size: 13px; color: #485a72; }
+.issue-list { list-style: none; padding-left: 0; }
+.issue-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 6px 10px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 6px; }
+.locate-btn { padding: 4px 10px; border-radius: 6px; border: 1px solid #93c5fd; background: #eff6ff; color: #1d4ed8; font-size: 12px; font-weight: 600; cursor: pointer; }
+.locate-btn:hover { background: #dbeafe; }
+
 .script { white-space: pre-wrap; max-height: 330px; overflow: auto; }
 .badge { display: inline-flex; align-items: center; flex-shrink: 0; white-space: nowrap; padding: 4px 8px; border-radius: 6px; background: #edf1f6; color: #526077; font-size: 11px; font-weight: 700; }
 .badge.running { background: #dcecff; color: #1c5089; }
 .badge.success { background: #e5f5eb; color: #276342; }
 .badge.failed, .notice { background: #fff0eb; color: #8c382c; }
+.badge.ref-badge { background: #f3e8ff; color: #6b21a8; }
 .notice { padding: 14px 17px; border-radius: 10px; margin-bottom: 18px; overflow-wrap: anywhere; }
 .timeline { margin-top: 18px; }
 .empty { padding: 24px; color: var(--muted); border-top: 1px dashed var(--line); }
-.shot { display: grid; grid-template-columns: minmax(125px, 185px) minmax(0, 1fr); gap: 16px; padding: 16px 23px; border-top: 1px solid var(--line); }
+.shot { display: grid; grid-template-columns: minmax(125px, 185px) minmax(0, 1fr); gap: 16px; padding: 16px 23px; border-top: 1px solid var(--line); transition: background-color 0.25s ease; }
+.shot.shot-highlighted { background: #fefce8; box-shadow: inset 4px 0 0 #eab308; }
 .shot-media { align-self: start; display: grid; place-items: center; aspect-ratio: 4 / 3; background: #17253b; border-radius: 9px; overflow: hidden; }
 .shot-media video, .shot-media img { display: block; width: 100%; height: 100%; max-height: 184px; object-fit: contain; }
 .frame-placeholder { display: grid; place-items: center; gap: 7px; color: #afbed3; }
@@ -475,6 +754,10 @@ h1, h2, h3, p { margin: 0; }
 .shot-title span, .shot-body p { color: var(--muted); font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
 .shot-body .narration { margin-top: 7px; border-left: 2px solid #a2bbdf; padding-left: 9px; color: #3d4b62; }
 .shot-tags { margin-top: 9px; }
+.pre-shoot-shot-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 10px; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; }
+.trial-shot-btn { padding: 5px 11px; border-radius: 6px; border: 1px solid #2563eb; background: #eff6ff; color: #1d4ed8; font-weight: 600; font-size: 12px; cursor: pointer; }
+.trial-shot-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.trial-hint { color: #b45309; font-size: 12px; }
 .shot audio { width: min(100%, 320px); height: 35px; margin-top: 10px; }
 .shot details { margin-top: 10px; font-size: 13px; color: #405a7a; }
 .shot summary { cursor: pointer; }
