@@ -5,7 +5,8 @@ from services.provider_factory import get_llm_service
 from services.generation_contract import (
     AUTO_DIRECTOR_MODE,
     MAX_VOICE_SPEED,
-    provider_duration_bounds,
+    STORYBOARD_FLOW_MODE,
+    active_provider_duration_bounds,
     rebalance_motion_beats_duration,
 )
 from services.character_binding import (
@@ -206,9 +207,13 @@ class VoiceAgent:
             total_duration = 0.0
             durations_changed = False
             allow_flexible_duration = (
-                task.get("generation_mode") == AUTO_DIRECTOR_MODE and not task.get("duration_locked")
+                task.get("generation_mode") in {AUTO_DIRECTOR_MODE, STORYBOARD_FLOW_MODE}
+                and not task.get("duration_locked")
             )
-            _, max_clip_seconds = provider_duration_bounds(settings.video_provider, settings.wan_video_model)
+            _, max_clip_seconds = active_provider_duration_bounds(
+                generation_mode=str(task.get("generation_mode") or ""),
+                cfg=settings,
+            )
             for scene in task_scenes:
                 scene_id = str(scene["scene_id"])
                 if scene.get("dialogue_lines"):
@@ -393,7 +398,10 @@ class VoiceAgent:
                     {"duration": synced_total, "metadata.task_plan.duration": synced_total},
                 )
 
-            if has_dialogue:
+            if has_dialogue or (
+                task.get("generation_mode") == STORYBOARD_FLOW_MODE
+                and not any(clean_tts_text(s.get("voiceover") or "") for s in task_scenes)
+            ):
                 await mark_agent_success(task_id, self.agent_name, progress=90,
                                          status=VideoTaskStatus.VOICE_GENERATING,
                                          message="Scene dialogue audio saved",

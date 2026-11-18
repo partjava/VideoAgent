@@ -1248,6 +1248,387 @@ class ShotContinuityTests(unittest.TestCase):
             self.assertEqual(infer_dialogue_emotion("滚出去！", ""), "angry")
             self.assertEqual(apply_dialogue_emotion_prosody({"rate": "+0%", "pitch": "+0Hz"}, "angry")["rate"], "+12%")
 
+    def test_storyboard_flow_mode_non_per_second_cast_cards_and_flash_white(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from agents.image_agent import ImageAgent
+            from agents.prompt_agent import PromptAgent
+            from agents.story_judge_agent import StoryJudgeAgent
+            from agents.storyboard_agent import StoryboardAgent, validate_storyboard_scenes
+            from services.generation_contract import (
+                STORYBOARD_FLOW_MODE,
+                provider_duration_bounds,
+                rebalance_motion_beats_duration,
+                render_srt_for_task,
+                validate_storyboard_flow_scenes,
+            )
+
+            # 1. Contracts: 3s minimum & continuous beat rebalance & ratio-aware SRT
+            self.assertEqual(provider_duration_bounds("wan", "wan3.0-video", generation_mode=STORYBOARD_FLOW_MODE), (3, 12))
+            flow_scenes = [
+                {"scene_id": "s1", "scene_index": 1, "duration": 3, "need_dynamic_video": True, "transition_type": "cut",
+                 "voiceover": "", "visual_description": "男孩俯桌闭眼入梦", "character_state": "困倦→迷茫",
+                 "scene_continuity": "课堂切换", "transition_note": "闪白入梦"},
+                {"scene_id": "s2", "scene_index": 2, "duration": 4, "need_dynamic_video": True, "transition_type": "scene_change",
+                 "voiceover": "一切都变了。", "visual_description": "男孩穿着粗布衣站在1927年泥泞乡道",
+                 "character_state": "惊愕→警觉", "scene_continuity": "转入1927年煤窑外", "transition_note": "镜头上摇揭示全貌"},
+            ]
+            validate_storyboard_scenes(flow_scenes, target_duration=7, enforce_voiceover_density=False, allow_silent=True)
+            validate_storyboard_flow_scenes(flow_scenes, target_duration=7, bounds=(3, 12))
+            rebalanced = rebalance_motion_beats_duration(
+                [{"start": 0, "end": 4, "subject": "男孩", "camera": "近景", "start_state": "站立", "action": "回头", "end_state": "望向前方"}],
+                4,
+                6,
+            )
+            self.assertEqual(len(rebalanced), 1)
+            self.assertEqual((rebalanced[0]["start"], rebalanced[0]["end"]), (0, 6))
+
+            long_line_scene = [{"scene_id": "s1", "duration": 8, "voice_start": 0.5, "audio_duration": 3.0, "voiceover": "这是一条二十字长度的测试台词用来核对换行效果。"}]
+            self.assertIn("\n", render_srt_for_task(long_line_scene, {"ratio": "9:16"}))
+            self.assertNotIn("\n", render_srt_for_task(long_line_scene, {"ratio": "16:9"}).splitlines()[2])
+
+            # 2. StoryJudge preserves silent visual beat in storyboard_flow without failing
+            judged = StoryJudgeAgent.judge_and_polish(
+                {"task_id": "t_flow", "generation_mode": STORYBOARD_FLOW_MODE},
+                {
+                    "content": "对视沉默。",
+                    "segments": [
+                        {"duration": 3, "plot": "男孩闭眼入梦", "voice_start": 0.0, "voiceover": "", "dialogue_lines": []},
+                        {"duration": 5, "plot": "小巷抬头对视", "voice_start": 0.3, "voiceover": "别放弃我，一定要等着我。", "dialogue_lines": [{"speaker": "男主", "text": "别放弃我，一定要等着我。", "start": 0.3}]},
+                    ],
+                },
+                {"generation_mode": STORYBOARD_FLOW_MODE, "duration": 8},
+                allow_llm=False,
+            )
+            self.assertNotIn("SLOW_OPENING", judged["story_judge"]["deterministic_flags"])
+
+            # 3. PromptAgent passes per_second=False & accepts single continuous motion_beat
+            seen_per_second = []
+
+            class FlowPromptLLM:
+                def generate_image_prompts(self, batch, ratio="9:16", style=None, visual_bible=None, per_second=True):
+                    seen_per_second.append(per_second)
+                    sc = batch[0]
+                    dur = int(sc["duration"])
+                    return [{
+                        "scene_id": sc["scene_id"],
+                        "blocking": "左男孩独框",
+                        "transition_mode": "flash_white",
+                        "image_prompt": "男孩趴在课桌上闭眼",
+                        "video_prompt": "镜头平滑推近闭上的眼睛",
+                        "last_frame_for_transition": "双眼闭合，光晕柔和",
+                        "motion_beats": [{
+                            "start": 0, "end": dur, "subject": "小男孩", "camera": "近景平滑推近",
+                            "start_state": "男孩侧趴课桌手握铅笔", "action": "眼皮慢慢合上铅笔轻滑", "end_state": "完全闭眼呼吸平稳",
+                        }],
+                    }]
+
+            pa_task = {"task_id": "t_flow_pa", "generation_mode": STORYBOARD_FLOW_MODE, "ratio": "9:16", "style": "短剧", "metadata": {"task_plan": {}}}
+            pa_db = Mock()
+            pa_db.find_many = AsyncMock(return_value=[{**flow_scenes[0]}])
+            pa_db.update_one = AsyncMock()
+            stub_anyio = SimpleNamespace(
+                Semaphore=asyncio.Semaphore,
+                to_thread=SimpleNamespace(run_sync=lambda fn, *a, abandon_on_cancel=None, **k: asyncio.sleep(0, result=fn(*a, **k))),
+            )
+            with patch("agents.prompt_agent.mongodb", pa_db), patch(
+                "agents.prompt_agent.get_required_task", new=AsyncMock(return_value=pa_task)
+            ), patch("agents.prompt_agent.anyio", stub_anyio), patch(
+                "agents.prompt_agent.get_llm_service", return_value=FlowPromptLLM()
+            ), patch("agents.prompt_agent.task_service.update_task_fields", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_start", new=AsyncMock()
+            ), patch("agents.prompt_agent.mark_agent_success", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_failed", new=AsyncMock()
+            ):
+                prompts_out = asyncio.run(PromptAgent().run("t_flow_pa"))
+            self.assertEqual(seen_per_second, [False])
+            self.assertEqual(len(prompts_out[0]["motion_beats"]), 1)
+
+            # 4. ImageAgent creates pure light-gray 4-view studio cast cards & avoids full-room anchor
+            tmp_dir = Path(tmp)
+            generated_log = []
+
+            class FlowImageSvc:
+                supports_reference_images = True
+                max_reference_images = 9
+
+                def generate_image(self, task_id, scene_id, image_prompt, negative_prompt=None, ratio="9:16", reference_images=None):
+                    out = tmp_dir / f"{scene_id}.png"
+                    Image.new("RGB", (64, 64), (220, 220, 220)).save(out)
+                    generated_log.append((scene_id, ratio, list(reference_images or []), image_prompt))
+                    return {"status": "success", "asset_path": str(out), "source": "qwen"}
+
+            img_task = {
+                "task_id": "t_flow_img",
+                "generation_mode": STORYBOARD_FLOW_MODE,
+                "ratio": "9:16",
+                "style": "短剧",
+                "metadata": {
+                    "task_plan": {
+                        "characters": [
+                            {"name": "小男孩", "gender": "male", "appearance": "10岁圆脸短黑发"},
+                            {"name": "女老师", "gender": "female", "appearance": "30岁浅色衬衫低马尾"},
+                        ]
+                    }
+                },
+            }
+            img_scenes = [
+                {"scene_id": "scene_01", "scene_index": 1, "duration": 4, "shot_type": "全景", "need_dynamic_video": True, "image_prompt": "小男孩与女老师在教室"},
+                {"scene_id": "scene_02", "scene_index": 2, "duration": 3, "shot_type": "空镜", "need_dynamic_video": True, "image_prompt": "风吹过煤炭山谷空无一人"},
+                {"scene_id": "scene_03", "scene_index": 3, "duration": 4, "shot_type": "近景", "need_dynamic_video": True, "image_prompt": "小男孩穿着粗布衣站在煤窑前"},
+            ]
+            img_db = Mock()
+            img_db.find_many = AsyncMock(side_effect=lambda *a, **k: [dict(s) for s in img_scenes])
+            img_db.find_one = AsyncMock(side_effect=lambda col, *a, **k: img_task if col == "video_tasks" else None)
+            img_db.replace_one = AsyncMock()
+            img_db.update_one = AsyncMock()
+            with patch("agents.image_agent.mongodb", img_db), patch(
+                "agents.image_agent.settings", SimpleNamespace(max_images_per_task=20, video_provider="wan")
+            ), patch("agents.image_agent.anyio", stub_anyio), patch(
+                "agents.image_agent.get_image_service", return_value=FlowImageSvc()
+            ), patch(
+                "agents.image_agent.dispatch_generation", side_effect=lambda t, o, k, fn: fn()
+            ), patch("agents.image_agent.mark_agent_start", new=AsyncMock()), patch(
+                "agents.image_agent.mark_agent_success", new=AsyncMock()
+            ), patch("agents.image_agent.mark_agent_failed", new=AsyncMock()), patch(
+                "services.media_quality.resolve_media",
+                side_effect=lambda p: (tmp_dir / f"{Path(p).stem}.png") if "cast_ref_" in str(p) else Path(p),
+            ):
+                asyncio.run(ImageAgent().run("t_flow_img"))
+
+            by_id = {sid: (r, refs, pr) for sid, r, refs, pr in generated_log}
+            self.assertEqual(by_id["cast_ref_1"][0], "16:9")
+            self.assertIn("4视图", by_id["cast_ref_1"][2])
+            self.assertEqual(len(by_id["scene_01"][1]), 2)
+            self.assertEqual(by_id["scene_02"][1], [])
+            self.assertEqual(by_id["scene_03"][1], [str(tmp_dir / "cast_ref_1.png")])
+            self.assertNotIn(str(tmp_dir / "scene_01.png"), by_id["scene_03"][1])
+
+            # 5. Flash-white transition triggers cleanly on scene_change dream switch
+            class DummyClip:
+                def __init__(self, dur, val=100):
+                    self.duration = dur
+                    self._val = val
+
+                def get_frame(self, t):
+                    return np.full((8, 8, 3), self._val, dtype=np.uint8)
+
+                def fl(self, fn):
+                    out = DummyClip(self.duration, self._val)
+                    out.get_frame = lambda t, _fn=fn, _src=self: _fn(_src.get_frame, t)
+                    return out
+
+            clips = [DummyClip(2.0, 100), DummyClip(2.0, 100)]
+            applied = apply_cut_transitions(
+                clips,
+                [
+                    {"scene_id": "s1", "transition_type": "cut", "transition_note": "闪白入梦"},
+                    {"scene_id": "s2", "transition_type": "scene_change", "transition_note": "梦醒回到现实"},
+                ],
+            )
+            self.assertEqual(applied[0]["mode"], "flash_white")
+            self.assertGreater(int(clips[0].get_frame(1.99)[0, 0, 0]), 200)
+            self.assertGreater(int(clips[1].get_frame(0.01)[0, 0, 0]), 200)
+
+    def test_seven_pipeline_optimizations_bounds_bgm_cast_concurrency_and_vidu(self):
+        import asyncio
+        import threading
+        import time
+        from unittest.mock import AsyncMock
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from agents.image_agent import ImageAgent, _match_cast_card_paths, build_end_frame_prompt
+            from agents.video_agent import VideoAgent
+            from services.director_heal_service import plan_scene_self_heal
+            from services.generation_contract import STORYBOARD_FLOW_MODE, provider_duration_bounds
+            from services.shot_continuity import select_bgm_file
+
+            # 1. Seedance enforces >= 4s even in storyboard_flow; self-heal honors non-per-second beats
+            self.assertEqual(
+                provider_duration_bounds("doubao", "doubao-seedance-1-5-pro-251215", generation_mode=STORYBOARD_FLOW_MODE),
+                (4, 12),
+            )
+            self.assertEqual(
+                provider_duration_bounds("wan", "wan2.6-i2v-flash", generation_mode=STORYBOARD_FLOW_MODE),
+                (3, 12),
+            )
+            heal_llm = SimpleNamespace(
+                doctor_scene_prompt=lambda sc, rs: {
+                    "video_prompt": "平滑推进特写表情",
+                    "transition_type": "cut",
+                    "heal_summary": "平滑收束",
+                    "motion_beats": [{
+                        "start": 0, "end": 4, "subject": "男生", "camera": "近景推进",
+                        "start_state": "抬头", "action": "泛红眼眶微笑", "end_state": "定格微红眼眶",
+                    }],
+                }
+            )
+            healed = plan_scene_self_heal(
+                {"scene_id": "s1", "duration": 4, "video_prompt": "原提示词"},
+                ["画面微颤"],
+                allow_llm=True,
+                llm_service=heal_llm,
+                generation_mode=STORYBOARD_FLOW_MODE,
+            )
+            self.assertEqual(healed["rewrite_source"], "llm_doctor")
+            self.assertEqual(len(healed["motion_beats"]), 1)
+
+            # 2. BGM auto-selection matches campus / heroic / suspense / none
+            bgm_dir = Path(__file__).resolve().parents[1] / "data" / "bgm"
+            campus_bgm = select_bgm_file({"user_input": "90秒校园早恋虐恋短剧，地铁重逢"}, [], bgm_dir)
+            heroic_bgm = select_bgm_file({"user_input": "方志敏1927年弋横暴动革命历史课"}, [], bgm_dir)
+            none_bgm = select_bgm_file({"bgm_preset": "none", "user_input": "校园"}, [], bgm_dir)
+            self.assertIsNotNone(campus_bgm)
+            self.assertIn("warm", Path(campus_bgm).name)
+            self.assertIsNotNone(heroic_bgm)
+            self.assertIn("heroic", Path(heroic_bgm).name)
+            self.assertIsNone(none_bgm)
+
+            # 3. ImageAgent generates up to 4 turnaround cards concurrently, persists metadata, avoids mis-matching 5th speaker, and generates end frame when flagged
+            tmp_dir = Path(tmp)
+            card_log = []
+
+            class MultiCastImageSvc:
+                supports_reference_images = True
+                max_reference_images = 9
+
+                def generate_image(self, task_id, scene_id, image_prompt, negative_prompt=None, ratio="9:16", reference_images=None):
+                    out = tmp_dir / f"{scene_id}.png"
+                    Image.new("RGB", (64, 64), (210, 210, 210)).save(out)
+                    card_log.append((scene_id, list(reference_images or [])))
+                    return {"status": "success", "asset_path": str(out), "source": "qwen"}
+
+            cast_task = {
+                "task_id": "t_opt_img",
+                "generation_mode": STORYBOARD_FLOW_MODE,
+                "ratio": "9:16",
+                "style": "短剧",
+                "metadata": {
+                    "task_plan": {
+                        "characters": [
+                            {"name": "林夏", "gender": "female"},
+                            {"name": "周延", "gender": "male"},
+                            {"name": "班主任", "gender": "male"},
+                            {"name": "母亲", "gender": "female"},
+                            {"name": "地铁乘客", "gender": "male"},
+                        ]
+                    }
+                },
+            }
+            cast_scenes = [
+                {"scene_id": "s1", "scene_index": 1, "duration": 4, "shot_type": "近景", "need_dynamic_video": True, "need_end_frame": True, "end_state": "笔记本摊开在桌面", "image_prompt": "林夏与周延在教室"},
+                {"scene_id": "s2", "scene_index": 2, "duration": 4, "shot_type": "中景", "need_dynamic_video": True, "image_prompt": "班主任怒斥众人"},
+                {"scene_id": "s3", "scene_index": 3, "duration": 4, "shot_type": "特写", "need_dynamic_video": True, "image_prompt": "母亲哽咽劝说林夏"},
+                {"scene_id": "s4", "scene_index": 4, "duration": 4, "shot_type": "近景", "need_dynamic_video": True, "speaker": "地铁乘客", "image_prompt": "陌生大叔低头看手机"},
+            ]
+            updated_calls = []
+
+            async def _track_update(col, q, payload, *a, **k):
+                updated_calls.append((col, q, payload))
+
+            img_db = Mock()
+            img_db.find_many = AsyncMock(side_effect=lambda *a, **k: [dict(s) for s in cast_scenes])
+            img_db.find_one = AsyncMock(side_effect=lambda col, *a, **k: cast_task if col == "video_tasks" else None)
+            img_db.replace_one = AsyncMock()
+            img_db.update_one = AsyncMock(side_effect=_track_update)
+            stub_anyio = SimpleNamespace(
+                Semaphore=asyncio.Semaphore,
+                to_thread=SimpleNamespace(run_sync=lambda fn, *a, abandon_on_cancel=None, **k: asyncio.sleep(0, result=fn(*a, **k))),
+            )
+            with patch("agents.image_agent.mongodb", img_db), patch(
+                "agents.image_agent.settings", SimpleNamespace(max_images_per_task=20, video_provider="wan")
+            ), patch("agents.image_agent.anyio", stub_anyio), patch(
+                "agents.image_agent.get_image_service", return_value=MultiCastImageSvc()
+            ), patch("agents.image_agent.dispatch_generation", side_effect=lambda t, o, k, fn: fn()), patch(
+                "agents.image_agent.mark_agent_start", new=AsyncMock()
+            ), patch("agents.image_agent.mark_agent_success", new=AsyncMock()), patch(
+                "agents.image_agent.mark_agent_failed", new=AsyncMock()
+            ), patch(
+                "services.media_quality.resolve_media",
+                side_effect=lambda p: (tmp_dir / f"{Path(p).stem}.png") if "cast_ref_" in str(p) or Path(p).is_absolute() is False else Path(p),
+            ):
+                asyncio.run(ImageAgent().run("t_opt_img"))
+
+            card_ids = [sid for sid, _ in card_log if sid.startswith("cast_ref_")]
+            self.assertEqual(len(card_ids), 4)
+            # s1_end generated referencing s1.png & saved as last_frame_target_path
+            s1_end_refs = [refs for sid, refs in card_log if sid == "s1_end"]
+            self.assertEqual(s1_end_refs, [[str(tmp_dir / "s1.png")]])
+            s1_updates = [p for c, q, p in updated_calls if c == "scenes" and q.get("_id") == "t_opt_img_s1"]
+            self.assertEqual(s1_updates[-1]["last_frame_target_path"], str(tmp_dir / "s1_end.png"))
+            # implicit_cast_cards persisted to video_tasks metadata for frontend pre-shoot UI
+            meta_updates = [p for c, q, p in updated_calls if c == "video_tasks" and "metadata.implicit_cast_cards" in p]
+            self.assertEqual(len(meta_updates), 1)
+            self.assertEqual(len(meta_updates[0]["metadata.implicit_cast_cards"]), 4)
+            # 5th minor character with no cast card must not receive protagonist's card[0]
+            self.assertEqual(_match_cast_card_paths(cast_scenes[3], meta_updates[0]["metadata.implicit_cast_cards"], 9), [])
+            self.assertIn("笔记本摊开在桌面", build_end_frame_prompt(cast_scenes[0]))
+
+            # 4. Concurrent VideoAgent execution + Vidu trial resolution + dual-frame end_target handoff
+            class ConcurrentViduSvc:
+                model = "viduq3-turbo"
+                supports_movement_amplitude = True
+                supports_resolution = True
+
+                def __init__(self):
+                    self.active = 0
+                    self.max_active = 0
+                    self.lock = threading.Lock()
+                    self.calls = []
+
+                def generate_video(self, task_id, scene_id, image_path, video_prompt=None, duration=5, ratio="9:16", movement_amplitude="auto", resolution=None):
+                    with self.lock:
+                        self.active += 1
+                        self.max_active = max(self.max_active, self.active)
+                    time.sleep(0.03)
+                    out = tmp_dir / f"vid_{scene_id}.mp4"
+                    out.write_bytes(b"mp4")
+                    with self.lock:
+                        self.active -= 1
+                        self.calls.append((scene_id, resolution, movement_amplitude))
+                    return {"status": "success", "asset_path": str(out), "source": "vidu"}
+
+            v_scenes = [
+                {
+                    "scene_id": f"vs_{i}", "scene_index": i, "duration": 4, "need_dynamic_video": True,
+                    "transition_type": "cut", "image_path": str(tmp_dir / "s1.png"), "video_prompt": "推近反应",
+                    "motion_beats": [{"start": 0, "end": 4, "subject": "林夏", "camera": "近景", "start_state": "静立", "action": "抬头微笑", "end_state": "微笑定格"}],
+                }
+                for i in range(1, 4)
+            ]
+            v_task = {"task_id": "t_vid_conc", "generation_mode": STORYBOARD_FLOW_MODE, "ratio": "9:16", "duration": 12, "style": "短剧", "metadata": {"task_plan": {}}}
+            v_db = Mock()
+            v_db.find_many = AsyncMock(side_effect=lambda col, *a, **k: [dict(s) for s in v_scenes] if col == "scenes" else [])
+            v_db.find_one = AsyncMock(return_value=v_task)
+            v_db.replace_one = AsyncMock()
+            v_db.update_one = AsyncMock()
+            conc_svc = ConcurrentViduSvc()
+
+            async def _fake_dispatch(t, o, k, fn):
+                return await asyncio.to_thread(fn)
+
+            with patch("agents.video_agent.mongodb", v_db), patch(
+                "agents.video_agent.anyio", SimpleNamespace(Semaphore=asyncio.Semaphore, to_thread=SimpleNamespace(run_sync=asyncio.to_thread))
+            ), patch("agents.video_agent.video_service_for_task", return_value=conc_svc), patch(
+                "agents.video_agent.dispatch_generation",
+                side_effect=_fake_dispatch,
+            ), patch("agents.video_agent.resolve_media", side_effect=lambda p: Path(p)), patch(
+                "agents.video_agent.mark_agent_start", new=AsyncMock()
+            ), patch("agents.video_agent.mark_agent_success", new=AsyncMock()), patch(
+                "agents.video_agent.mark_agent_failed", new=AsyncMock()
+            ):
+                out_assets = asyncio.run(VideoAgent().run("t_vid_conc"))
+                self.assertEqual(conc_svc.max_active, 3)
+                self.assertEqual([a["scene_id"] for a in out_assets], ["vs_1", "vs_2", "vs_3"])
+                self.assertTrue(all(res == "1080p" for _, res, _ in conc_svc.calls))
+
+                # Trial mode automatically steps down Vidu resolution to configured trial resolution
+                conc_svc.calls.clear()
+                asyncio.run(VideoAgent().run("t_vid_conc", trial_scene_id="vs_1"))
+                self.assertEqual(conc_svc.calls[0][1], "720p")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,10 +31,12 @@ class Settings:
     max_images_per_task: int = int(os.getenv("MAX_IMAGES_PER_TASK", "20"))
     max_video_seconds_per_task: int = int(os.getenv("MAX_VIDEO_SECONDS_PER_TASK", "600"))
     max_dynamic_scenes_per_task: int = int(os.getenv("MAX_DYNAMIC_SCENES_PER_TASK", "99"))
-    wan_video_model: str = os.getenv("WAN_VIDEO_MODEL", "wan2.7-i2v-2026-04-25")
+    wan_video_model: str = os.getenv("WAN_VIDEO_MODEL", "wan3.0-video")
     qwen_image_model: str = os.getenv("QWEN_IMAGE_MODEL", "qwen-image-2.0")
     vidu_api_token: str | None = os.getenv("VIDU_API_TOKEN")
     vidu_model: str = os.getenv("VIDU_MODEL", "viduq3-turbo")
+    vidu_resolution: str = os.getenv("VIDU_RESOLUTION", "1080p")
+    vidu_trial_resolution: str = os.getenv("VIDU_TRIAL_RESOLUTION", "720p")
     volcengine_api_key: str | None = os.getenv("VOLCENGINE_API_KEY")
     volcengine_model: str = os.getenv("VOLCENGINE_MODEL", "doubao-seedance-1-5-pro-251215")
     volcengine_image_model: str = os.getenv(

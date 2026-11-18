@@ -14,6 +14,7 @@ class ViduVideoService(BaseVideoService):
 
     API_BASE = "https://api.vidu.com/ent/v2"
     supports_movement_amplitude = True
+    supports_resolution = True
 
     def _get_headers(self) -> dict[str, str]:
         token = settings.vidu_api_token.strip() if settings.vidu_api_token else ""
@@ -56,6 +57,7 @@ class ViduVideoService(BaseVideoService):
         duration: int = 5,
         ratio: str = "9:16",
         movement_amplitude: str = "auto",
+        resolution: str | None = None,
     ) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError(
@@ -83,6 +85,8 @@ class ViduVideoService(BaseVideoService):
 
             # 3. 提交图生视频任务
             amp = movement_amplitude if movement_amplitude in {"auto", "small", "medium", "large"} else "auto"
+            raw_res = str(resolution or getattr(settings, "vidu_resolution", "1080p") or "1080p").strip().lower()
+            vidu_res = raw_res if raw_res in {"360p", "540p", "720p", "1080p"} else "1080p"
             submit_url = f"{self.API_BASE}/img2video"
             payload: dict[str, Any] = {
                 "model": settings.vidu_model,
@@ -90,7 +94,7 @@ class ViduVideoService(BaseVideoService):
                 "prompt": video_prompt
                 or "smooth movement, high quality, consistent with character",
                 "duration": duration,
-                "resolution": "1080p",
+                "resolution": vidu_res,
                 "movement_amplitude": amp,
             }
 

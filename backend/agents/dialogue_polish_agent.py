@@ -15,6 +15,7 @@ from agents.agent_utils import (
     mark_agent_success,
 )
 from agents.storyboard_agent import validate_storyboard_scenes
+from services.generation_contract import STORYBOARD_FLOW_MODE
 
 
 class DialoguePolishAgent:
@@ -34,8 +35,9 @@ class DialoguePolishAgent:
             task_scenes = await deduplicate_scenes_by_index(scenes, mongodb, SCENES_COLLECTION)
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
+            is_flow = task.get("generation_mode") == STORYBOARD_FLOW_MODE
             if (
-                task.get("generation_mode") == "auto_director"
+                task.get("generation_mode") in {"auto_director", STORYBOARD_FLOW_MODE}
                 and not task.get("duration_locked")
             ):
                 scenes_sum = sum(int(s.get("duration") or 0) for s in task_scenes)
@@ -44,8 +46,7 @@ class DialoguePolishAgent:
                     task["duration"] = scenes_sum
             if all(
                 (scene.get("dialogue_polished") or scene.get("status") == "dialogue_done")
-                and scene.get("speaker")
-                and scene.get("voiceover")
+                and ((is_flow and not scene.get("dialogue_lines") and not str(scene.get("voiceover") or "").strip()) or (scene.get("speaker") and scene.get("voiceover")))
                 for scene in task_scenes
             ):
                 validate_storyboard_scenes(
@@ -53,6 +54,7 @@ class DialoguePolishAgent:
                     target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
                     enforce_voiceover_density=False,
                     whole=task.get("generation_mode") == "wan3_whole",
+                    allow_silent=is_flow,
                 )
                 await mark_agent_success(
                     task_id,
@@ -65,7 +67,11 @@ class DialoguePolishAgent:
                 return task_scenes
 
             _target_duration = task.get("duration") if isinstance(task.get("duration"), int) else None
-            narration_scenes = [scene for scene in task_scenes if not scene.get("dialogue_lines")]
+            narration_scenes = [
+                scene for scene in task_scenes
+                if not scene.get("dialogue_lines")
+                and not (is_flow and not str(scene.get("voiceover") or "").strip())
+            ]
             dialogues = []
             if narration_scenes:
                 llm_service = get_llm_service()
@@ -82,6 +88,8 @@ class DialoguePolishAgent:
                 if scene.get("dialogue_lines"):
                     spoken = "\n".join(line["text"] for line in scene["dialogue_lines"])
                     dialogue = {"speaker": scene["dialogue_lines"][0]["speaker"], "voiceover": spoken, "subtitle": spoken}
+                elif is_flow and not str(scene.get("voiceover") or "").strip():
+                    dialogue = {"speaker": str(scene.get("speaker") or "无"), "voiceover": "", "subtitle": ""}
                 if dialogue is None:
                     raise ValueError(f"Dialogue polish result missing scene: {scene_id}")
 
@@ -102,6 +110,7 @@ class DialoguePolishAgent:
                 target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
                 enforce_voiceover_density=False,
                 whole=task.get("generation_mode") == "wan3_whole",
+                allow_silent=is_flow,
             )
 
             await mark_agent_success(

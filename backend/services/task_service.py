@@ -52,6 +52,7 @@ class TaskService:
             generation_mode=payload.generation_mode,
             intro_title=payload.intro_title,
             subtitle_style=payload.subtitle_style,
+            bgm_preset=payload.bgm_preset,
             auto_heal=payload.auto_heal,
             max_heal_attempts=payload.max_heal_attempts,
             duration_locked=payload.duration is not None,

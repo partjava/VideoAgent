@@ -8,7 +8,7 @@ from models.task_model import VideoTaskStatus
 from services.provider_factory import get_llm_service
 from services.task_service import task_service
 from services.camera_plan import normalize_camera_plan
-from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE
+from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE, STORYBOARD_FLOW_MODE
 from services.visual_style import PHOTO_RULES, PHOTO_EXCLUSIONS, lock_visual_style
 from services.character_binding import (
     characters_in_scene,
@@ -53,6 +53,8 @@ class PromptAgent:
             from services.generation_contract import validate_motion_beats
             paired = task.get("generation_mode") == PAIRED_GENERATION_MODE
             native = task.get("generation_mode") == NATIVE_GENERATION_MODE
+            storyboard_flow = task.get("generation_mode") == STORYBOARD_FLOW_MODE
+            per_second = not storyboard_flow
             for index, scene in enumerate(task_scenes):
                 if paired:
                     scene["camera_section_offset"] = 5 * (index % 2)
@@ -63,7 +65,7 @@ class PromptAgent:
             # 旧字符串节拍必须重新生成，不能仅凭图片提示词复用。
             def complete(scene):
                 try:
-                    validate_motion_beats(scene.get("motion_beats"), float(scene["duration"]), detailed=True, per_second=True)
+                    validate_motion_beats(scene.get("motion_beats"), float(scene["duration"]), detailed=True, per_second=per_second)
                     return bool(scene.get("image_prompt") and scene.get("video_prompt"))
                 except (ValueError, TypeError, KeyError):
                     return False
@@ -94,11 +96,14 @@ class PromptAgent:
             all_cast_names = [c.get("name") for c in bound_cast if isinstance(c, dict) and c.get("name")]
 
             def generate(batch):
-                return llm_service.generate_image_prompts(batch, ratio=ratio, style=_style, visual_bible=bible)
+                kwargs = {"ratio": ratio, "style": _style, "visual_bible": bible}
+                if not per_second:
+                    kwargs["per_second"] = False
+                return llm_service.generate_image_prompts(batch, **kwargs)
 
             def prepare(prompt, scene):
                 beats = prompt.get("motion_beats")
-                validate_motion_beats(beats, float(scene["duration"]), detailed=True, per_second=True)
+                validate_motion_beats(beats, float(scene["duration"]), detailed=True, per_second=per_second)
                 if not native and scene.get("start_state"):
                     beats[0]["start_state"] = scene["start_state"]
                 if not native and scene.get("end_state"):

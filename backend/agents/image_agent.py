@@ -9,6 +9,71 @@ from uuid import uuid4
 
 import anyio
 
+
+def _build_implicit_turnaround_prompt(char_info: dict, style: str | None) -> str:
+    """为未绑定角色资产库的剧组流任务生成 16:9 纯灰无阴影 4 视图人物设定卡。"""
+    name = str(char_info.get("name") or "主角").strip()
+    gender = "男" if str(char_info.get("gender") or "").lower() == "male" else (
+        "女" if str(char_info.get("gender") or "").lower() == "female" else ""
+    )
+    appearance = str(char_info.get("appearance") or char_info.get("face_dna") or "").strip()
+    style_hint = "写实电影级影视剧照质感，真实皮肤纹理" if style == "短剧" else "高清统一漫画/插画设定线稿上色风格"
+    return (
+        f"角色设定原画4视图，16:9横版构图，无多余元素的浅灰纯色影棚背景（#EFEFEF），角色无阴影，{style_hint}。"
+        f"角色信息：{name}（{gender}），外貌特征：{appearance or '五官清晰自然'}。"
+        f"画面布局严格分区：左区为角色正脸大特写（面部清晰占满左区，五官/发型/配饰极度清晰，无身体入镜）；"
+        f"右区为标准全身三视图横向并排（侧视图、正视图、背视图），从头到脚完整无遮挡、人物高度统一占右区高度80%。"
+        f"核心约束：特写与三视图100%为同一人，85mm焦距无畸变平视，中性平静表情（无喜怒哀乐），"
+        f"自然站立，双手自然下垂，空手（无手持物），身上无背负物，无文字无水印。"
+    )
+
+
+def _match_cast_card_paths(scene: dict, cast_cards: list[dict], max_refs: int) -> list[str]:
+    """按分镜实际出场人名或台词归属，精准匹配对应的纯底人物设定卡（≤2人）。"""
+    if not cast_cards or max_refs <= 0:
+        return []
+    shot_label = str(scene.get("shot_type") or "")
+    text_pool = " ".join([
+        str(scene.get("visual_description") or ""),
+        str(scene.get("image_prompt") or ""),
+        str(scene.get("speaker") or ""),
+        " ".join(str(line.get("speaker") or "") for line in (scene.get("dialogue_lines") or [])),
+    ])
+    if "空镜" in shot_label and not any(c["name"] in text_pool for c in cast_cards if c.get("name")):
+        return []
+    matched: list[str] = []
+    for card in cast_cards:
+        cname = str(card.get("name") or "").strip()
+        if not cname:
+            continue
+        short = cname.lstrip("小老") if len(cname) >= 3 else cname
+        if cname in text_pool or (len(short) >= 2 and short in text_pool):
+            matched.append(card["path"])
+    if not matched:
+        # 若该镜明确写明了无设定卡的新说话人（如配角/家长），不再强行塞入主角1的设定卡防串脸
+        speaker = str(scene.get("speaker") or "").strip()
+        explicit_other = speaker and speaker not in {"旁白", "解说", "无", "narrator"}
+        if not explicit_other and any(k in text_pool for k in ("主角", "男主", "女主", "他", "她", "少年", "女孩", "男孩")):
+            matched = [cast_cards[0]["path"]]
+    return matched[: min(2, max_refs)]
+
+
+def build_end_frame_prompt(scene: dict, custom_prompt: str | None = None) -> str:
+    """基于首帧人物、机位和场景，构造同镜头结束定格态尾帧提示词。"""
+    end_goal = str(
+        custom_prompt
+        or scene.get("end_state")
+        or scene.get("last_frame_for_transition")
+        or scene.get("visual_description")
+        or ""
+    ).strip()
+    shot_type = str(scene.get("shot_type") or "").strip()
+    style_cam = f" 保持景别：{shot_type}。" if shot_type else ""
+    return (
+        f"[尾帧动作定格] 严格继承参考首帧中的同一人物五官、服装、场景装修、拍摄轴线与主光色温，"
+        f"仅将人物姿态、视线与手中道具推进并定格在本镜结束状态：{end_goal or '动作自然收束停稳'}。{style_cam}无文字无水印。"
+    )
+
 from agents.agent_utils import (
     ASSETS_COLLECTION,
     SCENES_COLLECTION,
@@ -37,14 +102,15 @@ class ImageAgent:
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
 
-            from services.generation_contract import needs_video
+            from services.generation_contract import STORYBOARD_FLOW_MODE, needs_video
             task_scenes = [scene for scene in task_scenes
                            if not (needs_video(scene) and scene.get("transition_type") == "continue_action")]
             if len(task_scenes) > settings.max_images_per_task:
-                raise ValueError("Storyboard exceeds the configured image limit")
+                raise ValueError(f"分镜共需 {len(task_scenes)} 张首帧图，超过 MAX_IMAGES_PER_TASK={settings.max_images_per_task} 上限，请调高配置或缩短时长")
             image_service = get_image_service()
             # 获取任务比例，后续传给生图服务
             task = await mongodb.find_one("video_tasks", {"_id": task_id})
+            is_storyboard_flow = (task or {}).get("generation_mode") == STORYBOARD_FLOW_MODE
             if frozen_characters(task or {}) and not getattr(image_service, "supports_reference_images", False):
                 raise ValueError("连载角色需要支持参考图的图片模型，请先在模型配置中更换型号")
             task_ratio = str(task.get("ratio", "9:16")) if task else "9:16"
@@ -113,17 +179,125 @@ class ImageAgent:
                 )
                 return assets
 
-            # ── 并行生成所有图片（无角色库但支持参考图时，优先画第1镜作为主角外貌与片场光色锚点） ──
+            # ── 并行生成所有图片 ──
+            # 1) 剧组自由流模式且未选角色库：隐式先绘纯灰底 4 视图角色设定卡，绝不把实景第1镜直接当参考锁定机位；
+            # 2) 其他模式且无角色库：优先画第1个人物镜作为片场锚点。
             print(f"[ImageAgent] Generating {len(scenes_to_generate)} images...", flush=True)
             dynamic_anchor_path: str | None = None
+            implicit_cast_cards: list[dict] = []
             has_frozen_refs = bool(frozen_characters(task or {}))
             can_anchor = (
                 not has_frozen_refs
                 and getattr(image_service, "supports_reference_images", False)
                 and int(getattr(image_service, "max_reference_images", 0) or 0) >= 1
             )
-            if can_anchor and assets:
-                # 若第1镜或前序镜头已在硬盘就绪，直接复用其作为首镜视觉锚点
+            sem = anyio.Semaphore(4)  # 限制最多 4 个并发，避免打满线程池
+
+            if is_storyboard_flow and can_anchor:
+                from services.media_quality import resolve_media
+                raw_plan_chars = [
+                    dict(c) for c in ((task or {}).get("metadata", {}).get("task_plan") or {}).get("characters") or []
+                    if isinstance(c, dict) and str(c.get("name") or "").strip()
+                ]
+                seen_names: dict[str, int] = {}
+                for sc in task_scenes:
+                    sc_pool = f"{sc.get('visual_description') or ''} {sc.get('image_prompt') or ''}"
+                    for ch in raw_plan_chars:
+                        cname = str(ch.get("name") or "").strip()
+                        if cname and cname in sc_pool:
+                            seen_names[cname] = seen_names.get(cname, 0) + 1
+                    for spk in [sc.get("speaker")] + [l.get("speaker") for l in (sc.get("dialogue_lines") or [])]:
+                        s = str(spk or "").strip()
+                        if s and s not in {"旁白", "解说", "无", "narrator"}:
+                            seen_names[s] = seen_names.get(s, 0) + 1
+                known_by_name = {str(c.get("name") or "").strip(): c for c in raw_plan_chars}
+                order_rank: dict[str, int] = {str(c.get("name") or "").strip(): i for i, c in enumerate(raw_plan_chars)}
+                for n in seen_names:
+                    if n not in known_by_name:
+                        known_by_name[n] = {"name": n}
+                    order_rank.setdefault(n, len(order_rank))
+                ordered_names = sorted(
+                    known_by_name.keys(),
+                    key=lambda nm: (-seen_names.get(nm, 0), order_rank.get(nm, 999)),
+                )
+                headroom = max(0, int(getattr(settings, "max_images_per_task", 20) or 20) - len(task_scenes))
+                max_cards = min(4, len(ordered_names), headroom) if headroom > 0 else 0
+                card_targets = [known_by_name[nm] for nm in ordered_names[:max_cards]]
+
+                async def _prepare_cast_card(idx: int, ch: dict) -> dict | None:
+                    card_id = f"cast_ref_{idx + 1}"
+                    expected_rel = f"backend/assets/{task_id}/images/{card_id}.png"
+                    disk_card = resolve_media(expected_rel)
+                    card_prompt = _build_implicit_turnaround_prompt(ch, (task or {}).get("style"))
+                    if disk_card.is_file() and disk_card.stat().st_size > 1024:
+                        card_path = expected_rel
+                    else:
+                        try:
+                            async with sem:
+                                card_res = await dispatch_generation(
+                                    task or {"task_id": task_id},
+                                    "image",
+                                    card_id,
+                                    lambda _cid=card_id, _cp=card_prompt: image_service.generate_image(
+                                        task_id=task_id,
+                                        scene_id=_cid,
+                                        image_prompt=_cp,
+                                        negative_prompt="复杂场景, 阴影, 道具, 手持物, 背包, 变形, 乱码文字",
+                                        ratio="16:9",
+                                    ),
+                                )
+                            if not (isinstance(card_res, dict) and card_res.get("status") == "success" and card_res.get("asset_path")):
+                                return None
+                            card_path = str(card_res["asset_path"])
+                        except GenerationLimitExceeded:
+                            raise
+                        except Exception as exc:
+                            print(f"[ImageAgent] Implicit cast card skipped safely for {ch['name']}: {exc}", flush=True)
+                            return None
+                    card_asset = Asset(
+                        asset_id=f"asset_{task_id}_{card_id}",
+                        task_id=task_id,
+                        scene_id=card_id,
+                        asset_type="character_ref",
+                        path=card_path,
+                        source=str(image_service.__class__.__name__),
+                        status="success",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    await mongodb.replace_one(
+                        ASSETS_COLLECTION,
+                        {"_id": card_asset.asset_id},
+                        with_document_id(card_asset.model_dump(), card_asset.asset_id),
+                        upsert=True,
+                    )
+                    return {
+                        "card_id": card_id,
+                        "name": str(ch.get("name") or "").strip(),
+                        "gender": str(ch.get("gender") or "").strip(),
+                        "appearance": str(ch.get("appearance") or ch.get("face_dna") or "").strip(),
+                        "path": card_path,
+                        "prompt": card_prompt,
+                    }
+
+                if card_targets:
+                    card_results = await asyncio.gather(
+                        *(_prepare_cast_card(idx, ch) for idx, ch in enumerate(card_targets)),
+                        return_exceptions=True,
+                    )
+                    for cr in card_results:
+                        if isinstance(cr, GenerationLimitExceeded):
+                            raise cr
+                        if isinstance(cr, dict) and cr.get("path"):
+                            implicit_cast_cards.append(cr)
+                    if implicit_cast_cards:
+                        await mongodb.update_one(
+                            "video_tasks",
+                            {"_id": task_id},
+                            {"metadata.implicit_cast_cards": implicit_cast_cards},
+                        )
+            elif can_anchor and assets:
+                # 非自由流模式下，若前序镜头已就绪，复用其作为首镜视觉锚点
                 for existing in assets:
                     cand = str(existing.get("path") or "").strip()
                     if cand:
@@ -149,6 +323,15 @@ class ImageAgent:
                     if resolve_media(env_anchor).is_file() and env_anchor not in ref_paths:
                         ref_paths.append(env_anchor)
                         image_prompt += "\n[环境参考锚定] 仅继承最后一张场景图的空间装修、材质与主光源方向，严格按本镜机位构图重排。"
+                elif not ref_paths and implicit_cast_cards and max_refs >= 1:
+                    from services.media_quality import resolve_media
+                    matched = [
+                        p for p in _match_cast_card_paths(scene, implicit_cast_cards, max_refs)
+                        if resolve_media(p).is_file()
+                    ]
+                    if matched:
+                        ref_paths = matched
+                        image_prompt += "\n[角色外貌设定参考] 仅继承参考设定图中对应角色的五官脸型、发型与基础体态特征；彻底忽略设定图浅灰背景及三视图排版，严格按本镜新景别、构图角度、指定时代服装、独立场景背景与阶段光影色温绘制。"
                 elif not ref_paths and anchor_path and max_refs >= 1:
                     from services.media_quality import resolve_media
                     if resolve_media(anchor_path).is_file():
@@ -177,8 +360,6 @@ class ImageAgent:
                     print(f"[ImageAgent] Scene {scene_id} image generation failed: {e}")
                     return None
 
-            sem = anyio.Semaphore(4)  # 限制最多 4 个并发，避免打满线程池
-
             async def _generate_and_save(scene: dict, anchor_path: str | None = None) -> str | None:
                 scene_id = str(scene["scene_id"])
                 async with sem:
@@ -203,22 +384,48 @@ class ImageAgent:
                     with_document_id(asset.model_dump(), asset.asset_id),
                     upsert=True,
                 )
+                scene_update = {
+                    "image_path": asset.path,
+                    "reference_choices": image_result.get("reference_choices") or [],
+                    "status": "image_done",
+                    "updated_at": now,
+                }
+                if scene.get("need_end_frame") is True and getattr(image_service, "supports_reference_images", False):
+                    end_scene_id = f"{scene_id}_end"
+                    end_prompt = lock_visual_style(build_end_frame_prompt(scene), (task or {}).get("style"))
+                    try:
+                        async with sem:
+                            end_res = await dispatch_generation(
+                                task or {"task_id": task_id},
+                                "image",
+                                end_scene_id,
+                                lambda _eid=end_scene_id, _ep=end_prompt, _ref=asset.path: image_service.generate_image(
+                                    task_id=task_id,
+                                    scene_id=_eid,
+                                    image_prompt=_ep,
+                                    negative_prompt=PHOTO_EXCLUSIONS if (task or {}).get("style") == "短剧" else None,
+                                    ratio=task_ratio,
+                                    reference_images=[_ref],
+                                ),
+                            )
+                        if isinstance(end_res, dict) and end_res.get("status") == "success" and end_res.get("asset_path"):
+                            scene_update["last_frame_target_path"] = str(end_res["asset_path"])
+                    except GenerationLimitExceeded:
+                        raise
+                    except Exception as end_exc:
+                        print(f"[ImageAgent] Optional end frame skipped for {scene_id}: {end_exc}", flush=True)
+
                 await mongodb.update_one(
                     SCENES_COLLECTION,
                     {"_id": f"{task_id}_{scene_id}"},
-                    {
-                        "image_path": asset.path,
-                        "reference_choices": image_result.get("reference_choices") or [],
-                        "status": "image_done",
-                        "updated_at": now,
-                    },
+                    scene_update,
                 )
                 assets.append(asset.model_dump())
 
                 return None
 
             remaining_scenes = list(scenes_to_generate)
-            if can_anchor and not dynamic_anchor_path and len(remaining_scenes) > 1:
+            if can_anchor and not is_storyboard_flow and not dynamic_anchor_path and len(remaining_scenes) > 1:
                 anchor_idx = 0
                 for idx, candidate in enumerate(remaining_scenes):
                     shot_label = str(candidate.get("shot_type") or "").strip()

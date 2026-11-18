@@ -18,7 +18,7 @@ from agents.agent_utils import (
 )
 
 
-from services.generation_contract import render_srt
+from services.generation_contract import render_srt_for_task
 
 
 class SubtitleAgent:
@@ -72,7 +72,7 @@ class SubtitleAgent:
                     await mongodb.update_one(SCENES_COLLECTION, {"_id": scene["_id"]}, fields)
                     scene.update(fields)
             task_doc = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
-            srt_content = render_srt(task_scenes, wrap_width=24 if task_doc.get("ratio") == "16:9" else 15)
+            srt_content = render_srt_for_task(task_scenes, task_doc)
 
             # 3. 保存 SRT 文件
             backend_dir = Path(__file__).resolve().parents[1]

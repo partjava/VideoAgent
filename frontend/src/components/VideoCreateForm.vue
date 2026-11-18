@@ -5,8 +5,10 @@
         <el-input
           v-model="form.user_input"
           type="textarea"
-          :rows="4"
-          placeholder="用一句话描述你要的视频，例如：用20秒讲清楚猫为什么会踩奶。"
+          :rows="form.generation_mode === 'storyboard_flow' ? 6 : 4"
+          :placeholder="form.generation_mode === 'storyboard_flow'
+            ? '可输入一句话主题，或直接粘贴多单元剧情梗概/角色设定/分镜模板（不卡逐秒，系统会先生成浅灰纯底角色设定卡，再按单元交替景别自由生成）。'
+            : '用一句话描述你要的视频，例如：用20秒讲清楚猫为什么会踩奶。'"
           class="prompt-textarea"
         />
       </el-form-item>
@@ -51,9 +53,19 @@
       </el-form-item>
 
       <div class="form-row-three">
+        <el-form-item label="排片导演模式" class="form-item-third">
+          <el-select v-model="form.generation_mode" class="full-width">
+            <el-option label="AI 自主导演（逐秒动作链 · 4–12s）" value="auto_director" />
+            <el-option label="剧组单元自由流（不逐秒 · 角色设定卡+多镜交替）" value="storyboard_flow" />
+            <el-option label="原生 10 秒动态镜头" value="native_10s" />
+            <el-option label="双 5 秒连续动作镜头" value="paired_5s" />
+            <el-option label="关键镜头动态（省额度）" value="key_scenes" />
+          </el-select>
+        </el-form-item>
+
         <el-form-item label="目标时长" class="form-item-third">
           <el-select v-model="form.duration" placeholder="选择预计时长" class="full-width">
-            <el-option label="自动" :value="0" />
+            <el-option :label="form.generation_mode === 'storyboard_flow' ? '自动（由剧本与单元数决定）' : '自动'" :value="0" />
             <el-option label="10 秒测试" :value="10" />
             <el-option label="30 秒" :value="30" />
             <el-option label="60 秒" :value="60" />
@@ -70,16 +82,18 @@
       </div>
 
       <div class="usage-estimate-bar">
-        <span v-if="form.generation_mode === 'auto_director'">AI 自主导演规划镜头节奏（主镜头 8–12 秒、反应/钩子 4–7 秒），配音自适应时间轴并在质检后自动精修重拍瑕疵镜头。</span>
+        <span v-if="form.generation_mode === 'storyboard_flow'">不强制逐秒拆碎动作：未选角色库时自动先绘纯灰底 4 视图角色设定卡，按 15 秒情感单元交替景别视角与阶段光影生成连续长镜（支持静默情绪特写与闪白切场）。</span>
+        <span v-else-if="form.generation_mode === 'auto_director'">AI 自主导演规划镜头节奏（主镜头 8–12 秒、反应/钩子 4–7 秒），配音自适应时间轴并在质检后自动精修重拍瑕疵镜头。</span>
         <span v-else-if="form.generation_mode === 'native_10s'">每段固定生成 10 秒动态视频，完成后自动拼接。</span>
         <span v-else-if="form.generation_mode === 'paired_5s'">每段由两个 5 秒连续动作镜头拼接而成。</span>
         <span v-else>关键镜头生成动态视频，其余镜头辅以运镜衔接。</span>
         <span class="estimate-badge">预计消耗：约 {{ estimatedUsage.images }} 张图 + {{ estimatedUsage.videos }} 段视频（共 {{ estimatedUsage.total }} 次生成操作）</span>
+        <p v-if="limitWarning" class="limit-warning">⚠️ {{ limitWarning }}</p>
       </div>
 
       <div class="workflow-switches">
         <el-checkbox v-model="form.pre_shoot_review">
-          开拍前预审首帧与配音（生成完分镜图与配音后暂停，支持单镜试拍）
+          开拍前预审首帧与配音（生成完分镜图与配音后暂停，支持单镜试拍{{ form.generation_mode === 'storyboard_flow' ? ' · 建议勾选以先看 4 视图设定卡' : '' }}）
         </el-checkbox>
       </div>
 
@@ -95,6 +109,17 @@
               <el-option label="国风诗词" value="poetry" />
             </el-select>
           </el-form-item>
+          <el-form-item label="背景音乐情绪" class="form-item-third">
+            <el-select v-model="form.bgm_preset" class="full-width">
+              <el-option label="自动匹配题材" value="auto" />
+              <el-option label="校园/温暖钢琴" value="warm_campus" />
+              <el-option label="悬疑强戏剧底噪" value="suspense" />
+              <el-option label="历史/燃向进行曲" value="heroic" />
+              <el-option label="无背景音乐" value="none" />
+            </el-select>
+          </el-form-item>
+        </div>
+        <div class="form-row-three">
           <el-form-item label="生成操作额度上限（可选）" class="form-item-third">
             <el-input
               v-model="form.generation_limit"
@@ -103,16 +128,6 @@
               max="10000"
               placeholder="留空不设上限"
             />
-          </el-form-item>
-        </div>
-        <div class="form-row-three">
-          <el-form-item label="导演排片模式" class="form-item-third">
-            <el-select v-model="form.generation_mode" class="full-width">
-              <el-option label="AI 自主导演（弹性 4–12s · 推荐）" value="auto_director" />
-              <el-option label="原生 10 秒动态镜头" value="native_10s" />
-              <el-option label="双 5 秒连续动作镜头" value="paired_5s" />
-              <el-option label="关键镜头动态（省额度）" value="key_scenes" />
-            </el-select>
           </el-form-item>
           <el-form-item label="质检自动重拍精修" class="form-item-third">
             <el-checkbox v-model="form.auto_heal">
@@ -139,6 +154,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { charactersApi } from '../api/characters'
+import { videoApi } from '../api/video'
 
 defineProps({
   loading: {
@@ -150,6 +166,7 @@ defineProps({
 const emit = defineEmits(['submit'])
 
 const confirmedCharacters = ref([])
+const capabilities = ref(null)
 
 const form = reactive({
   user_input: '',
@@ -161,6 +178,7 @@ const form = reactive({
   max_heal_attempts: 2,
   intro_title: '',
   subtitle_style: 'standard',
+  bgm_preset: 'auto',
   pre_shoot_review: false,
   generation_limit: '',
   character_ids: []
@@ -174,10 +192,20 @@ onMounted(async () => {
   } catch {
     confirmedCharacters.value = []
   }
+  try {
+    capabilities.value = await videoApi.getCapabilities()
+  } catch {
+    capabilities.value = null
+  }
 })
 
 const estimatedUsage = computed(() => {
-  const seconds = form.duration > 0 ? form.duration : 30
+  const seconds = form.duration > 0 ? form.duration : (form.generation_mode === 'storyboard_flow' ? 60 : 30)
+  if (form.generation_mode === 'storyboard_flow') {
+    const clips = Math.max(2, Math.round(seconds / 4))
+    const images = clips + (Array.isArray(form.character_ids) && form.character_ids.length > 0 ? 0 : 2)
+    return { images, videos: clips, total: images + clips }
+  }
   let clips = Math.max(1, Math.ceil(seconds / 10))
   if (form.generation_mode === 'auto_director') {
     clips = Math.max(2, Math.round(seconds / 9))
@@ -185,6 +213,25 @@ const estimatedUsage = computed(() => {
     clips = Math.max(1, Math.ceil(seconds / 5))
   }
   return { images: clips, videos: clips, total: clips * 2 }
+})
+
+const limitWarning = computed(() => {
+  const caps = capabilities.value
+  if (!caps) return ''
+  const est = estimatedUsage.value
+  const seconds = form.duration > 0 ? form.duration : (form.generation_mode === 'storyboard_flow' ? 60 : 30)
+  const reasons = []
+  if (est.images > caps.max_images_per_task) {
+    reasons.push(`预计首帧/设定图约 ${est.images} 张 > 上限 ${caps.max_images_per_task} 张`)
+  }
+  if (est.videos > caps.max_dynamic_scenes_per_task) {
+    reasons.push(`预计动态镜约 ${est.videos} 段 > 上限 ${caps.max_dynamic_scenes_per_task} 段`)
+  }
+  if (seconds > caps.max_video_seconds_per_task) {
+    reasons.push(`目标时长 ${seconds} 秒 > 上限 ${caps.max_video_seconds_per_task} 秒`)
+  }
+  if (!reasons.length) return ''
+  return `${reasons.join('；')}。建议调高后端 .env 配置，或缩短时长 / 拆分成多集连载运行。`
 })
 
 const handleSubmit = () => {
@@ -318,6 +365,17 @@ const handleSubmit = () => {
   transform: translateY(-1px);
   box-shadow: 0 6px 14px rgba(37, 99, 235, 0.28);
   background: #1d4ed8;
+}
+.limit-warning {
+  width: 100%;
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  color: #92400e;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .submit-button:active {

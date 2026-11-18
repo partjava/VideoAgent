@@ -210,6 +210,36 @@
             </div>
           </section>
 
+          <section v-if="implicitCastCards.length" class="panel cast-cards-panel" aria-label="自动生成角色设定卡">
+            <div class="section-heading">
+              <div>
+                <span class="eyebrow">CAST TURNAROUND ANCHORS · 角色设定卡</span>
+                <h2>自动生成的 4 视图人物锚点</h2>
+                <p>剧组自由流会先在浅灰无阴影影棚背景绘制标准正脸特写 + 三视图，后续全部镜头按出镜角色提取五官与体态特征，不锁定实景角度。</p>
+              </div>
+            </div>
+            <div class="cast-cards-grid">
+              <div v-for="card in implicitCastCards" :key="card.card_id" class="cast-card-item">
+                <img :src="mediaUrl(card.path)" :alt="card.name" loading="lazy" />
+                <div class="cast-card-meta">
+                  <div>
+                    <strong>{{ card.name }}</strong>
+                    <small v-if="card.appearance"> · {{ card.appearance }}</small>
+                  </div>
+                  <button
+                    v-if="['awaiting_shoot_review', 'failed', 'success'].includes(status)"
+                    type="button"
+                    class="copy-prompt"
+                    :disabled="!!cardRerunId || !!activeTrial"
+                    @click="rerunCastCard(card)"
+                  >
+                    {{ cardRerunId === card.card_id ? '正在重绘设定卡…' : '重绘设定卡' }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section class="panel timeline" aria-labelledby="timeline-title">
             <div class="section-heading timeline-heading">
               <div><span class="eyebrow">SHOT TIMELINE</span><h2 id="timeline-title">分镜时间线</h2></div>
@@ -272,6 +302,7 @@
                     <span v-else-if="scene.image_path" class="badge neutral">首帧就绪</span>
                     <span v-if="scene.audio_path || scene.dialogue_audio?.length" class="badge neutral">配音就绪</span>
                     <span v-if="scene.transition_type === 'continue_action'" class="badge running">承接上镜尾帧</span>
+                    <span v-if="scene.last_frame_target_path" class="badge success">已绑定尾帧控制图</span>
                     <span v-if="scene.transition_mode" class="badge neutral">
                       衔接：{{ transitionModeLabel(scene.transition_mode) }}
                     </span>
@@ -305,10 +336,19 @@
                       v-if="scene.transition_type !== 'continue_action'"
                       type="button"
                       class="copy-prompt"
-                      :disabled="!!imageRerunId || !!activeTrial"
+                      :disabled="!!imageRerunId || !!endFrameRerunId || !!activeTrial"
                       @click="rerunShotImage(scene)"
                     >
                       {{ imageRerunId === scene.scene_id ? '正在重绘首帧…' : '重绘本镜首帧' }}
+                    </button>
+                    <button
+                      v-if="scene.image_path && scene.need_dynamic_video !== false"
+                      type="button"
+                      class="copy-prompt"
+                      :disabled="!!endFrameRerunId || !!imageRerunId || !!activeTrial"
+                      @click="rerunShotEndFrame(scene)"
+                    >
+                      {{ endFrameRerunId === scene.scene_id ? '正在生成尾帧…' : scene.last_frame_target_path ? '重绘尾帧控制图' : '生成尾帧（双图锁终点）' }}
                     </button>
                     <button
                       v-if="scene.voiceover"
@@ -319,6 +359,10 @@
                     >
                       {{ voiceRetry === scene.scene_id ? '正在重生成配音…' : '重生成本镜配音' }}
                     </button>
+                    <div v-if="scene.last_frame_target_path" class="end-frame-preview">
+                      <span>尾帧锁定：</span>
+                      <img :src="mediaUrl(scene.last_frame_target_path)" :alt="'镜头 ' + (i + 1) + ' 尾帧控制图'" loading="lazy" />
+                    </div>
                     <small v-if="!canTrialShot(scene, i)" class="trial-hint">
                       此镜头承接上一镜头尾帧，请先试拍上一镜头
                     </small>
@@ -413,6 +457,8 @@ defineProps({ embedded: Boolean })
 
 const voiceRetry = ref(null)
 const imageRerunId = ref(null)
+const endFrameRerunId = ref(null)
+const cardRerunId = ref(null)
 const voiceFeedback = ref({})
 const trialSubmitting = ref(null)
 const approvingShoot = ref(false)
@@ -432,6 +478,7 @@ const transitionModeLabel = (mode) =>
     angle_cut: '换机位硬切',
     empty_shot: '空镜/道具过渡',
     whip_morph: '动势转场',
+    flash_white: '闪白切场',
   })[mode] || mode
 
 async function runTaskScriptReview() {
@@ -507,6 +554,42 @@ async function rerunShotImage(scene) {
     voiceFeedback.value = { sceneId: scene.scene_id, text: error.message }
   } finally {
     imageRerunId.value = null
+  }
+}
+
+async function rerunShotEndFrame(scene) {
+  endFrameRerunId.value = scene.scene_id
+  voiceFeedback.value = {}
+  try {
+    await videoApi.rerunScene(taskId.value, scene.scene_id, {
+      rerun_type: 'end_frame',
+      prompt: scene.end_state || scene.last_frame_for_transition || scene.visual_description,
+    })
+    scenes.value = await videoApi.getStoryboard(taskId.value)
+    voiceFeedback.value = { sceneId: scene.scene_id, text: '尾帧控制图已生成，后续生成或重拍视频将锁定起止双帧。' }
+  } catch (error) {
+    voiceFeedback.value = { sceneId: scene.scene_id, text: error.message }
+  } finally {
+    endFrameRerunId.value = null
+  }
+}
+
+async function rerunCastCard(card) {
+  cardRerunId.value = card.card_id
+  connectionIssue.value = ''
+  try {
+    const res = await videoApi.rerunCastCard(taskId.value, card.card_id, {})
+    if (res?.implicit_cast_cards && task.value) {
+      task.value = {
+        ...task.value,
+        metadata: { ...(task.value.metadata || {}), implicit_cast_cards: res.implicit_cast_cards },
+      }
+    }
+    refreshNow()
+  } catch (error) {
+    connectionIssue.value = error.message || '重绘设定卡失败'
+  } finally {
+    cardRerunId.value = null
   }
 }
 
@@ -637,6 +720,7 @@ async function selectStep(key) {
 const starting = ref(false)
 const connectionIssue = ref('')
 const plan = computed(() => task.value?.metadata?.task_plan)
+const implicitCastCards = computed(() => task.value?.metadata?.implicit_cast_cards || [])
 const report = computed(() => task.value?.metadata?.quality_report)
 const activeTrial = computed(() => task.value?.metadata?.shoot_review_trial || null)
 const lastTrial = computed(() => task.value?.metadata?.last_shoot_trial || null)
@@ -906,4 +990,12 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .script-review-box { margin-top: 12px; padding: 12px 14px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; }
 .script-review-summary { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; color: #92400e; }
 .blocking-line { margin: 4px 0 6px; padding: 4px 8px; background: #eff6ff; border-left: 3px solid #3b82f6; border-radius: 4px; color: #1e3a8a !important; font-size: 12px !important; }
+.cast-cards-panel { margin-top: 18px; }
+.cast-cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; padding: 0 23px 20px; }
+.cast-card-item { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #f8fafc; }
+.cast-card-item img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #efefef; }
+.cast-card-meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 12px; font-size: 13px; }
+.cast-card-meta small { color: var(--muted); }
+.end-frame-preview { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.end-frame-preview img { width: 48px; height: 28px; object-fit: cover; border-radius: 4px; border: 1px solid #cbd5e1; }
 </style>

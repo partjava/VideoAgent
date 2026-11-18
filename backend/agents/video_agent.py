@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from hashlib import sha256
 from copy import deepcopy
@@ -18,6 +19,8 @@ from models.asset_model import Asset
 from models.task_model import VideoTaskStatus
 from services.generation_contract import (
     AUTO_DIRECTOR_MODE,
+    STORYBOARD_FLOW_MODE,
+    active_provider_duration_bounds,
     continuity_input,
     format_motion_beats,
     needs_video,
@@ -25,6 +28,7 @@ from services.generation_contract import (
     validate_auto_director_scenes,
     validate_motion_beats,
     validate_scene_durations,
+    validate_storyboard_flow_scenes,
     PAIRED_GENERATION_MODE,
     NATIVE_GENERATION_MODE,
     validate_native_scenes,
@@ -338,6 +342,7 @@ class VideoAgent:
             paired = task.get("generation_mode") == PAIRED_GENERATION_MODE
             native = task.get("generation_mode") == NATIVE_GENERATION_MODE
             auto_director = task.get("generation_mode") == AUTO_DIRECTOR_MODE
+            storyboard_flow = task.get("generation_mode") == STORYBOARD_FLOW_MODE
             if paired:
                 validate_paired_scenes(scenes, task.get("duration"))
             elif native:
@@ -349,10 +354,19 @@ class VideoAgent:
                 validate_auto_director_scenes(
                     scenes,
                     target_duration=task.get("duration"),
-                    bounds=provider_duration_bounds(_cfg.video_provider, _cfg.wan_video_model),
+                    bounds=active_provider_duration_bounds(generation_mode=AUTO_DIRECTOR_MODE, cfg=_cfg),
                 )
                 for scene in scenes:
                     validate_motion_beats(scene.get("motion_beats"), int(scene["duration"]), detailed=True, per_second=True)
+            elif storyboard_flow:
+                from config import settings as _cfg
+                validate_storyboard_flow_scenes(
+                    scenes,
+                    target_duration=task.get("duration"),
+                    bounds=active_provider_duration_bounds(generation_mode=STORYBOARD_FLOW_MODE, cfg=_cfg),
+                )
+                for scene in scenes:
+                    validate_motion_beats(scene.get("motion_beats"), int(scene["duration"]), detailed=True, per_second=False)
             else:
                 validate_scene_durations(scenes, task.get("duration"), whole=task.get("generation_mode") == WHOLE_GENERATION_MODE)
             selected = list(enumerate(scenes))
@@ -379,128 +393,185 @@ class VideoAgent:
                 if asset.get("asset_type") == "video_clip":
                     videos.setdefault(asset["scene_id"], asset)
             service = video_service_for_task(task)
-            assets = []
-            previous_tail = None
-            for index, scene in selected:
-                sid = str(scene["scene_id"])
-                key = {"_id": f"{task_id}_{sid}"}
-                image = scene.get("image_path") or images.get(sid, {}).get("path")
-                if not needs_video(scene):
-                    if not image or not resolve_media(image).is_file():
-                        raise ValueError(f"Missing scene image: {sid}")
-                    previous_tail = str(image)
-                    continue
+            sem = getattr(anyio, "Semaphore", asyncio.Semaphore)(3)
+            chains: list[list[tuple[int, dict]]] = []
+            for pair in selected:
+                _, sc = pair
+                if trial_scene_id is None and chains and sc.get("transition_type") == "continue_action":
+                    chains[-1].append(pair)
+                else:
+                    chains.append([pair])
 
-                previous = scenes[index - 1] if index else None
-                if trial_scene_id is not None and scene.get("transition_type") == "continue_action":
-                    if previous and not previous.get("stale_tail"):
-                        if needs_video(previous):
-                            previous_tail = previous.get("last_frame_path") if previous.get("video_path") else None
-                        else:
-                            previous_tail = previous.get("image_path") or images.get(previous["scene_id"], {}).get("path")
-                    if not previous_tail or not resolve_media(previous_tail).is_file():
-                        raise ValueError("这个镜头需要上一镜头的实际尾帧，请先试拍上一镜头")
-                first = continuity_input(scene, previous_tail, image)
-                if not first or not resolve_media(first).is_file():
-                    raise ValueError(f"Missing first frame for scene: {sid}")
-                duration = int(scene["duration"])
-                asset = videos.get(sid)
-                cached_path = asset.get("path") if asset else None
-                first_digest = sha256(resolve_media(first).read_bytes()).hexdigest()
-                prompt, observed = await prepare_motion_prompt(scene, previous, first, first_digest)
-                submitted_prompt, adapted_opts = adapt_video_submission(service, scene, prompt)
-                prompt_options = {**video_prompt_options(service, scene), **adapted_opts}
-                signature = render_signature(service, first_digest, submitted_prompt, duration, ratio, **prompt_options)
-                reusable = asset and asset.get("render_signature") == signature
-                if not cached_path or not resolve_media(cached_path).is_file() or not reusable:
-                    if scene.get("camera_plan") and scene.get("transition_type") != "continue_action" and review_enabled():
-                        saved_check = scene.get("opening_frame_review") or {}
-                        if saved_check.get("digest") != first_digest:
-                            try:
-                                check = await anyio.to_thread.run_sync(review_opening_frame, scene, first)
-                                saved_check = {"digest": first_digest, **check}
-                                await mongodb.update_one(SCENES_COLLECTION, key, {"opening_frame_review": saved_check})
-                            except Exception as exc:
-                                print(f"[VideoAgent] Opening frame review skipped safely for {sid}: {exc}", flush=True)
-                                saved_check = {}
-                        if saved_check.get("verdict") == "blocked":
-                            raise ValueError(f"首帧构图不符合分组运镜计划（{sid}）：{saved_check.get('reason') or '关键接触位置不可见'}")
-                    if observed:
-                        await mongodb.update_one(SCENES_COLLECTION, key, {"observed_handoff": observed})
-                    task_doc = {"task_id": task_id, **(task or {})}
-                    try:
-                        has_pending = getattr(service, "has_pending_render", lambda *a, **kw: False)(
-                            task_id, sid, first, video_prompt=submitted_prompt, duration=duration, ratio=ratio, **prompt_options
-                        ) is True
-                        def _call_video(_sid=sid, _first=first, _prompt=submitted_prompt, _dur=duration, _opts=prompt_options):
-                            return service.generate_video(
-                                task_id=task_id, scene_id=_sid, image_path=_first,
-                                video_prompt=_prompt, duration=_dur, ratio=ratio, **_opts
-                            )
-                        if has_pending:
-                            result = await anyio.to_thread.run_sync(_call_video)
-                        else:
-                            result = await dispatch_generation(task_doc, "video", sid, _call_video)
-                    except Exception as exc:
-                        if trial_scene_id is not None or paired or native or task.get("generation_mode") == WHOLE_GENERATION_MODE or (not isinstance(exc, VideoRenderRejected) and not isinstance(exc.__cause__, VideoRenderRejected)):
-                            raise
-                        await mongodb.update_one(SCENES_COLLECTION, key, {
-                            "video_path": None, "image_path": first, "need_dynamic_video": False,
-                            "status": "static_fallback", "fallback_reason": str(exc),
-                        })
-                        previous_tail = first
+            outcomes: dict[int, dict] = {}
+
+            async def _run_chain(chain: list[tuple[int, dict]]) -> None:
+                previous_tail = None
+                for index, scene in chain:
+                    sid = str(scene["scene_id"])
+                    key = {"_id": f"{task_id}_{sid}"}
+                    image = scene.get("image_path") or images.get(sid, {}).get("path")
+                    if not needs_video(scene):
+                        if not image or not resolve_media(image).is_file():
+                            raise ValueError(f"Missing scene image: {sid}")
+                        previous_tail = str(image)
                         continue
-                    if result.get("status") != "success" or not result.get("asset_path"):
-                        raise RuntimeError(f"Video generation failed for {sid}")
-                    now = datetime.now(UTC)
-                    asset_id = f"asset_{task_id}_{sid}_video_clip"
-                    asset = Asset(asset_id=asset_id, task_id=task_id, scene_id=sid,
-                                  asset_type="video_clip", path=str(result["asset_path"]),
-                                  source=str(result.get("source", "video_provider")), status="success",
-                                  created_at=now, updated_at=now).model_dump()
-                    asset["provider_task_id"] = result.get("provider_task_id")
-                    asset["first_frame_digest"] = first_digest
-                    asset["render_signature"] = signature
-                    asset["submitted_video_prompt"] = submitted_prompt
+
+                    previous = scenes[index - 1] if index else None
+                    if trial_scene_id is not None and scene.get("transition_type") == "continue_action":
+                        if previous and not previous.get("stale_tail"):
+                            if needs_video(previous):
+                                previous_tail = previous.get("last_frame_path") if previous.get("video_path") else None
+                            else:
+                                previous_tail = previous.get("image_path") or images.get(previous["scene_id"], {}).get("path")
+                        if not previous_tail or not resolve_media(previous_tail).is_file():
+                            raise ValueError("这个镜头需要上一镜头的实际尾帧，请先试拍上一镜头")
+                    first = continuity_input(scene, previous_tail, image)
+                    if not first or not resolve_media(first).is_file():
+                        raise ValueError(f"Missing first frame for scene: {sid}")
+                    duration = int(scene["duration"])
+                    asset = videos.get(sid)
+                    cached_path = asset.get("path") if asset else None
+                    first_digest = sha256(resolve_media(first).read_bytes()).hexdigest()
+                    prompt, observed = await prepare_motion_prompt(scene, previous, first, first_digest)
+                    prompt_scene = {**scene, "_is_trial": True} if trial_scene_id is not None else scene
+                    submitted_prompt, adapted_opts = adapt_video_submission(service, prompt_scene, prompt)
+                    prompt_options = {**video_prompt_options(service, prompt_scene), **adapted_opts}
+                    signature = render_signature(service, first_digest, submitted_prompt, duration, ratio, **prompt_options)
+                    reusable = asset and asset.get("render_signature") == signature
+                    asset_needs_replace = False
+                    scene_fields: dict[str, object] = {}
+
+                    if not cached_path or not resolve_media(cached_path).is_file() or not reusable:
+                        if scene.get("camera_plan") and scene.get("transition_type") != "continue_action" and review_enabled():
+                            saved_check = scene.get("opening_frame_review") or {}
+                            if saved_check.get("digest") != first_digest:
+                                try:
+                                    check = await anyio.to_thread.run_sync(review_opening_frame, scene, first)
+                                    saved_check = {"digest": first_digest, **check}
+                                    await mongodb.update_one(SCENES_COLLECTION, key, {"opening_frame_review": saved_check})
+                                except Exception as exc:
+                                    print(f"[VideoAgent] Opening frame review skipped safely for {sid}: {exc}", flush=True)
+                                    saved_check = {}
+                            if saved_check.get("verdict") == "blocked":
+                                raise ValueError(f"首帧构图不符合分组运镜计划（{sid}）：{saved_check.get('reason') or '关键接触位置不可见'}")
+                        if observed:
+                            await mongodb.update_one(SCENES_COLLECTION, key, {"observed_handoff": observed})
+                        task_doc = {"task_id": task_id, **(task or {})}
+                        try:
+                            async with sem:
+                                has_pending = getattr(service, "has_pending_render", lambda *a, **kw: False)(
+                                    task_id, sid, first, video_prompt=submitted_prompt, duration=duration, ratio=ratio, **prompt_options
+                                ) is True
+                                def _call_video(_sid=sid, _first=first, _prompt=submitted_prompt, _dur=duration, _opts=prompt_options):
+                                    return service.generate_video(
+                                        task_id=task_id, scene_id=_sid, image_path=_first,
+                                        video_prompt=_prompt, duration=_dur, ratio=ratio, **_opts
+                                    )
+                                if has_pending:
+                                    result = await anyio.to_thread.run_sync(_call_video)
+                                else:
+                                    result = await dispatch_generation(task_doc, "video", sid, _call_video)
+                        except Exception as exc:
+                            if trial_scene_id is not None or paired or native or task.get("generation_mode") == WHOLE_GENERATION_MODE or (not isinstance(exc, VideoRenderRejected) and not isinstance(exc.__cause__, VideoRenderRejected)):
+                                raise
+                            outcomes[index] = {
+                                "kind": "fallback",
+                                "key": key,
+                                "first": first,
+                                "reason": str(exc),
+                            }
+                            previous_tail = first
+                            continue
+                        if result.get("status") != "success" or not result.get("asset_path"):
+                            raise RuntimeError(f"Video generation failed for {sid}")
+                        now = datetime.now(UTC)
+                        asset_id = f"asset_{task_id}_{sid}_video_clip"
+                        asset = Asset(asset_id=asset_id, task_id=task_id, scene_id=sid,
+                                      asset_type="video_clip", path=str(result["asset_path"]),
+                                      source=str(result.get("source", "video_provider")), status="success",
+                                      created_at=now, updated_at=now).model_dump()
+                        asset["provider_task_id"] = result.get("provider_task_id")
+                        asset["first_frame_digest"] = first_digest
+                        asset["render_signature"] = signature
+                        asset["submitted_video_prompt"] = submitted_prompt
+                        asset_needs_replace = True
+                        scene_fields.update({
+                            "video_path": asset["path"],
+                            "submitted_video_prompt": submitted_prompt,
+                            "continuity_input_path": first,
+                            "need_dynamic_video": True,
+                            "stale_tail": False,
+                            "status": "video_done",
+                            "updated_at": now,
+                        })
+                    else:
+                        if scene.get("stale_tail") or scene.get("video_path") != cached_path or (
+                            scene.get("transition_type") == "continue_action" and scene.get("continuity_input_path") != first
+                        ):
+                            scene_fields.update({
+                                "video_path": cached_path,
+                                "continuity_input_path": first,
+                                "need_dynamic_video": True,
+                                "stale_tail": False,
+                                "status": "video_done",
+                            })
+                        await record_reuse({"task_id": task_id, **(task or {})}, "video", sid)
+
+                    scene["video_path"] = asset["path"]
+                    effective = align_measured_motion(scene)
+                    scene["effective_motion_beats"] = effective.get("motion_beats")
+                    scene["effective_end_state"] = effective.get("end_state")
+                    scene_fields.update({
+                        "effective_motion_beats": effective.get("motion_beats"),
+                        "effective_end_state": effective.get("end_state"),
+                    })
+                    if scene.get("transition_type") == "continue_action":
+                        actual_first = f"backend/assets/{task_id}/frames/{sid}_first.png"
+                        await anyio.to_thread.run_sync(extract_tail, asset["path"], resolve_media(actual_first), 0)
+                        join_review = await anyio.to_thread.run_sync(compare_join_frames, first, actual_first)
+                        scene_fields.update({
+                            "actual_first_frame_path": actual_first,
+                            "join_review": join_review,
+                        })
+
+                    previous_tail = None
+                    if index + 1 < len(scenes) and scenes[index + 1].get("transition_type") == "continue_action":
+                        destination = f"backend/assets/{task_id}/frames/{sid}_tail.png"
+                        await anyio.to_thread.run_sync(extract_tail, asset["path"], resolve_media(destination), duration)
+                        previous_tail = destination
+                        scene_fields["last_frame_path"] = previous_tail
+
+                    outcomes[index] = {
+                        "kind": "ok",
+                        "key": key,
+                        "asset": asset,
+                        "asset_needs_replace": asset_needs_replace,
+                        "scene_fields": scene_fields,
+                    }
+
+            chain_results = await asyncio.gather(*(_run_chain(c) for c in chains), return_exceptions=True)
+
+            assets = []
+            for index in sorted(outcomes):
+                item = outcomes[index]
+                if item["kind"] == "fallback":
+                    await mongodb.update_one(SCENES_COLLECTION, item["key"], {
+                        "video_path": None, "image_path": item["first"], "need_dynamic_video": False,
+                        "status": "static_fallback", "fallback_reason": item["reason"],
+                    })
+                    continue
+                asset = item["asset"]
+                if item["asset_needs_replace"]:
+                    asset_id = str(asset["asset_id"])
                     await mongodb.replace_one(ASSETS_COLLECTION, {"_id": asset_id},
                                               with_document_id(asset, asset_id), upsert=True)
-                    await mongodb.update_one(SCENES_COLLECTION, key, {"video_path": asset["path"],
-                                              "submitted_video_prompt": submitted_prompt,
-                                              "continuity_input_path": first, "need_dynamic_video": True, "stale_tail": False,
-                                              "status": "video_done", "updated_at": now})
-                else:
-                    if scene.get("stale_tail") or scene.get("video_path") != cached_path or (
-                        scene.get("transition_type") == "continue_action" and scene.get("continuity_input_path") != first
-                    ):
-                        await mongodb.update_one(SCENES_COLLECTION, key, {"video_path": cached_path,
-                                                  "continuity_input_path": first,
-                                                  "need_dynamic_video": True, "stale_tail": False, "status": "video_done"})
-                    await record_reuse({"task_id": task_id, **(task or {})}, "video", sid)
-                scene["video_path"] = asset["path"]
-                effective = align_measured_motion(scene)
-                await mongodb.update_one(SCENES_COLLECTION, key, {
-                    "effective_motion_beats": effective.get("motion_beats"),
-                    "effective_end_state": effective.get("end_state"),
-                })
-                scene["effective_motion_beats"] = effective.get("motion_beats")
-                scene["effective_end_state"] = effective.get("end_state")
+                if item["scene_fields"]:
+                    await mongodb.update_one(SCENES_COLLECTION, item["key"], item["scene_fields"])
                 assets.append(asset)
-                if scene.get("transition_type") == "continue_action":
-                    actual_first = f"backend/assets/{task_id}/frames/{sid}_first.png"
-                    await anyio.to_thread.run_sync(extract_tail, asset["path"], resolve_media(actual_first), 0)
-                    join_review = await anyio.to_thread.run_sync(compare_join_frames, first, actual_first)
-                    await mongodb.update_one(SCENES_COLLECTION, key, {
-                        "actual_first_frame_path": actual_first, "join_review": join_review,
-                    })
 
-                # Only decode tails that are required by the next shot. Use the displayed end,
-                # since the editor may trim excess frames returned by the provider.
-                previous_tail = None
-                if index + 1 < len(scenes) and scenes[index + 1].get("transition_type") == "continue_action":
-                    destination = f"backend/assets/{task_id}/frames/{sid}_tail.png"
-                    await anyio.to_thread.run_sync(extract_tail, asset["path"], resolve_media(destination), duration)
-                    previous_tail = destination
-                    await mongodb.update_one(SCENES_COLLECTION, key, {"last_frame_path": previous_tail})
+            for res in chain_results:
+                if isinstance(res, BaseException):
+                    raise res
 
             if trial_scene_id is None:
                 await mark_agent_success(task_id, self.agent_name, progress=92, status=VideoTaskStatus.VIDEO_GENERATING,

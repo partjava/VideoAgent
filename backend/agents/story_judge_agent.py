@@ -14,7 +14,12 @@ from typing import Any
 from config import settings
 from models.script_model import Script, ScriptSegment
 from services.drama_craft_service import ai_review_script, scan_script_metrics
-from services.generation_contract import AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE, provider_duration_bounds
+from services.generation_contract import (
+    AUTO_DIRECTOR_MODE,
+    NATIVE_GENERATION_MODE,
+    STORYBOARD_FLOW_MODE,
+    active_provider_duration_bounds,
+)
 
 
 MIN_PASS_SCORE = 82
@@ -100,14 +105,15 @@ def audit_script_pacing_and_drama(
         dead_tail = max(0.0, dur - v_start - est_speech)
         silence_seconds += min(float(dur), v_start + dead_tail)
 
-        if idx == 1 and v_start > 1.0:
+        allow_silent = str((task_plan or {}).get("generation_mode") or "") == STORYBOARD_FLOW_MODE
+        if idx == 1 and v_start > 1.0 and not (allow_silent and chars == 0):
             flags.append({
                 "rule_id": "SLOW_OPENING",
                 "severity": "high",
                 "diagnosis": f"第 1 段开场等待 {v_start:.1f} 秒才发声，前 3 秒钩子起势偏慢。",
                 "prescription": "开场控制在 0.2~0.5 秒内以冲突台词或摔物证直接破题。",
             })
-        elif v_start >= 1.5:
+        elif v_start >= 1.5 and not (allow_silent and chars == 0):
             flags.append({
                 "rule_id": "EXCESSIVE_SILENCE_GAP",
                 "severity": "medium",
@@ -115,7 +121,7 @@ def audit_script_pacing_and_drama(
                 "prescription": "将起音前移至 0.2~0.6 秒内。",
             })
 
-        if dead_tail > 2.3:
+        if dead_tail > (2.8 if allow_silent else 2.3) and not (allow_silent and chars == 0):
             flags.append({
                 "rule_id": "EXCESSIVE_SILENCE_GAP",
                 "severity": "high" if dead_tail >= 3.2 else "medium",
@@ -126,7 +132,8 @@ def audit_script_pacing_and_drama(
     if segments:
         chars_per_sec = round(total_spoken / max(1, total_dur), 2)
         silence_ratio = round(min(1.0, silence_seconds / max(1, total_dur)), 2)
-        if chars_per_sec < 2.2:
+        is_flow_mode = str((task_plan or {}).get("generation_mode") or "") == STORYBOARD_FLOW_MODE
+        if chars_per_sec < (1.4 if is_flow_mode else 2.2):
             flags.append({
                 "rule_id": "LOW_STORY_DENSITY",
                 "severity": "high",
@@ -258,10 +265,10 @@ class StoryJudgeAgent:
         allow_llm: bool = True,
     ) -> dict[str, Any]:
         mode = str(task.get("generation_mode") or AUTO_DIRECTOR_MODE)
-        min_s, max_s = provider_duration_bounds(getattr(settings, "video_provider", None))
+        min_s, max_s = active_provider_duration_bounds(generation_mode=mode, cfg=settings)
 
         working_script = deepcopy(script_data)
-        if mode in {AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE}:
+        if mode in {AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE, STORYBOARD_FLOW_MODE}:
             working_script["segments"] = normalize_segments_for_mode(
                 working_script.get("segments") or [],
                 mode=mode,
@@ -277,7 +284,7 @@ class StoryJudgeAgent:
 
         should_rewrite = (
             bool(before_review.get("needs_rewrite"))
-            and mode in {AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE}
+            and mode in {AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE, STORYBOARD_FLOW_MODE}
             and allow_llm
             and llm_service is not None
             and hasattr(llm_service, "rewrite_script_with_judgment")

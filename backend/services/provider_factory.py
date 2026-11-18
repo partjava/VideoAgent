@@ -1,7 +1,7 @@
 import os
 
 from config import settings
-from services.model_config import saved_models
+from services.model_config import model_config, saved_models
 from services.image.base import BaseImageService
 from services.llm.base import BaseLLMService
 from services.video.base import BaseVideoService
@@ -39,10 +39,33 @@ def get_image_service() -> BaseImageService:
     raise ValueError(f"Unsupported IMAGE_PROVIDER for real generation: {provider}")
 
 
+def _resolve_video_provider_name(cfg=None) -> str:
+    resolved_cfg = cfg if cfg is not None else settings
+    provider = _runtime_provider("VIDEO_PROVIDER", getattr(resolved_cfg, "video_provider", "wan"))
+    if (cfg is None or cfg is settings) and provider != "comfyui" and "video" in saved_models():
+        return "wan"
+    return provider
+
+
+def active_video_provider_and_model(cfg=None) -> tuple[str, str]:
+    """返回当前真实生效的视频服务商和模型名（感知 .env.models.local 与环境变量，同时保留测试 patch）。"""
+    resolved_cfg = cfg if cfg is not None else settings
+    provider = _resolve_video_provider_name(resolved_cfg)
+    if provider == "wan":
+        try:
+            model = str(model_config("video", resolved_cfg).get("model") or getattr(resolved_cfg, "wan_video_model", "") or "")
+        except Exception:
+            model = str(getattr(resolved_cfg, "wan_video_model", "") or "")
+        return provider, model
+    if provider == "vidu":
+        return provider, str(getattr(resolved_cfg, "vidu_model", "") or "")
+    if provider == "doubao":
+        return provider, str(getattr(resolved_cfg, "volcengine_model", "") or "")
+    return provider, ""
+
+
 def get_video_service() -> BaseVideoService:
-    provider = _runtime_provider("VIDEO_PROVIDER", settings.video_provider)
-    if provider != "comfyui" and "video" in saved_models():
-        provider = "wan"
+    provider = _resolve_video_provider_name(settings)
     if provider == "vidu":
         from services.video.vidu_video_service import ViduVideoService
 

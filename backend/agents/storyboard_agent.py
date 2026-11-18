@@ -15,12 +15,14 @@ from services.generation_contract import (
     AUTO_DIRECTOR_MODE,
     NATIVE_GENERATION_MODE,
     PAIRED_GENERATION_MODE,
+    STORYBOARD_FLOW_MODE,
+    active_provider_duration_bounds,
     build_timeline,
-    provider_duration_bounds,
     validate_auto_director_scenes,
     validate_native_scenes,
     validate_paired_scenes,
     validate_scene_durations,
+    validate_storyboard_flow_scenes,
     voice_window,
     scene_event_offset,
 )
@@ -57,11 +59,12 @@ def validate_storyboard_scenes(
     target_duration: int | None = None,
     enforce_voiceover_density: bool = True,
     whole: bool = False,
+    allow_silent: bool = False,
 ) -> None:
     if not scenes:
         raise ValueError("Storyboard is empty")
 
-    validate_scene_durations(scenes, target_duration, whole=whole)
+    validate_scene_durations(scenes, target_duration, whole=whole, min_duration=3 if allow_silent else 4)
     build_timeline(scenes)
     if [int(scene.get("scene_index", 0)) for scene in scenes] != list(range(1, len(scenes) + 1)):
         raise ValueError("Storyboard indexes must be consecutive from 1")
@@ -86,9 +89,9 @@ def validate_storyboard_scenes(
         for cue in scene.get("sound_cues") or []:
             scene_event_offset(scene, cue["start"])
         duration = int(scene.get("duration") or 0)
-        if len(voiceover) < 2:
+        if len(voiceover) < 2 and not allow_silent:
             raise ValueError(f"Storyboard voiceover is too short: {scene_id}")
-        if enforce_voiceover_density and not scene.get("voiceover_repaired"):
+        if enforce_voiceover_density and not scene.get("voiceover_repaired") and (voiceover or not allow_silent):
             count = _spoken_char_count(voiceover)
             min_voiceover_chars = _minimum_voiceover_chars(float(duration))
             max_voiceover_chars = _maximum_voiceover_chars(float(duration))
@@ -124,6 +127,7 @@ class StoryboardAgent:
             # 检查分镜是否已生成；若存在并发或历史残余导致的重复 scene_index，先去重或清理重建
             scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
             existing_scenes = [scene for scene in scenes]
+            _is_flow = task.get("generation_mode") == STORYBOARD_FLOW_MODE
             if existing_scenes:
                 deduped = await deduplicate_scenes_by_index(existing_scenes, mongodb, SCENES_COLLECTION)
                 for scene in deduped:
@@ -134,6 +138,7 @@ class StoryboardAgent:
                         target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
                         enforce_voiceover_density=False,
                         whole=task.get("generation_mode") == "wan3_whole",
+                        allow_silent=_is_flow,
                     )
                     await mark_agent_success(
                         task_id,
@@ -190,8 +195,9 @@ class StoryboardAgent:
                             voice_start=lines[0]["start"] if lines else segment["voice_start"],
                             dialogue_lines=lines,
                         )
-                elif _generation_mode == AUTO_DIRECTOR_MODE:
-                    min_s, max_s = provider_duration_bounds(settings.video_provider)
+                elif _generation_mode in {AUTO_DIRECTOR_MODE, STORYBOARD_FLOW_MODE}:
+                    min_s, max_s = active_provider_duration_bounds(generation_mode=_generation_mode, cfg=settings)
+                    default_dur = 4 if _generation_mode == STORYBOARD_FLOW_MODE else 8
                     draft.sort(key=lambda scene: int(scene.get("scene_index") or 1))
                     for idx, scene in enumerate(draft):
                         scene["scene_index"] = idx + 1
@@ -200,7 +206,7 @@ class StoryboardAgent:
                             scene["transition_type"] = "cut"
                         if segments and idx < len(segments):
                             segment = segments[idx]
-                            seg_dur = max(min_s, min(max_s, int(segment.get("duration") or scene.get("duration") or 8)))
+                            seg_dur = max(min_s, min(max_s, int(segment.get("duration") or scene.get("duration") or default_dur)))
                             lines = segment.get("dialogue_lines") or []
                             voiceover = "\n".join(line["text"] for line in lines) if lines else segment.get("voiceover", "")
                             if voiceover:
@@ -213,8 +219,11 @@ class StoryboardAgent:
                                 )
                             else:
                                 scene["duration"] = seg_dur
+                                if _generation_mode == STORYBOARD_FLOW_MODE and segment.get("voiceover") == "":
+                                    scene["voiceover"] = ""
+                                    scene["subtitle"] = ""
                         else:
-                            scene["duration"] = max(min_s, min(max_s, int(scene.get("duration") or 8)))
+                            scene["duration"] = max(min_s, min(max_s, int(scene.get("duration") or default_dur)))
                     if not task.get("duration_locked"):
                         resolved_duration = sum(int(s["duration"]) for s in draft)
                         await task_service.update_task_fields(
@@ -226,6 +235,7 @@ class StoryboardAgent:
                     target_duration=resolved_duration,
                     enforce_voiceover_density=False,
                     whole=_generation_mode == "wan3_whole",
+                    allow_silent=_generation_mode == STORYBOARD_FLOW_MODE,
                 )
                 if _generation_mode == PAIRED_GENERATION_MODE:
                     validate_paired_scenes(draft, resolved_duration)
@@ -233,7 +243,13 @@ class StoryboardAgent:
                     validate_native_scenes(draft, resolved_duration)
                 elif _generation_mode == AUTO_DIRECTOR_MODE:
                     validate_auto_director_scenes(
-                        draft, target_duration=resolved_duration, bounds=provider_duration_bounds(settings.video_provider)
+                        draft, target_duration=resolved_duration, bounds=active_provider_duration_bounds(generation_mode=AUTO_DIRECTOR_MODE, cfg=settings)
+                    )
+                elif _generation_mode == STORYBOARD_FLOW_MODE:
+                    validate_storyboard_flow_scenes(
+                        draft,
+                        target_duration=resolved_duration,
+                        bounds=active_provider_duration_bounds(generation_mode=STORYBOARD_FLOW_MODE, cfg=settings),
                     )
                 return draft, resolved_duration
 

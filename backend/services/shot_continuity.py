@@ -125,6 +125,15 @@ def adapt_video_submission(service: Any, scene: dict[str, Any], prompt: str) -> 
     if dialect == "vidu" and getattr(service, "supports_movement_amplitude", False) is True:
         extra_options["movement_amplitude"] = resolve_vidu_movement_amplitude(scene)
 
+    if dialect == "vidu" and getattr(service, "supports_resolution", False) is True:
+        from config import settings as _cfg
+        if scene.get("vidu_resolution"):
+            extra_options["resolution"] = str(scene["vidu_resolution"])
+        elif scene.get("_is_trial"):
+            extra_options["resolution"] = str(getattr(_cfg, "vidu_trial_resolution", "720p") or "720p")
+        else:
+            extra_options["resolution"] = str(getattr(_cfg, "vidu_resolution", "1080p") or "1080p")
+
     last_frame = scene.get("last_frame_target_path")
     if (
         isinstance(last_frame, str)
@@ -405,6 +414,55 @@ def plan_shot_color_match(
     return plan
 
 
+def select_bgm_file(
+    task: dict[str, Any] | None,
+    scenes: Sequence[dict[str, Any]],
+    bgm_dir: Path,
+) -> str | None:
+    """按任务设定或剧情关键词挑选最贴合情绪基调的 BGM 文件，支持 none 静音与显式 bgm_path。"""
+    explicit = str((task or {}).get("bgm_path") or "").strip()
+    if explicit and Path(explicit).is_file():
+        return explicit
+
+    preset = str((task or {}).get("bgm_preset") or "auto").strip().lower()
+    if preset == "none":
+        return None
+    if not bgm_dir.exists():
+        return None
+    candidates = sorted(list(bgm_dir.glob("*.mp3")) + list(bgm_dir.glob("*.wav")))
+    if not candidates:
+        return None
+
+    def _find(substr: str) -> str | None:
+        for path in candidates:
+            if substr in path.name.lower():
+                return str(path)
+        return None
+
+    if preset == "warm_campus":
+        return _find("warm") or str(candidates[0])
+    if preset == "heroic":
+        return _find("heroic") or str(candidates[0])
+    if preset == "suspense":
+        return _find("suspense") or str(candidates[0])
+
+    # auto：结合用户输入、主题与前几镜剧情判定情绪底色
+    text_pool = " ".join([
+        str((task or {}).get("user_input") or ""),
+        str((task or {}).get("topic") or ""),
+        str((task or {}).get("style") or ""),
+        " ".join(str(s.get("visual_description") or "") for s in list(scenes)[:6]),
+        " ".join(str(s.get("voiceover") or "") for s in list(scenes)[:6]),
+    ])
+    heroic_kw = ("革命", "暴动", "英雄", "烈士", "方志敏", "军", "起义", "热血", "史诗", "抗争", "红色")
+    warm_kw = ("校园", "早恋", "青春", "暗恋", "初恋", "教室", "晚自习", "虐恋", "地铁", "温暖", "成长", "告别")
+    if any(k in text_pool for k in heroic_kw):
+        return _find("heroic") or str(candidates[0])
+    if any(k in text_pool for k in warm_kw):
+        return _find("warm") or str(candidates[0])
+    return _find("suspense") or str(candidates[0])
+
+
 def apply_color_match_to_clip(clip: Any, match: ShotColorMatch) -> Any:
     """用预计算 uint8 LUT 快速统一帧色调与亮度。"""
     lut = match.build_uint8_lut()
@@ -437,6 +495,12 @@ def _scale_luma_frame(frame: np.ndarray, ratio: float, min_factor: float) -> np.
     return np.clip(frame.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
 
+def _flash_white_frame(frame: np.ndarray, ratio: float) -> np.ndarray:
+    arr = frame.astype(np.float32)
+    alpha = min(0.9, max(0.0, ratio * 0.9))
+    return np.clip(arr + (255.0 - arr) * alpha, 0, 255).astype(np.uint8)
+
+
 def _apply_edge_transition(clip: Any, *, edge: str, width: float, fn: Callable[[np.ndarray, float], np.ndarray]) -> Any:
     dur = float(getattr(clip, "duration", 0.0) or 0.0)
     if edge == "tail":
@@ -460,7 +524,19 @@ def apply_cut_transitions(clips: list[Any], scenes: Sequence[dict[str, Any]]) ->
         if out_dur < 0.8 or in_dur < 0.8:
             continue
 
-        if ttype == "scene_change":
+        transition_hint = " ".join(
+            str(x or "")
+            for x in (
+                scenes[idx - 1].get("transition_note"),
+                scenes[idx - 1].get("visual_description"),
+                next_scene.get("transition_note"),
+                next_scene.get("visual_description"),
+                tmode,
+            )
+        )
+        if tmode == "flash_white" or (ttype == "scene_change" and any(k in transition_hint for k in ("闪白", "入梦", "梦醒"))):
+            mode, width, fn = "flash_white", 0.24, _flash_white_frame
+        elif ttype == "scene_change":
             mode, width, fn = "scene_fade", 0.22, lambda frame, r: _scale_luma_frame(frame, r, 0.18)
         elif tmode == "whip_morph":
             mode, width, fn = "whip_morph", 0.16, _apply_whip_blur_frame

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 from models.task_model import VideoTaskStatus
 from models.asset_model import Asset
@@ -11,6 +12,7 @@ from services.shot_continuity import (
     measure_clip_rgb_stats,
     measure_loudnorm_filter,
     plan_shot_color_match,
+    select_bgm_file,
     wrap_ducked_bgm,
 )
 
@@ -227,25 +229,33 @@ class EditorAgent:
 
                 final_video = concatenate_videoclips(clips, method="compose")
                 resources.callback(final_video.close)
+                bgm_file = select_bgm_file(task, task_scenes, backend_dir / "data" / "bgm")
+                if bgm_file and Path(bgm_file).is_file():
+                    # BGM 自动铺底与人声动态闪避（即使全片纯静默无台词也保留轻氛围 BGM 兜底）
+                    from moviepy.audio.fx.all import audio_loop
+                    bgm = resources.enter_context(AudioFileClip(str(bgm_file)))
+                    bgm = audio_loop(bgm, duration=timeline[-1]["end"])
+                    bgm_vol = 0.14 if not speech_windows else 0.17
+                    bgm = wrap_ducked_bgm(bgm, speech_windows, base_volume=bgm_vol, duck_volume=0.075)
+                    audio_segments.insert(0, bgm.set_start(0))
                 if audio_segments:
-                    # BGM 自动铺底与人声动态闪避（对白期平滑压低，空白/转场回升）
-                    bgm_dir = backend_dir / "data" / "bgm"
-                    bgm_candidates = sorted(list(bgm_dir.glob("*.mp3")) + list(bgm_dir.glob("*.wav"))) if bgm_dir.exists() else []
-                    bgm_file = task.get("bgm_path") or (str(bgm_candidates[0]) if bgm_candidates else None)
-                    if bgm_file and Path(bgm_file).is_file():
-                        from moviepy.audio.fx.all import audio_loop
-                        bgm = resources.enter_context(AudioFileClip(str(bgm_file)))
-                        bgm = audio_loop(bgm, duration=timeline[-1]["end"])
-                        bgm = wrap_ducked_bgm(bgm, speech_windows, base_volume=0.17, duck_volume=0.075)
-                        audio_segments.insert(0, bgm.set_start(0))
                     final_audio = CompositeAudioClip(audio_segments).set_duration(timeline[-1]["end"])
                     resources.callback(final_audio.close)
                     final_video = final_video.set_audio(final_audio)
                 output_file.parent.mkdir(parents=True, exist_ok=True)
                 # Separate render from published final to avoid stale-file success.
                 raw_file = output_file.with_name("render.mp4")
-                final_video.write_videofile(str(raw_file), fps=24, codec="libx264", audio_codec="aac",
-                                            temp_audiofile=str(output_file.with_name("render_audio.m4a")), logger=None)
+                encode_threads = max(2, min(8, os.cpu_count() or 4))
+                final_video.write_videofile(
+                    str(raw_file),
+                    fps=24,
+                    codec="libx264",
+                    audio_codec="aac",
+                    preset="faster",
+                    threads=encode_threads,
+                    temp_audiofile=str(output_file.with_name("render_audio.m4a")),
+                    logger=None,
+                )
                 subtitle_file = output_file.with_name("subtitle.srt")
                 if not subtitle_file.is_file():
                     raise FileNotFoundError("Subtitle file missing")
@@ -256,7 +266,8 @@ class EditorAgent:
                     subtitle_style = "Alignment=2,FontSize=15,MarginV=34,MarginL=14,MarginR=14,BorderStyle=1,Outline=1.6,Shadow=0.6"
                 else:
                     subtitle_style = "Alignment=2,FontSize=16,MarginV=20,MarginL=16,MarginR=16,BorderStyle=1,Outline=1.8,Shadow=0.5"
-                filters = [f"subtitles=subtitle.srt:force_style='{subtitle_style}'"]
+                has_subtitles = bool(subtitle_file.read_text(encoding="utf-8").strip())
+                filters = [f"subtitles=subtitle.srt:force_style='{subtitle_style}'"] if has_subtitles else []
                 title = " ".join((task.get("intro_title") or "").split())
                 title = title.translate(str.maketrans("", "", "{}<>\\")).strip()
                 title_end = min(3.8, timeline[-1]["end"])
@@ -270,15 +281,22 @@ class EditorAgent:
                     )
                 ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
                 loudnorm_filter = measure_loudnorm_filter(ffmpeg_exe, raw_file) if audio_segments else None
-                cmd = [ffmpeg_exe, "-y", "-i", raw_file.name, "-vf", ",".join(filters)]
-                if loudnorm_filter:
-                    cmd += ["-af", loudnorm_filter, "-c:a", "aac", "-b:a", "192k"]
+                if filters or loudnorm_filter:
+                    cmd = [ffmpeg_exe, "-y", "-i", raw_file.name]
+                    if filters:
+                        cmd += ["-vf", ",".join(filters)]
+                    else:
+                        cmd += ["-c:v", "copy"]
+                    if loudnorm_filter:
+                        cmd += ["-af", loudnorm_filter, "-c:a", "aac", "-b:a", "192k"]
+                    else:
+                        cmd += ["-c:a", "copy"]
+                    cmd.append(staged.name)
+                    result = subprocess.run(cmd, cwd=str(output_file.parent), capture_output=True, timeout=180)
+                    if result.returncode:
+                        raise RuntimeError(f"Subtitle burn failed: {result.stderr.decode(errors='replace')[-1000:]}")
                 else:
-                    cmd += ["-c:a", "copy"]
-                cmd.append(staged.name)
-                result = subprocess.run(cmd, cwd=str(output_file.parent), capture_output=True, timeout=180)
-                if result.returncode:
-                    raise RuntimeError(f"Subtitle burn failed: {result.stderr.decode(errors='replace')[-1000:]}")
+                    raw_file.replace(staged)
                 from services.media_quality import extract_tail
                 extract_tail(staged, output_file.with_name("cover.png"), min(1, timeline[-1]["end"]))
                 staged.replace(output_file)

@@ -478,7 +478,8 @@ const handleRerunScene = async (scene, type) => {
 
 const getModeText = (mode) => {
   const modes = {
-    auto_director: 'AI 自主导演（弹性 4–12s）',
+    auto_director: 'AI 自主导演（逐秒 4–12s）',
+    storyboard_flow: '剧组单元自由流（不逐秒）',
     key_scenes: '关键镜头动态 (推荐)',
     full_dynamic: '全动态视频 (精美)',
     native_10s: '原生 10 秒动态镜头',

@@ -7,7 +7,12 @@ from core.database import mongodb
 from models.script_model import Script
 from models.task_model import VideoTaskStatus
 from agents.story_judge_agent import StoryJudgeAgent, normalize_segments_for_mode
-from services.generation_contract import AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE, provider_duration_bounds
+from services.generation_contract import (
+    AUTO_DIRECTOR_MODE,
+    NATIVE_GENERATION_MODE,
+    STORYBOARD_FLOW_MODE,
+    active_provider_duration_bounds,
+)
 from services.provider_factory import get_llm_service
 from services.task_service import task_service
 
@@ -65,7 +70,7 @@ class ScriptAgent:
                 lambda _plan=task_plan: llm_service.generate_script(_plan)
             )
             mode = str(task.get("generation_mode") or AUTO_DIRECTOR_MODE)
-            min_s, max_s = provider_duration_bounds(getattr(settings, "video_provider", None))
+            min_s, max_s = active_provider_duration_bounds(generation_mode=mode, cfg=settings)
 
             # 情节审判官 + 自动打回重写精修（仅在配置启用且非兼容旧测试空段落时生效）
             judge_bundle = await anyio.to_thread.run_sync(
@@ -83,7 +88,7 @@ class ScriptAgent:
                 mode=mode,
                 min_sec=min_s,
                 max_sec=max_s,
-            ) if mode in {AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE} else (script_data.get("segments") or [])
+            ) if mode in {AUTO_DIRECTOR_MODE, NATIVE_GENERATION_MODE, STORYBOARD_FLOW_MODE} else (script_data.get("segments") or [])
 
             now = datetime.now(UTC)
             script = Script(
@@ -105,7 +110,7 @@ class ScriptAgent:
                 or sum(segment.duration for segment in script.segments) != task.get("duration")
             ):
                 raise ValueError("原生10秒模式要求每段严格为10秒且总时长等于任务时长")
-            if mode == AUTO_DIRECTOR_MODE and script.segments:
+            if mode in {AUTO_DIRECTOR_MODE, STORYBOARD_FLOW_MODE} and script.segments:
                 total_seg_dur = sum(seg.duration for seg in script.segments)
                 if not task.get("duration_locked"):
                     await task_service.update_task_fields(

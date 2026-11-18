@@ -165,6 +165,10 @@ def estimate_generation(duration, mode=None, episodes=1):
     elif mode == 'auto_director':
         clips = max(2, round(duration / 9))
         images = videos = clips
+    elif mode == 'storyboard_flow':
+        clips = max(2, round(duration / 4))
+        images = clips + 2
+        videos = clips
     else:
         images = videos = ceil(duration / 10)
     return {'images': images * episodes, 'videos': videos * episodes, 'total': (images + videos) * episodes}

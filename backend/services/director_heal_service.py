@@ -21,6 +21,7 @@ from core.database import mongodb
 from models.asset_model import Asset
 from services.drama_craft_service import sanitize_video_prompt_mcsla
 from services.generation_contract import (
+    STORYBOARD_FLOW_MODE,
     build_timeline,
     continuity_input,
     needs_video,
@@ -114,12 +115,15 @@ def plan_scene_self_heal(
     *,
     allow_llm: bool = True,
     llm_service: Any = None,
+    generation_mode: str | None = None,
 ) -> dict[str, Any]:
     """生成针对病灶的自愈改写方案；若模型不可用则回退确定性稳态增强。"""
     duration = int(scene.get("duration") or 5)
     healed = deepcopy(scene)
     rewrite_source = "deterministic_fallback"
     heal_summary = "；".join(diagnosis_reasons[:2])
+    mode = str(generation_mode or scene.get("generation_mode") or "")
+    per_second = mode != STORYBOARD_FLOW_MODE
 
     if allow_llm and (llm_service is not None or settings.enable_paid_api):
         try:
@@ -128,7 +132,7 @@ def plan_scene_self_heal(
                 candidate = svc.doctor_scene_prompt(scene, diagnosis_reasons)
                 if isinstance(candidate, dict):
                     beats = candidate.get("motion_beats")
-                    validate_motion_beats(beats, duration, detailed=True, per_second=True)
+                    validate_motion_beats(beats, duration, detailed=True, per_second=per_second)
                     vp = str(candidate.get("video_prompt") or "").strip()
                     if vp:
                         healed["video_prompt"] = vp
@@ -232,8 +236,8 @@ async def execute_director_self_heal(
             continue
 
         patch_plan = await anyio.to_thread.run_sync(
-            lambda sc=scene, rs=cand["reasons"]: plan_scene_self_heal(
-                sc, rs, allow_llm=True, llm_service=llm_service
+            lambda sc=scene, rs=cand["reasons"], _gm=task.get("generation_mode"): plan_scene_self_heal(
+                sc, rs, allow_llm=True, llm_service=llm_service, generation_mode=_gm
             )
         )
         patched_scene = {**scene, **patch_plan, "style": task.get("style")}

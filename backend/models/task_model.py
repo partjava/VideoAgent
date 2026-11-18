@@ -32,6 +32,7 @@ class VideoTask(BaseModel):
     ratio: str | None = Field(default="9:16", description="Video aspect ratio")
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
+    bgm_preset: str = "auto"
     generation_mode: str = Field(default="auto_director", description="Video generation mode")
     pre_shoot_review: bool = False
     auto_heal: bool = True
@@ -55,7 +56,8 @@ class CreateVideoTaskRequest(BaseModel):
     ratio: str = "9:16"
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
-    generation_mode: Literal["auto_director", "native_10s", "full_dynamic", "paired_5s", "key_scenes"] = "auto_director"
+    bgm_preset: Literal["auto", "suspense", "warm_campus", "heroic", "none"] = "auto"
+    generation_mode: Literal["auto_director", "storyboard_flow", "native_10s", "full_dynamic", "paired_5s", "key_scenes"] = "auto_director"
     pre_shoot_review: bool = False
     auto_heal: bool = True
     max_heal_attempts: int = Field(default=2, ge=0, le=3)
@@ -78,7 +80,7 @@ class VideoTaskProgressResponse(BaseModel):
 
 
 class RerunSceneRequest(BaseModel):
-    rerun_type: str = "voice"  # "voice" | "image" | "video" | "all"
+    rerun_type: str = "voice"  # "voice" | "image" | "end_frame" | "video" | "all"
     voiceover: str | None = None
     speaker: str | None = None
     prompt: str | None = None

@@ -328,22 +328,34 @@ class DeepSeekService(BaseLLMService):
                 "你是爆款短视频金牌导演与创意总监。你的任务是把用户的一句话需求转化为极具戏剧张力、"
                 "充满反差感、节奏紧凑、绝不枯燥乏味的视频方案。坚决拒绝平铺直叙和平庸AI流水账。必须输出严格 JSON。"
             )
-            mode_guidance = (
-                "当前为全自主导演（auto_director）模式：严禁套用『每段必须10秒』『固定3段』机械模板！"
-                "未锁定总时长时，按内容密度自主决定最合理的总时长（12–75秒均可）与节拍数（2–8个节拍均可）："
-                "主力剧情/对峙/连贯戏每段 8–12 秒减少切缝，开场钩子/惊愕特写/反转点可用 4–7 秒紧凑切镜。"
-                if generation_mode == "auto_director"
-                else (
-                    "若生成模式为 native_10s，自动时长选 10 的整数倍，未指定则 30 秒。"
-                    if generation_mode == "native_10s"
-                    else f"生成模式：{generation_mode}"
+            if generation_mode == "auto_director":
+                mode_guidance = (
+                    "当前为全自主导演（auto_director）模式：严禁套用『每段必须10秒』『固定3段』机械模板！"
+                    "未锁定总时长时，按内容密度自主决定最合理的总时长（12–75秒均可）与节拍数（2–8个节拍均可）："
+                    "主力剧情/对峙/连贯戏每段 8–12 秒减少切缝，开场钩子/惊愕特写/反转点可用 4–7 秒紧凑切镜。"
                 )
-            )
-            beats_guidance = (
-                "plot_beats: 数组，每个包含 beat_name, description, suggested_duration（整数秒，推荐主力戏8-12秒、快切反应/钩子4-7秒）。根据叙事自然拆分 2–8 个节拍，不必凑3段。"
-                if generation_mode == "auto_director"
-                else "plot_beats: 数组，每个包含 beat_name 和 description。native_10s 模式先确定最终 duration（用户指定时以指定值为准），然后输出恰好 duration / 10 个节拍，每个节拍对应一个10秒段落的核心事件。其他模式输出3–5个节拍。"
-            )
+                beats_guidance = (
+                    "plot_beats: 数组，每个包含 beat_name, description, suggested_duration（整数秒，推荐主力戏8-12秒、快切反应/钩子4-7秒）。根据叙事自然拆分 2–8 个节拍，不必凑3段。"
+                )
+            elif generation_mode == "storyboard_flow":
+                mode_guidance = (
+                    "当前为剧组单元自由流（storyboard_flow · 不逐秒卡拍）模式："
+                    "如果用户已给出分段/分单元/多镜头剧本模板，必须完整保留用户的全部单元剧情、角色跨时空换装、光影色调阶段变化与每镜景别节奏（不得擅自删减合并成3段）！"
+                    "如果用户只给了一句话梗概且未锁定总时长，按每 15 秒一个情感单元拆分 2–6 个单元（总时长 30–90 秒整数，每镜 3–6 秒）。"
+                )
+                beats_guidance = (
+                    "plot_beats: 数组，每个节拍包含 beat_name, description, suggested_duration（整数秒 3–8 秒），"
+                    "若原输入包含多单元分镜则逐条忠实保留所有单元与核心镜头节点（最多可输出 24 个节拍），否则拆出 6–16 个景别交替的影视镜头节拍。"
+                )
+            elif generation_mode == "native_10s":
+                mode_guidance = "若生成模式为 native_10s，自动时长选 10 的整数倍，未指定则 30 秒。"
+                beats_guidance = (
+                    "plot_beats: 数组，每个包含 beat_name 和 description。native_10s 模式先确定最终 duration（用户指定时以指定值为准），"
+                    "然后输出恰好 duration / 10 个节拍，每个节拍对应一个10秒段落的核心事件。"
+                )
+            else:
+                mode_guidance = f"生成模式：{generation_mode}"
+                beats_guidance = "plot_beats: 数组，每个包含 beat_name 和 description，输出3–5个节拍。"
             user_prompt = f"""\
 用户原始需求：{user_input}
 目标时长：{str(duration) + " 秒（固定）" if duration is not None else "从原句提取；未指定则由导演按内容张力自主决定（12-75秒）"}
@@ -399,8 +411,9 @@ class DeepSeekService(BaseLLMService):
             result["source"] = "deepseek"
             result["user_input"] = user_input
             planned_duration = result.get("duration")
+            max_auto_dur = 120 if generation_mode == "storyboard_flow" else 90
             result["duration"] = duration if duration is not None else (
-                planned_duration if type(planned_duration) is int and 4 <= planned_duration <= 90 else 30
+                planned_duration if type(planned_duration) is int and 4 <= planned_duration <= max_auto_dur else 30
             )
             if generation_mode in ("paired_5s", "native_10s"):
                 if duration is not None and (duration < 10 or duration % 10):
@@ -460,6 +473,15 @@ class DeepSeekService(BaseLLMService):
                     "多人对白填写 speaker、text、start（0 ≤ start < duration）以及可选 emotion（从 mocking / angry / cold_threat / shocked / urgent / calm 选择以驱动配音语调剧烈起伏）。"
                     "voice_start 等于第一句时间。旁白段 dialogue_lines 为空。content 展示同一份完整分段剧本。"
                 )
+            elif mode == "storyboard_flow":
+                segment_rules = (
+                    "当前为剧组单元自由流（storyboard_flow · 不逐秒卡拍）模式：输出 segments 结构化段落数组，"
+                    "若项目方案/原始需求中已有明确分镜或15秒单元节奏，务必按其镜头粒度拆出 6–24 段（每段 3–8 秒整数，优先 3–5 秒换镜，合计贴合总时长）。"
+                    "每段填写 plot、duration（整数 3–10 秒）、voice_start、voiceover、dialogue_lines；"
+                    "多人对白填写 speaker、text、start（0 ≤ start < duration）以及可选 emotion（mocking / angry / cold_threat / shocked / urgent / calm）；"
+                    "允许纯视觉情绪留白/转场镜（如闭眼入梦、无声对视落泪等）将 dialogue_lines 设为空数组且 voiceover 留空字符串 \"\"；"
+                    "content 展示完整分段剧本。"
+                )
             else:
                 segment_rules = "segments 返回空数组，在 content 中编写完整画面和对应台词。"
             system_prompt = (
@@ -503,7 +525,7 @@ class DeepSeekService(BaseLLMService):
 """
             result = self._call_api(system_prompt, user_prompt, max_tokens=3600)
             result["source"] = "deepseek"
-            if mode not in {"native_10s", "auto_director"}:
+            if mode not in {"native_10s", "auto_director", "storyboard_flow"}:
                 result["segments"] = []
             return result
         except Exception as e:
@@ -518,11 +540,12 @@ class DeepSeekService(BaseLLMService):
         """根据情节审稿与节奏诊断，结构化重写爆款短剧剧本与 segments。"""
         mode = str(task_plan.get("generation_mode") or "auto_director")
         target_duration = int(task_plan.get("duration") or 48)
-        seg_constraint = (
-            f"保持 segments 总段数与每段 duration 严格为 10 秒（共 {max(1, target_duration // 10)} 段）。"
-            if mode == "native_10s"
-            else "segments 数量 4–7 段、每段整数 4–12 秒（总时长贴近剧情需要且节奏紧凑，40–65 秒优先）。"
-        )
+        if mode == "native_10s":
+            seg_constraint = f"保持 segments 总段数与每段 duration 严格为 10 秒（共 {max(1, target_duration // 10)} 段）。"
+        elif mode == "storyboard_flow":
+            seg_constraint = "segments 数量 4–24 段、每段整数 3–10 秒（主节奏 3–5 秒快切，允许极少数无台词纯情绪凝视留白段）。"
+        else:
+            seg_constraint = "segments 数量 4–7 段、每段整数 4–12 秒（总时长贴近剧情需要且节奏紧凑，40–65 秒优先）。"
         system_prompt = (
             "你是金牌爆款短剧总编剧兼剧本医生。你刚刚审完一份节奏拖沓、缺乏筹码升级、对白过于稀碎或存在无声干瞪眼的初稿。"
             "请你保留原有核心设定与角色姓名，彻底重构写出一版高张力、无废话、密集攻防、反转精准落底的结构化剧本。"
@@ -579,6 +602,14 @@ class DeepSeekService(BaseLLMService):
                     "如果剧本含 segments，一个段落严格对应一个分镜并保持其规划好的 duration、对白与时间；"
                     "若无 segments，自由按内容节拍拆镜（不限定段数，主力对话与连贯动作 8–12 秒减少切缝，强钩子与面部反应特写 4–7 秒），单镜整数 4–12 秒。"
                     "由导演按画面因果自主挑选 transition_type（cut 换机位 / continue_action 连续动作接力 / scene_change 换场）。"
+                ),
+                "storyboard_flow": (
+                    "剧组单元自由流（storyboard_flow · 不逐秒卡拍）：所有分镜 need_dynamic_video 都设为 true。"
+                    "如果剧本含 segments，一个段落对应一个分镜（小数时长向上或向近取整数 3–10 秒，合计严格等于目标时长）；"
+                    "按 15 秒情感单元拆成 3–4 个镜号（每镜 3–6 秒为主），且**相邻两镜强制交替不同景别（全景/中景/中近景/近景/特写/过肩）与不同拍摄视角**，严禁连续固定同构图；"
+                    "允许不同单元切换阶段光影色调（如暖金课堂 → 低饱和灰褐 → 火把橙红 → 暖金结尾）与人物时代服装；"
+                    "如遇跨时空闪白/入梦/梦醒切场，请设 transition_type='scene_change' 并在 transition_note 写明'闪白转场'；"
+                    "纯无声情绪镜头可将 voiceover 设为空字符串 \"\" 并填好 sound_cues 氛围音效。"
                 ),
                 "native_10s": "每个故事段落恰好一条10秒动态视频。分镜数量严格等于总时长除以10。所有 duration=10、need_dynamic_video=true、transition_type=cut。每段用独立首帧，一次生成完整事件。旁白按该10秒段落编写，中间不断句重启。",
                 "full_dynamic": "所有分镜 need_dynamic_video 都设为 true。",
@@ -737,6 +768,7 @@ class DeepSeekService(BaseLLMService):
         ratio: str = "9:16",
         style: str | None = None,
         visual_bible: dict[str, Any] | None = None,
+        per_second: bool = True,
     ) -> list[dict[str, Any]]:
         try:
             resolved_style = style if style in STYLE_TEMPLATES else DEFAULT_STYLE
@@ -857,9 +889,9 @@ video_prompt 要求：
 - image_negative_prompt: 针对该首帧最可能出现的结构、位置或材质错误，列出具体可见缺陷。只排除不需要的额外肢体、错误接触、文字、水印或风格偏差，按当前画面取舍。
 - video_negative_prompt: 针对该镜头的动作和运镜，列出具体的时序缺陷，包括道具瞬移、接触穿模、角色外观漂移、动作倒放或非计划的抖动；排除画面浮现字幕、标题或字卡，保留情节所需的道具内文字。不要排除分镜要求的静止、运动或效果。两个负面词字段用简短短语，不堆砌画质评分词。
 - video_prompt
-- motion_beats: 对象数组，每条包含 start、end、subject、camera、start_state、action、end_state。按片段本地时间从0秒逐秒写到 duration，时间连续且不重叠。每条都写完整可见画面：camera 写景别、机位、取景重点及运镜；start_state 写人物在画面中的方位、姿态、视线和相关道具的位置；action 写动作方向、肢体和接触点如何变化；end_state 写秒末可见结果，下一条从该结果继续。停顿也写清保持的画面。输出只描述当前分镜的实际内容，不包含示例、类比、占位词或模板说明。
+- motion_beats: 对象数组，每条包含 start、end、subject、camera、start_state、action、end_state。{"按片段本地时间从0秒逐秒写到 duration，时间连续且不重叠。" if per_second else "【自由流·不逐秒模式】不要机械拆成每秒一条！每个分镜只返回 1–2 条完整连贯的连续时间块（例如 0 到 duration 一整条，或因果清晰的前后两半段，严格连续覆盖 0 到 duration），让视频模型顺滑完成整个连贯动作与单一运镜。"}每条都写完整可见画面：camera 写景别、机位、取景重点及运镜；start_state 写人物在画面中的方位、姿态、视线和相关道具的位置；action 写动作方向、肢体和接触点如何变化；end_state 写段末可见结果。输出只描述当前分镜的实际内容，不包含示例、类比、占位词或模板说明。
 - motion_beats 的 start 和 end 必须使用 JSON 数字，单位为秒，不加引号或单位后缀。
-- 每个动态分镜必须返回条数与自身 duration 完全相等的逐秒描述（如 6 秒返回 6 条、8 秒返回 8 条、11 秒返回 11 条，严格从 0 到 duration 秒）。每秒的 camera、start_state、action、end_state 合计精炼控制在 30–55 个汉字，突出构图、发力部位、接触过程和秒末结果（总提示词避免臃肿稀释模型注意力）。共同的外貌、服装、场景和光线放在 continuity_note 中，逐秒字段不重复堆砌。每秒只写当前段落能拍到的内容。
+- {"每个动态分镜必须返回条数与自身 duration 完全相等的逐秒描述（如 6 秒返回 6 条、8 秒返回 8 条、11 秒返回 11 条，严格从 0 到 duration 秒）。每秒的 camera、start_state、action、end_state 合计精炼控制在 30–55 个汉字，突出构图、发力部位、接触过程和秒末结果（总提示词避免臃肿稀释模型注意力）。" if per_second else "每个动态分镜返回 1–2 条连贯时间块覆盖 0 到 duration 秒（如 start=0, end=duration），禁止按 1 秒强行切碎！每条写清景别构图、连贯运镜方向、核心发力与眼神表情弧线，同时严格保留跨时空换装与当前单元的光影色调要求。"}共同的外貌、服装、场景和光线放在 continuity_note 中。
 - 画面中要看清什么，先在 video_prompt 指明接触点和景别；每秒写清入画侧、接触面的相对位置、力的方向、动作结果和可见反应。不要用气氛词代替位移。
 - 图片只能画出动作开始状态，不得提前呈现动作结果；末段结果必须符合 end_state。
 - first_frame_focus: 首帧最重要的可见主体

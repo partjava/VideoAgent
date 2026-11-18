@@ -30,6 +30,7 @@ from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
 from services.character_binding import frozen_characters, reference_choices_for_scene, scene_voice_options, faster_voice_options
 from services.generation_dispatch import dispatch_generation
 from services.generation_usage import GenerationLimitExceeded
+from services.shot_continuity import adapt_video_submission
 
 
 router = APIRouter(prefix="/api/video", tags=["video"])
@@ -112,6 +113,34 @@ async def video_route_status() -> dict[str, str]:
         "status": "ok",
         "message": "video routes are ready for real generation",
     }
+
+
+@router.get("/capabilities", response_model=ApiResponse)
+async def get_video_capabilities() -> ApiResponse:
+    from config import settings
+    from services.generation_contract import (
+        AUTO_DIRECTOR_MODE,
+        STORYBOARD_FLOW_MODE,
+        active_provider_duration_bounds,
+    )
+    from services.provider_factory import active_video_provider_and_model
+
+    provider, model = active_video_provider_and_model(settings)
+    return ApiResponse(
+        status="success",
+        data={
+            "video_provider": provider,
+            "video_model": model,
+            "vidu_resolution": str(getattr(settings, "vidu_resolution", "1080p") or "1080p"),
+            "max_images_per_task": int(getattr(settings, "max_images_per_task", 20) or 20),
+            "max_video_seconds_per_task": int(getattr(settings, "max_video_seconds_per_task", 600) or 600),
+            "max_dynamic_scenes_per_task": int(getattr(settings, "max_dynamic_scenes_per_task", 99) or 99),
+            "duration_bounds": {
+                AUTO_DIRECTOR_MODE: list(active_provider_duration_bounds(AUTO_DIRECTOR_MODE, cfg=settings)),
+                STORYBOARD_FLOW_MODE: list(active_provider_duration_bounds(STORYBOARD_FLOW_MODE, cfg=settings)),
+            },
+        },
+    )
 
 
 @router.post("/create", response_model=ApiResponse)
@@ -316,6 +345,68 @@ async def polish_scene_dialogue(task_id: str, scene_id: str, payload: PolishScen
     return error_response("模型没有返回该镜头的有效旁白", 502)
 
 
+class CastCardRerunRequest(BaseModel):
+    prompt: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/{task_id}/cast-card/{card_id}/rerun", response_model=ApiResponse)
+async def rerun_cast_card(task_id: str, card_id: str, payload: CastCardRerunRequest | None = None):
+    """重绘剧组流自动生成的 4 视图人物设定卡（开拍前可单独微调外观）。"""
+    from agents.image_agent import _build_implicit_turnaround_prompt
+    from services.provider_factory import get_image_service
+
+    try:
+        task = await task_service.get_task(task_id)
+        if not task:
+            return error_response("Task not found", 404)
+        meta = dict(task.get("metadata") or {})
+        cards = [dict(c) for c in (meta.get("implicit_cast_cards") or []) if isinstance(c, dict)]
+        target_idx = next((i for i, c in enumerate(cards) if c.get("card_id") == card_id), None)
+        if target_idx is None:
+            return error_response("Cast card not found", 404)
+        card = cards[target_idx]
+        image_service = get_image_service()
+        card_prompt = (payload.prompt.strip() if payload and payload.prompt and payload.prompt.strip() else None) or _build_implicit_turnaround_prompt(card, task.get("style"))
+        render_id = f"{card_id}_edit_{uuid4().hex[:8]}"
+        res = await dispatch_generation(
+            {"task_id": task_id, **task},
+            "image",
+            card_id,
+            lambda: image_service.generate_image(
+                task_id=task_id,
+                scene_id=render_id,
+                image_prompt=card_prompt,
+                negative_prompt="复杂场景, 阴影, 道具, 手持物, 背包, 变形, 乱码文字",
+                ratio="16:9",
+            ),
+        )
+        if not isinstance(res, dict) or res.get("status") != "success" or not res.get("asset_path"):
+            raise ValueError("Cast card generation did not return an asset")
+        new_path = str(res["asset_path"])
+        card["path"] = new_path
+        card["prompt"] = card_prompt
+        cards[target_idx] = card
+        now = datetime.now(UTC)
+        asset = Asset(
+            asset_id=f"asset_{task_id}_{card_id}",
+            task_id=task_id,
+            scene_id=card_id,
+            asset_type="character_ref",
+            path=new_path,
+            source=str(res.get("source") or "image_provider"),
+            status="success",
+            created_at=now,
+            updated_at=now,
+        )
+        await mongodb.replace_one("assets", {"_id": asset.asset_id}, with_document_id(asset.model_dump(), asset.asset_id), upsert=True)
+        await mongodb.update_one("video_tasks", {"_id": task_id}, {"metadata.implicit_cast_cards": cards, "updated_at": now})
+        return ApiResponse(status="success", data={"card": card, "implicit_cast_cards": cards})
+    except GenerationLimitExceeded as exc:
+        return error_response(str(exc), 409)
+    except Exception as exc:
+        return error_response(f"Cast card rerun failed: {exc}", 500)
+
+
 @router.post("/{task_id}/scene/{scene_id}/rerun", response_model=ApiResponse)
 async def rerun_scene_asset(
     task_id: str,
@@ -339,12 +430,12 @@ async def rerun_scene_asset(
         now = datetime.now(UTC)
         backend_dir = Path(__file__).resolve().parents[1]
         updated_fields = {}
-        if payload.rerun_type not in {"voice", "image", "video", "all"}:
+        if payload.rerun_type not in {"voice", "image", "end_frame", "video", "all"}:
             return error_response("Invalid rerun type", 400)
         in_shoot_review = task.get("status") == VideoTaskStatus.AWAITING_SHOOT_REVIEW.value
         series_context = (task.get("metadata") or {}).get("series_context")
         if series_context and (
-            (payload.rerun_type in {"image", "video", "all"} and not (in_shoot_review and payload.rerun_type == "image"))
+            (payload.rerun_type in {"image", "end_frame", "video", "all"} and not (in_shoot_review and payload.rerun_type in {"image", "end_frame"}))
             or (payload.voiceover is not None and clean_tts_text(payload.voiceover) != clean_tts_text(scene.get("voiceover") or ""))
             or (payload.speaker is not None and payload.speaker != scene.get("speaker"))
         ):
@@ -445,12 +536,23 @@ async def rerun_scene_asset(
 
         # 3. 重新生成图片底图
         if payload.rerun_type in ("image", "all"):
+            from agents.image_agent import _match_cast_card_paths
             from services.provider_factory import get_image_service
             image_prompt = payload.prompt or scene.get("image_prompt")
             if image_prompt:
                 image_service = get_image_service()
                 choices = reference_choices_for_scene(task, scene)
-                reference_options = {"reference_images": [item["path"] for item in choices]} if choices else {}
+                ref_paths = [item["path"] for item in choices]
+                implicit_cards = (task.get("metadata") or {}).get("implicit_cast_cards") or []
+                if not ref_paths and implicit_cards and getattr(image_service, "supports_reference_images", False):
+                    max_refs = int(getattr(image_service, "max_reference_images", 2) or 2)
+                    ref_paths = [
+                        p for p in _match_cast_card_paths(scene, implicit_cards, max_refs)
+                        if resolve_media(p).is_file()
+                    ]
+                    if ref_paths:
+                        image_prompt += "\n[角色外貌设定参考] 仅继承参考设定图中对应角色的五官脸型、发型与基础体态特征；彻底忽略设定图浅灰背景及三视图排版，严格按本镜新景别、构图角度、指定时代服装、独立场景背景与阶段光影色温绘制。"
+                reference_options = {"reference_images": ref_paths} if ref_paths else {}
                 if choices and not getattr(image_service, "supports_reference_images", False):
                     return error_response("当前图片模型不支持角色参考图，请更换模型", 422)
                 img_res = await dispatch_generation(
@@ -478,6 +580,38 @@ async def rerun_scene_asset(
             else:
                 raise ValueError("Image prompt is missing")
 
+        # 3b. 生成本镜尾帧定格图（用于 Wan3 / Seedance 首尾双帧驱动）
+        if payload.rerun_type == "end_frame":
+            from agents.image_agent import build_end_frame_prompt
+            from services.provider_factory import get_image_service
+
+            first_src = scene.get("image_path")
+            if not first_src or not resolve_media(first_src).is_file():
+                return error_response("请先确保本镜首帧底图已就绪，再生成尾帧控制图", 422)
+            image_service = get_image_service()
+            if not getattr(image_service, "supports_reference_images", False):
+                return error_response("当前图片模型不支持基于首帧参考生成尾帧，请在模型设置中选择支持参考图的模型", 422)
+            end_prompt = lock_visual_style(build_end_frame_prompt(scene, payload.prompt), task.get("style"))
+            end_res = await dispatch_generation(
+                {"task_id": task_id, **(task or {})},
+                "image",
+                f"{scene_id}_end",
+                lambda: image_service.generate_image(
+                    task_id=task_id,
+                    scene_id=f"{render_id}_end",
+                    image_prompt=end_prompt,
+                    negative_prompt=PHOTO_EXCLUSIONS if task.get("style") == "短剧" else None,
+                    ratio=task.get("ratio", "9:16"),
+                    reference_images=[first_src],
+                ),
+            )
+            if end_res.get("status") == "success" and end_res.get("asset_path"):
+                updated_fields["last_frame_target_path"] = end_res["asset_path"]
+                scene["last_frame_target_path"] = end_res["asset_path"]
+                await save_asset("end_frame", end_res["asset_path"], end_res.get("source") or "image_provider")
+            else:
+                raise ValueError("End frame generation did not return an asset")
+
         if payload.rerun_type in ("video", "all"):
             previous_tail = (prior or {}).get("last_frame_path") or (prior or {}).get("image_path")
             first = continuity_input(scene, previous_tail, scene.get("image_path"))
@@ -494,14 +628,15 @@ async def rerun_scene_asset(
             prompt, observed = await prepare_motion_prompt(prompt_scene, prior, first, first_digest)
             provider = video_service_for_task(task)
             duration = int(scene["duration"])
-            prompt_options = video_prompt_options(provider, prompt_scene)
-            pending_key = render_signature(provider, first_digest, prompt, duration, task.get("ratio", "9:16"), **prompt_options)
+            submitted_prompt, adapted_opts = adapt_video_submission(provider, prompt_scene, prompt)
+            prompt_options = {**video_prompt_options(provider, prompt_scene), **adapted_opts}
+            pending_key = render_signature(provider, first_digest, submitted_prompt, duration, task.get("ratio", "9:16"), **prompt_options)
             pending_job = scene.get("pending_video_rerun") or {}
             resumed_pending = False
             if pending_job.get("key") == pending_key:
                 render_id = pending_job["render_id"]
                 resumed_pending = getattr(provider, "has_pending_render", lambda *a, **kw: False)(
-                    task_id, render_id, first, video_prompt=prompt, duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options
+                    task_id, render_id, first, video_prompt=submitted_prompt, duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options
                 ) is True
             else:
                 await mongodb.update_one("scenes", {"_id": scene["_id"]}, {
@@ -511,7 +646,7 @@ async def rerun_scene_asset(
             def _call_rerun_video():
                 return provider.generate_video(
                     task_id=task_id, scene_id=render_id,
-                    image_path=first, video_prompt=prompt,
+                    image_path=first, video_prompt=submitted_prompt,
                     duration=duration, ratio=task.get("ratio", "9:16"), **prompt_options
                 )
             if resumed_pending:
@@ -527,10 +662,10 @@ async def rerun_scene_asset(
             tail = f"backend/assets/{task_id}/frames/{render_id}_tail.png"
             await anyio.to_thread.run_sync(extract_tail, video_path, resolve_media(tail), duration)
             await save_asset("video_clip", video_path, result.get("source") or "video_provider",
-                             submitted_video_prompt=prompt,
+                             submitted_video_prompt=submitted_prompt,
                              first_frame_digest=first_digest, render_signature=pending_key, provider_task_id=result.get("provider_task_id"))
             updated_fields.update(video_path=video_path, last_frame_path=tail, continuity_input_path=first,
-                                  submitted_video_prompt=prompt,
+                                  submitted_video_prompt=submitted_prompt,
                                   observed_handoff=observed, need_dynamic_video=True, stale_tail=False,
                                   status="video_done", pending_video_rerun=None)
             if scene.get("transition_type") == "continue_action":
@@ -547,11 +682,12 @@ async def rerun_scene_asset(
 
         updated_fields["updated_at"] = now
         await mongodb.update_one("scenes", {"_id": f"{task_id}_{scene_id}"}, updated_fields)
-        if in_shoot_review or (task.get("status") == "failed" and payload.rerun_type == "voice"):
+        if in_shoot_review or payload.rerun_type == "end_frame" or (task.get("status") == "failed" and payload.rerun_type == "voice"):
             scene_data = {**scene, **updated_fields}
             if "_id" in scene_data:
                 scene_data["_id"] = str(scene_data["_id"])
-            return ApiResponse(status="success", data={"message": "素材已保存，可继续试拍或确认开拍", "scene": scene_data})
+            msg = "尾帧控制图已保存，可点击「试拍/重拍本镜」使用首尾双帧生成" if payload.rerun_type == "end_frame" else "素材已保存，可继续试拍或确认开拍"
+            return ApiResponse(status="success", data={"message": msg, "scene": scene_data})
 
         pending = await mongodb.find_many("scenes", {"task_id": task_id, "stale_tail": True}, limit=100)
         if pending:

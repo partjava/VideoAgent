@@ -26,6 +26,11 @@ export const videoApi = {
     return client.post('/create', payload)
   },
   
+  // Get active runtime capabilities and limits
+  getCapabilities() {
+    return client.get('/capabilities')
+  },
+
   // Get task detail
   getTask(taskId) {
     return client.get(`/${taskId}`)
@@ -67,7 +72,10 @@ export const videoApi = {
   },
 
   rerunScene(taskId, sceneId, payload) {
-    return client.post(`/${taskId}/scene/${sceneId}/rerun`, payload)
+    return client.post(`/${taskId}/scene/${sceneId}/rerun`, payload, { timeout: 180000 })
+  },
+  rerunCastCard(taskId, cardId, payload = {}) {
+    return client.post(`/${taskId}/cast-card/${cardId}/rerun`, payload, { timeout: 180000 })
   },
   applyAudioTiming(taskId, sceneId, payload) {
     return client.post(`/${taskId}/scene/${sceneId}/audio-timing`, payload, { timeout: 300000 })

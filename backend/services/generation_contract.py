@@ -20,7 +20,7 @@ def build_timeline(scenes):
     return rows
 
 
-def validate_scene_durations(scenes, target=None, *, whole=False):
+def validate_scene_durations(scenes, target=None, *, whole=False, min_duration: int = 4):
     if not scenes:
         raise ValueError("Storyboard is empty")
     if whole and (len(scenes) != 1 or scenes[0].get("need_dynamic_video") is not True):
@@ -28,8 +28,8 @@ def validate_scene_durations(scenes, target=None, *, whole=False):
     maximum = 30 if whole else 12
     for scene in scenes:
         duration = float(scene.get("duration", 0))
-        if not math.isfinite(duration) or not 4 <= duration <= maximum or not duration.is_integer():
-            raise ValueError(f"Scene duration must be an integer between 4 and {maximum} seconds")
+        if not math.isfinite(duration) or not min_duration <= duration <= maximum or not duration.is_integer():
+            raise ValueError(f"Scene duration must be an integer between {min_duration} and {maximum} seconds")
     total = sum(float(s["duration"]) for s in scenes)
     if target is not None and abs(total - target) > 0.01:
         raise ValueError(f"Storyboard duration mismatch: expected {target}s, got {total}s")
@@ -39,22 +39,47 @@ WHOLE_GENERATION_MODE = "wan3_whole"
 PAIRED_GENERATION_MODE = "paired_5s"
 NATIVE_GENERATION_MODE = "native_10s"
 AUTO_DIRECTOR_MODE = "auto_director"
+STORYBOARD_FLOW_MODE = "storyboard_flow"
 
 
-def provider_duration_bounds(provider_name: str | None = None, model_name: str | None = None) -> tuple[int, int]:
+def provider_duration_bounds(
+    provider_name: str | None = None,
+    model_name: str | None = None,
+    *,
+    generation_mode: str | None = None,
+) -> tuple[int, int]:
     """返回当前视频生成模型支持的单段合理整数秒数区间（下限, 上限）。"""
     combined = f"{provider_name or ''} {model_name or ''}".lower()
+    min_sec = 3 if generation_mode == STORYBOARD_FLOW_MODE else 4
     if "wan3" in combined or "wan2.6" in combined or "wan2.7" in combined:
-        # 弹性导演建议单镜控制在 4-12 秒保证画面连贯与动作可执行性
-        return (4, 12)
+        return (min_sec, 12)
     if "vidu" in combined:
-        return (4, 10)
-    if "doubao" in combined or "seedance" in combined or "comfyui" in combined:
+        return (min_sec, 10)
+    if "doubao" in combined or "seedance" in combined:
+        # Doubao / Seedance API 物理强校验仅接受 4–12 秒整数片段
         return (4, 12)
-    return (4, 12)
+    if "comfyui" in combined:
+        return (min_sec, 12)
+    return (min_sec, 12)
 
 
-def validate_auto_director_scenes(scenes, target_duration=None, bounds: tuple[int, int] = (4, 12)):
+def active_provider_duration_bounds(
+    generation_mode: str | None = None,
+    *,
+    cfg=None,
+) -> tuple[int, int]:
+    """按当前实际生效的视频服务（含 .env.models.local 与环境变量）解析单镜时长区间。"""
+    try:
+        from services.provider_factory import active_video_provider_and_model
+
+        provider, model = active_video_provider_and_model(cfg)
+    except Exception:
+        provider = getattr(cfg, "video_provider", None) if cfg is not None else None
+        model = getattr(cfg, "wan_video_model", None) if cfg is not None else None
+    return provider_duration_bounds(provider, model, generation_mode=generation_mode)
+
+
+def _validate_variable_scenes(scenes, target_duration=None, bounds: tuple[int, int] = (4, 12), *, label: str = "Auto-director"):
     if not scenes:
         raise ValueError("Storyboard is empty")
     min_sec, max_sec = bounds
@@ -66,15 +91,23 @@ def validate_auto_director_scenes(scenes, target_duration=None, bounds: tuple[in
             or not duration.is_integer()
         ):
             raise ValueError(
-                f"Auto-director clip {index + 1} duration must be an integer between {min_sec} and {max_sec} seconds"
+                f"{label} clip {index + 1} duration must be an integer between {min_sec} and {max_sec} seconds"
             )
         if scene.get("need_dynamic_video") is not True:
-            raise ValueError(f"Auto-director clip {index + 1} must be dynamic")
+            raise ValueError(f"{label} clip {index + 1} must be dynamic")
         if scene.get("transition_type") not in {None, "cut", "continue_action", "scene_change"}:
-            raise ValueError(f"Auto-director clip {index + 1} has invalid transition_type")
+            raise ValueError(f"{label} clip {index + 1} has invalid transition_type")
     total = sum(float(s["duration"]) for s in scenes)
     if target_duration is not None and abs(total - target_duration) > 0.01:
         raise ValueError(f"Storyboard duration mismatch: expected {target_duration}s, got {total}s")
+
+
+def validate_auto_director_scenes(scenes, target_duration=None, bounds: tuple[int, int] = (4, 12)):
+    _validate_variable_scenes(scenes, target_duration=target_duration, bounds=bounds, label="Auto-director")
+
+
+def validate_storyboard_flow_scenes(scenes, target_duration=None, bounds: tuple[int, int] = (3, 12)):
+    _validate_variable_scenes(scenes, target_duration=target_duration, bounds=bounds, label="Storyboard-flow")
 
 
 def rebalance_motion_beats_duration(beats: list[dict], old_duration: int, new_duration: int) -> list[dict]:
@@ -95,6 +128,12 @@ def rebalance_motion_beats_duration(beats: list[dict], old_duration: int, new_du
             }
             for i in range(new_duration)
         ]
+
+    if len(working) == 1 and float(working[0].get("start", 0)) == 0 and float(working[0].get("end", 0)) == old_duration:
+        single = dict(working[0])
+        single["start"] = 0
+        single["end"] = new_duration
+        return [single]
 
     # 先转为逐秒槽位列表
     if len(working) == old_duration and all(
@@ -304,3 +343,8 @@ def render_srt(scenes, *, wrap_width: int = 15):
             spoken = float(audio_duration) / narration_speed(scene, float(audio_duration), slot)
         cues.append(f"{len(cues) + 1}\n{format_srt_time(start)} --> {format_srt_time(start + spoken)}\n{_wrap_cjk_subtitle(text, wrap_width)}\n")
     return "\n".join(cues)
+
+
+def render_srt_for_task(scenes, task: dict | None = None) -> str:
+    wrap_width = 24 if (task or {}).get("ratio") == "16:9" else 15
+    return render_srt(scenes, wrap_width=wrap_width)

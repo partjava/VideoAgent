@@ -11,7 +11,7 @@ class ScriptLine(BaseModel):
 
 
 class ScriptSegment(BaseModel):
-    duration: int = Field(default=10, ge=4, le=12)
+    duration: int = Field(default=10, ge=3, le=12)
     plot: str = Field(min_length=1)
     voice_start: float = Field(ge=0, lt=30)
     voiceover: str = ""
