@@ -68,6 +68,29 @@
           show-icon
           class="model-feedback"
         />
+        <div v-if="(catalogs[item.id]?.length || suggestions[item.id]?.length)" class="candidate-chips">
+          <small>点击可直接切换使用：</small>
+          <button
+            v-for="m in (catalogs[item.id] || [])"
+            :key="'c-' + m"
+            type="button"
+            class="candidate-chip primary"
+            :class="{ active: profiles[item.id].model === m }"
+            @click="selectCandidate(item.id, m)"
+          >
+            {{ m }}
+          </button>
+          <button
+            v-for="m in (suggestions[item.id] || [])"
+            :key="'s-' + m"
+            type="button"
+            class="candidate-chip"
+            :class="{ active: profiles[item.id].model === m }"
+            @click="selectCandidate(item.id, m)"
+          >
+            {{ m }}
+          </button>
+        </div>
       </template>
       <p v-else>正在读取配置…</p>
     </article>
@@ -95,10 +118,21 @@ const modelOptions = id => [...new Set([
   profiles[id].model, ...(catalogs[id] || []), ...(suggestions[id] || [])
 ].filter(Boolean))]
 
+const normalizeBase = url =>
+  String(url || '')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/(?:compatible-mode\/v1|api\/v1|v1)$/i, '')
+
 const isUrlChanged = id => {
-  const current = (profiles[id]?.url || '').trim().replace(/\/+$/, '')
-  const saved = (savedUrls[id] || '').trim().replace(/\/+$/, '')
+  const current = normalizeBase(profiles[id]?.url)
+  const saved = normalizeBase(savedUrls[id])
   return Boolean(saved && current && current !== saved)
+}
+
+function selectCandidate(id, model) {
+  profiles[id].model = model
+  clearResult(id)
 }
 
 const keyPlaceholder = id => {
@@ -185,21 +219,30 @@ async function submit(id, action) {
       catalogs[id] = models
       suggestions[id] = suggested_models
       suggestionSources[id] = suggestion_source
-      feedback[id] = models.length
-        ? { type: 'success', message: `找到 ${models.length} 个匹配模型，请在「模型名称」下拉框中选择。` }
-        : suggested_models.length
-          ? {
-              type: 'warning',
-              message: suggestion_source === 'catalog'
-                ? `已从该地址识别出 ${suggested_models.length} 个候选视频模型，可在下拉框中选择或直接手动输入。`
-                : '目录未返回直接匹配的视频型号。下拉框已列出项目支持的型号，实际权限以服务商为准。'
-            }
-          : {
-              type: 'warning',
-              message: available
-                ? '服务返回的列表中没有自动匹配当前分类的模型，可直接在输入框手动填写模型名称。'
-                : '该地址未开放标准模型目录接口，可直接手动输入模型名称并保存使用。'
-            }
+      if (models.length && suggested_models.length) {
+        feedback[id] = {
+          type: 'success',
+          message: suggestion_source === 'official'
+            ? `目录返回 ${models.length} 个模型，并已补充 ${suggested_models.length} 个项目支持的官方候选型号（实际权限以百炼控制台为准）。`
+            : `找到 ${models.length} 个匹配模型及 ${suggested_models.length} 个兼容候选模型，可直接点击下方标签或下拉框选择。`,
+        }
+      } else if (models.length) {
+        feedback[id] = { type: 'success', message: `找到 ${models.length} 个匹配模型，可直接点击下方标签或「模型名称」下拉框选择。` }
+      } else if (suggested_models.length) {
+        feedback[id] = {
+          type: suggestion_source === 'catalog' ? 'success' : 'warning',
+          message: suggestion_source === 'catalog'
+            ? `已从该地址识别出 ${suggested_models.length} 个候选视频模型，可直接点击下方标签选用。`
+            : '百炼兼容目录未直接返回生图/视频型号，下方已列出当前通道项目支持的官方候选型号（需在百炼模型广场开通权限）。',
+        }
+      } else {
+        feedback[id] = {
+          type: 'warning',
+          message: available
+            ? '服务返回的列表中没有自动匹配当前分类的模型，可直接在输入框手动填写模型名称。'
+            : '该地址未开放标准模型目录接口，可直接手动输入模型名称并保存使用。',
+        }
+      }
     } else {
       const { result } = await settingsApi.testModel(id, payload)
       const [type, message] = messages[result] || ['warning', '未知测试结果']
@@ -225,4 +268,9 @@ async function submit(id, action) {
 .model-actions { display:flex; flex-wrap:wrap; gap:8px; }
 .model-actions .el-button { margin:0; }
 .model-feedback { margin-top:12px; }
+.candidate-chips { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:10px; }
+.candidate-chips small { color:#475569; font-size:12px; width:100%; }
+.candidate-chip { border:1px solid #cbd5e1; background:#f8fafc; color:#334155; font-size:12px; padding:3px 9px; border-radius:999px; cursor:pointer; }
+.candidate-chip.primary { border-color:#93c5fd; background:#eff6ff; color:#1d4ed8; }
+.candidate-chip.active { background:#2563eb; border-color:#2563eb; color:#ffffff; font-weight:600; }
 </style>

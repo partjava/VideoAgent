@@ -17,9 +17,12 @@ from core.database import mongodb
 from models.asset_model import Asset
 from models.task_model import VideoTaskStatus
 from services.generation_contract import (
+    AUTO_DIRECTOR_MODE,
     continuity_input,
     format_motion_beats,
     needs_video,
+    provider_duration_bounds,
+    validate_auto_director_scenes,
     validate_motion_beats,
     validate_scene_durations,
     PAIRED_GENERATION_MODE,
@@ -39,6 +42,8 @@ from services.audio_timing import narration_speed
 from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
 from services.generation_dispatch import dispatch_generation
 from services.generation_usage import record_reuse
+from services.drama_craft_service import sanitize_video_prompt_mcsla
+from services.shot_continuity import adapt_video_submission
 
 
 OVERLAY_DIRECTION = re.compile(
@@ -112,19 +117,21 @@ def actual_dialogue_direction(scene):
     if not audio:
         return ""
     last = audio[-1]
-    return (
-        f"\n[实测配音时间优先] 最后一句在 {last['start']:.2f}–{last['end']:.2f} 秒。"
-        "这段保留能看清当前保护目标的构图。"
-        "若逐秒动作与该窗口冲突，推迟转身、离场或转移焦点；时间不足时省略次要动作。"
-    )
+    return f"\n[配音对齐] 最后一句台词在 {last['start']:.2f}–{last['end']:.2f} 秒，保持说话人正面表情和反应完整可见。"
 
 
 def speaker_windows(scene):
     windows = []
+    visible_ids = scene.get("character_ids") or []
+    single_cast_mode = len(visible_ids) == 1
+    visible_speaker = str(scene.get("speaker") or "").strip()
     for line in scene.get("dialogue_audio") or []:
-        speaker = line.get("speaker", "当前说话者")
-        if speaker == "旁白":
+        speaker = str(line.get("speaker") or "当前说话者").strip()
+        if speaker in {"旁白", "解说", "narrator"}:
             windows.append(f"{line['start']:.2f}–{line['end']:.2f}秒为画外旁白，画面内人物按剧情反应。")
+        elif single_cast_mode and visible_speaker and speaker != visible_speaker:
+            # 单人镜头画外角色发声时不写入画外人名，避免生出多余人物或双胞胎
+            windows.append(f"{line['start']:.2f}–{line['end']:.2f}秒为画外对白，画面内人物自然闭口并保持倾听反应。")
         else:
             windows.append(
                 f"{line['start']:.2f}–{line['end']:.2f}秒：{speaker}若在画面中，"
@@ -144,11 +151,14 @@ def video_prompt_options(service, scene):
     return {}
 
 
-def render_signature(service, first_digest, prompt, duration, ratio, *, negative_prompt=None):
+def render_signature(service, first_digest, prompt, duration, ratio, *, negative_prompt=None, **extra):
     provider = f"{type(service).__module__}.{type(service).__qualname__}:{getattr(service, 'model', '')}:{getattr(service, 'api_base', '')}"
     parts = (provider, first_digest, prompt, duration, ratio)
     if negative_prompt:
         parts += (negative_prompt,)
+    for k in sorted(extra):
+        if extra[k] is not None:
+            parts += (f"{k}={extra[k]}",)
     return sha256(repr(parts).encode()).hexdigest()
 
 
@@ -164,13 +174,59 @@ async def prepare_motion_prompt(scene, previous, first, first_digest):
         scene["start_state"] = previous["effective_end_state"]
         scene["motion_beats"][0]["start_state"] = previous["effective_end_state"]
     revision = sha256(_build_motion_prompt(scene).encode()).hexdigest()
+    plan = None
     if saved.get("digest") == first_digest and saved.get("revision") == revision:
         plan = saved["plan"]
-    elif review_enabled():
-        plan = await anyio.to_thread.run_sync(replan_from_tail, previous, scene, first)
-    else:
+    elif review_enabled() and previous.get("video_path"):
+        try:
+            plan = await anyio.to_thread.run_sync(replan_from_tail, previous, scene, first)
+        except Exception as exc:
+            print(f"[VideoAgent] Tail replan skipped safely for {scene.get('scene_id')}: {exc}", flush=True)
+            plan = None
+    if plan is None:
+        base_note = str(scene.get("continuity_note") or "").strip()
+        seam_lock = "首0.3秒严格顺承首帧落地姿态、持物手与运动惯性，不复位重起"
+        if seam_lock not in base_note:
+            scene["continuity_note"] = f"{seam_lock}。{base_note}".strip("。")
         return _build_motion_prompt(scene), None
     return _build_motion_prompt({**scene, **plan}), {"digest": first_digest, "revision": revision, "plan": plan}
+
+
+def _compact_timeline_slices(beats, *, keep_intermediate_states: bool = True, merge_identical: bool = False):
+    working = list(beats)
+    if merge_identical and len(working) > 1:
+        merged = [dict(working[0])]
+        for item in working[1:]:
+            prev = merged[-1]
+            same_action = str(prev.get("action") or "").strip() == str(item.get("action") or "").strip()
+            same_subj = str(prev.get("subject") or "").strip() == str(item.get("subject") or "").strip()
+            same_cam = str(prev.get("camera") or "").strip() == str(item.get("camera") or "").strip()
+            if same_action and same_subj and same_cam:
+                prev["end"] = item["end"]
+                prev["end_state"] = item.get("end_state")
+            else:
+                merged.append(dict(item))
+        working = merged
+
+    slices = []
+    prev_end_state = None
+    for index, b in enumerate(working):
+        parts = []
+        cam = b.get("camera")
+        if index == 0 and cam and cam != "沿用分组运镜计划":
+            parts.append(f"机位:{cam}")
+        start_state = b.get("start_state")
+        if start_state and (index == 0 or (keep_intermediate_states and start_state != prev_end_state)):
+            parts.append(f"起:{start_state}")
+        action_text = f"{b.get('subject', '')} {b['action']}".strip()
+        if action_text:
+            parts.append(action_text)
+        end_state = b.get("end_state")
+        if end_state and (index == len(working) - 1 or (keep_intermediate_states and end_state != start_state)):
+            parts.append(f"止:{end_state}")
+        prev_end_state = end_state
+        slices.append(f"[{b['start']}-{b['end']}s]" + "｜".join(parts))
+    return "\n".join(slices)
 
 
 def _build_motion_prompt(scene):
@@ -181,7 +237,7 @@ def _build_motion_prompt(scene):
     shot_type = scene.get("shot_type") or "中景"
     camera_motion = scene.get("camera_motion") or "固定机位"
 
-    # 1. 镜头配方 (video-shotcraft 语法: 景别与运镜模式)
+    # 1. 镜头配方（景别与单一主运镜）
     plan = scene.get("camera_plan")
     if plan:
         offset = scene.get("camera_section_offset") or 0
@@ -191,55 +247,63 @@ def _build_motion_prompt(scene):
             f"[统一运镜] {direction} 目标构图：{framing_goal}。镜头任务：{plan['purpose']}。"
         )
     else:
-        recipe_header = f"[运镜指令] 景别: {shot_type}，运镜: {camera_motion}。从首帧画面自然推进。"
+        recipe_header = f"[运镜指令] 景别:{shot_type}，单一主运镜:{camera_motion}，从首帧自然推进。"
 
-    # 2. 秒级时间切片进度 (seedance2-skill 语法: 结构化动作演进与动力学向量)
-    timeline_slices = []
-    for b in beats:
-        fields = []
-        if b.get("camera") and b["camera"] != "沿用分组运镜计划":
-            fields.append(f"构图与机位：{b['camera']}")
-        if b.get("start_state"):
-            fields.append(f"起始画面与位置：{b['start_state']}")
-        fields.append(f"可见动作：{b.get('subject', '')} {b['action']}".strip())
-        if b.get("end_state"):
-            fields.append(f"秒末画面：{b['end_state']}")
-        timeline_slices.append(f"【{b['start']}-{b['end']}秒】" + "｜".join(fields))
-    timeline_block = "\n".join(timeline_slices)
-
-    # 3. 角色一致性与物理结算 (Seedance 角色锁定与尾帧锚定)
-    continuity = scene.get("continuity_note") or scene.get("scene_continuity") or "保持首帧主体面孔、发型服装与光影一致"
+    # 2. 角色与场景物理锁定 + 结尾定格
+    continuity = scene.get("continuity_note") or scene.get("scene_continuity") or "保持首帧五官、服装与主光一致"
     opening_pose = beats[0].get("start_state") if beats else scene.get("start_state")
     settle = scene.get("end_state") or (beats[-1].get("end_state") if beats else None) or scene.get("last_frame_for_transition") or "动作自然收止稳定"
 
-    pose_block = f"[动作起止状态] 起手姿态: {opening_pose}；末尾定格姿态: {settle}。\n" if opening_pose else ""
+    pose_block = f"[起止] 起:{opening_pose}；定格:{settle}。\n" if opening_pose else ""
     consistency_block = (
         f"{pose_block}"
-        f"[角色锁定] 严格锚定首帧画面，{continuity}，严禁角色突变或衣服变色。\n"
-        f"[结尾帧锚定] 最终帧停留在: {settle}。"
+        f"[锚定与微锁] 严格继承首帧外观与物理材质（{continuity}），一镜一视线落点，身后固定背景与主光色温不变，最终停在：{settle}。"
     )
 
     # The section camera plan and structured beats are authoritative in paired mode.
     base_prompt = "" if plan else str(scene.get("video_prompt") or "").strip()
+    blocking_header = f"[站位轴线] {scene['blocking']}\n" if scene.get("blocking") else ""
     handoff = ""
     if scene.get("transition_type") == "continue_action":
         handoff = (
-            "[实际尾帧续接] 输入图就是上一段的实际结尾，第一帧必须沿用其中真实出现的人物、姿态、"
-            "机位、光线和道具位置。若文字起始状态和图像冲突，以图像为准。"
-            "已经完成的动作不要重演，已落下或离开画面的道具不得突然回到原处。\n"
+            "[尾帧续接] 输入图即为上段尾帧，第一帧沿用其中真实姿态、机位与道具位置；已完成动作不重演，已离场物体不复位。\n"
         )
         previous_state = scene.get("previous_action_state")
         if previous_state:
-            handoff += f"[动作交接] 第1秒从上一拍状态继续：{previous_state}。保留接触点、视线和运动方向。\n"
-    body = f"{handoff}{recipe_header}\n{base_prompt}\n[秒级动作演进]\n{timeline_block}\n{consistency_block}"
-    return (
-        lock_visual_style(sanitize_motion_text(body), scene.get("style"))
-        + actual_dialogue_direction(scene)
-        + speaker_windows(scene)
-        + "\n"
-        "[画面交付] 全段保留剧情画面。字幕、标题、气泡、水印和字卡由后期处理，"
-        "忽略上述字段里任何要求生成这些元素的指令。保留剧情需要的道具内文字。"
-    )
+            handoff += f"[动作交接] 从上一拍继续：{previous_state}。\n"
+
+    tail_notes = actual_dialogue_direction(scene) + speaker_windows(scene)
+
+    cast_names = scene.get("cast_names") or [
+        str(line.get("speaker") or "").strip()
+        for line in (scene.get("dialogue_audio") or [])
+        if str(line.get("speaker") or "").strip() not in {"", "旁白", "解说", "narrator"}
+    ]
+
+    def _assemble_level(keep_inter: bool, merge_same: bool, include_overview: bool) -> str:
+        tblock = _compact_timeline_slices(beats, keep_intermediate_states=keep_inter, merge_identical=merge_same)
+        prefix = f"{base_prompt}\n" if (include_overview and base_prompt) else ""
+        raw_motion = f"{prefix}[节奏动作链]\n{tblock}".strip()
+        sanitized_motion = sanitize_video_prompt_mcsla(
+            raw_motion,
+            scene=scene,
+            all_character_names=cast_names,
+            max_chars=1800,
+        )["prompt"]
+        body = f"{handoff}{blocking_header}{recipe_header}\n{sanitized_motion}\n{consistency_block}"
+        return lock_visual_style(sanitize_motion_text(body), scene.get("style")) + tail_notes
+
+    # 无损逐级压缩：先保留完整明细；若超 1400 字则依次省略中间重复状态、合并静止连续拍、省略概括句，绝不截断第 8-10 秒结尾动作
+    for keep_inter, merge_same, include_overview in (
+        (True, False, True),
+        (False, False, True),
+        (False, True, True),
+        (False, True, False),
+    ):
+        assembled = _assemble_level(keep_inter, merge_same, include_overview)
+        if len(assembled) <= 1400:
+            return assembled
+    return assembled
 
 
 def video_service_for_task(task):
@@ -260,19 +324,35 @@ class VideoAgent:
             scenes = await mongodb.find_many(SCENES_COLLECTION, query, limit=100)
             scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
             task = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
+            from services.character_binding import frozen_characters
+            task_plan_chars = (task.get("metadata", {}).get("task_plan") or {}).get("characters") or []
+            all_cast_names = [
+                c.get("name") for c in (frozen_characters(task) or task_plan_chars) if isinstance(c, dict) and c.get("name")
+            ]
             video_type = (task.get("metadata", {}).get("task_plan") or {}).get("video_type", "story")
             for scene in scenes:
                 scene["video_type"] = video_type
                 scene["style"] = task.get("style")
+                scene["cast_names"] = all_cast_names
             ratio = str(task.get("ratio", "9:16"))
             paired = task.get("generation_mode") == PAIRED_GENERATION_MODE
             native = task.get("generation_mode") == NATIVE_GENERATION_MODE
+            auto_director = task.get("generation_mode") == AUTO_DIRECTOR_MODE
             if paired:
                 validate_paired_scenes(scenes, task.get("duration"))
             elif native:
                 validate_native_scenes(scenes, task.get("duration"))
                 for scene in scenes:
                     validate_motion_beats(scene.get("motion_beats"), 10, detailed=True, per_second=True)
+            elif auto_director:
+                from config import settings as _cfg
+                validate_auto_director_scenes(
+                    scenes,
+                    target_duration=task.get("duration"),
+                    bounds=provider_duration_bounds(_cfg.video_provider, _cfg.wan_video_model),
+                )
+                for scene in scenes:
+                    validate_motion_beats(scene.get("motion_beats"), int(scene["duration"]), detailed=True, per_second=True)
             else:
                 validate_scene_durations(scenes, task.get("duration"), whole=task.get("generation_mode") == WHOLE_GENERATION_MODE)
             selected = list(enumerate(scenes))
@@ -328,16 +408,21 @@ class VideoAgent:
                 cached_path = asset.get("path") if asset else None
                 first_digest = sha256(resolve_media(first).read_bytes()).hexdigest()
                 prompt, observed = await prepare_motion_prompt(scene, previous, first, first_digest)
-                prompt_options = video_prompt_options(service, scene)
-                signature = render_signature(service, first_digest, prompt, duration, ratio, **prompt_options)
+                submitted_prompt, adapted_opts = adapt_video_submission(service, scene, prompt)
+                prompt_options = {**video_prompt_options(service, scene), **adapted_opts}
+                signature = render_signature(service, first_digest, submitted_prompt, duration, ratio, **prompt_options)
                 reusable = asset and asset.get("render_signature") == signature
                 if not cached_path or not resolve_media(cached_path).is_file() or not reusable:
                     if scene.get("camera_plan") and scene.get("transition_type") != "continue_action" and review_enabled():
                         saved_check = scene.get("opening_frame_review") or {}
                         if saved_check.get("digest") != first_digest:
-                            check = await anyio.to_thread.run_sync(review_opening_frame, scene, first)
-                            saved_check = {"digest": first_digest, **check}
-                            await mongodb.update_one(SCENES_COLLECTION, key, {"opening_frame_review": saved_check})
+                            try:
+                                check = await anyio.to_thread.run_sync(review_opening_frame, scene, first)
+                                saved_check = {"digest": first_digest, **check}
+                                await mongodb.update_one(SCENES_COLLECTION, key, {"opening_frame_review": saved_check})
+                            except Exception as exc:
+                                print(f"[VideoAgent] Opening frame review skipped safely for {sid}: {exc}", flush=True)
+                                saved_check = {}
                         if saved_check.get("verdict") == "blocked":
                             raise ValueError(f"首帧构图不符合分组运镜计划（{sid}）：{saved_check.get('reason') or '关键接触位置不可见'}")
                     if observed:
@@ -345,9 +430,9 @@ class VideoAgent:
                     task_doc = {"task_id": task_id, **(task or {})}
                     try:
                         has_pending = getattr(service, "has_pending_render", lambda *a, **kw: False)(
-                            task_id, sid, first, video_prompt=prompt, duration=duration, ratio=ratio, **prompt_options
+                            task_id, sid, first, video_prompt=submitted_prompt, duration=duration, ratio=ratio, **prompt_options
                         ) is True
-                        def _call_video(_sid=sid, _first=first, _prompt=prompt, _dur=duration, _opts=prompt_options):
+                        def _call_video(_sid=sid, _first=first, _prompt=submitted_prompt, _dur=duration, _opts=prompt_options):
                             return service.generate_video(
                                 task_id=task_id, scene_id=_sid, image_path=_first,
                                 video_prompt=_prompt, duration=_dur, ratio=ratio, **_opts
@@ -376,11 +461,11 @@ class VideoAgent:
                     asset["provider_task_id"] = result.get("provider_task_id")
                     asset["first_frame_digest"] = first_digest
                     asset["render_signature"] = signature
-                    asset["submitted_video_prompt"] = prompt
+                    asset["submitted_video_prompt"] = submitted_prompt
                     await mongodb.replace_one(ASSETS_COLLECTION, {"_id": asset_id},
                                               with_document_id(asset, asset_id), upsert=True)
                     await mongodb.update_one(SCENES_COLLECTION, key, {"video_path": asset["path"],
-                                              "submitted_video_prompt": prompt,
+                                              "submitted_video_prompt": submitted_prompt,
                                               "continuity_input_path": first, "need_dynamic_video": True, "stale_tail": False,
                                               "status": "video_done", "updated_at": now})
                 else:

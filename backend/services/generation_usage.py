@@ -162,6 +162,9 @@ def estimate_generation(duration, mode=None, episodes=1):
     elif mode == 'paired_5s':
         images = ceil(duration / 10)
         videos = images * 2
+    elif mode == 'auto_director':
+        clips = max(2, round(duration / 9))
+        images = videos = clips
     else:
         images = videos = ceil(duration / 10)
     return {'images': images * episodes, 'videos': videos * episodes, 'total': (images + videos) * episodes}

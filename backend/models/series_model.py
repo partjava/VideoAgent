@@ -9,10 +9,17 @@ class CreateSeriesRequest(BaseModel):
     episode_duration: Literal[10, 30, 60, 90] = 30
     style: Literal['短剧', '漫剧'] = '短剧'
     ratio: Literal['9:16', '16:9'] = '9:16'
+    market_mode: Literal['cn', 'en'] = 'cn'
     character_ids: list[str] = Field(default_factory=list)
     auto_continue: bool = False
     pre_shoot_review: bool = False
     generation_limit: int | None = Field(default=None, ge=1, le=10000)
+    initial_episodes: list[dict[str, Any]] | None = None
+    continuity_ledgers: dict[str, Any] | None = None
+
+
+class ContinuityLedgersRequest(BaseModel):
+    continuity_ledgers: dict[str, Any]
 
 
 class OutlineRequest(BaseModel):

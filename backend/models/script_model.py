@@ -1,26 +1,29 @@
 from datetime import UTC, datetime
 
-from typing import Literal
-
 from pydantic import BaseModel, Field, model_validator
 
 
 class ScriptLine(BaseModel):
     speaker: str = Field(min_length=1)
     text: str = Field(min_length=1)
-    start: float = Field(ge=0, lt=10)
+    start: float = Field(ge=0, lt=30)
+    emotion: str = ""
 
 
 class ScriptSegment(BaseModel):
-    duration: Literal[10]
+    duration: int = Field(default=10, ge=4, le=12)
     plot: str = Field(min_length=1)
-    voice_start: float = Field(ge=0, lt=10)
+    voice_start: float = Field(ge=0, lt=30)
     voiceover: str = ""
     dialogue_lines: list[ScriptLine] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_speech(self):
+        if self.voice_start >= self.duration:
+            raise ValueError("旁白或对白切入时间必须小于本段时长")
         if self.dialogue_lines:
+            if any(line.start >= self.duration for line in self.dialogue_lines):
+                raise ValueError("对白出声时间必须小于本段时长")
             if any(right.start <= left.start for left, right in zip(self.dialogue_lines, self.dialogue_lines[1:])):
                 raise ValueError("对白出声时间必须依次递增")
         elif not self.voiceover.strip():

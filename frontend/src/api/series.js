@@ -8,6 +8,8 @@ export const seriesApi = {
   outline: (id) => client.post(`${path(id)}/outline`),
   saveOutline: (id, episodes) =>
     client.put(`${path(id)}/outline`, { episodes }),
+  saveLedgers: (id, continuity_ledgers) =>
+    client.put(`${path(id)}/ledgers`, { continuity_ledgers }),
   confirm: (id) => client.post(`${path(id)}/confirm`),
   run: (id) => client.post(`${path(id)}/run`),
   stop: (id) => client.post(`${path(id)}/stop`),

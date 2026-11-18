@@ -34,6 +34,7 @@ from services.generation_usage import GenerationLimitExceeded
 
 router = APIRouter(prefix="/api/video", tags=["video"])
 _audio_remixes = set()
+_running_pipelines: set[str] = set()
 
 
 class AudioTimingEdit(BaseModel):
@@ -150,6 +151,8 @@ async def run_pipeline_wrapper(task_id: str) -> None:
             )
         except Exception as inner_exc:
             print(f"[BackgroundTasks] Failed to update task error status: {inner_exc}")
+    finally:
+        _running_pipelines.discard(task_id)
 
 
 @router.post("/{task_id}/run-pipeline", response_model=ApiResponse)
@@ -166,6 +169,8 @@ async def run_video_pipeline(
 
         if (task.get("metadata") or {}).get("series_context"):
             return error_response("请在连载工作台继续或重新生成本集，以维护跨集状态", 409)
+        if task_id in _running_pipelines:
+            return error_response("任务正在后台生成中，请勿重复启动", 409)
         if not resume:
             # 清理历史资产文件和数据库，准备重头开始生成
             await task_service.clear_task_assets(task_id)
@@ -179,12 +184,23 @@ async def run_video_pipeline(
                 },
             )
 
+        _running_pipelines.add(task_id)
         if run_async:
+            await task_service.update_task_fields(
+                task_id,
+                {
+                    "status": VideoTaskStatus.PLANNING.value,
+                    "metadata.last_error": None,
+                },
+            )
             background_tasks.add_task(run_pipeline_wrapper, task_id)
             return ApiResponse(status="success", data={"message": "Pipeline execution started."})
 
-        result = await run_pipeline(task_id)
-        return ApiResponse(status="success", data=result)
+        try:
+            result = await run_pipeline(task_id)
+            return ApiResponse(status="success", data=result)
+        finally:
+            _running_pipelines.discard(task_id)
     except PyMongoError:
         return error_response("MongoDB unavailable", 503)
     except ValueError as exc:
@@ -307,8 +323,7 @@ async def rerun_scene_asset(
     payload: RerunSceneRequest,
 ) -> ApiResponse | JSONResponse:
     """
-    OpenCut / OpenMontage 风格：单镜头局部重新生成与微调。
-    支持重新生成配音、图片、视频，并自动重新合成最终视频。
+    单镜头局部重新生成与微调：支持重新生成配音、图片、视频，并自动重新合成最终视频。
     """
     try:
         task = await task_service.get_task(task_id)

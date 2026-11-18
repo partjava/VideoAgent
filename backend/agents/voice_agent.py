@@ -1,8 +1,21 @@
 import anyio
 import math
+from config import settings
 from services.provider_factory import get_llm_service
-from services.generation_contract import MAX_VOICE_SPEED
-from services.character_binding import frozen_characters, scene_voice_options, faster_voice_options
+from services.generation_contract import (
+    AUTO_DIRECTOR_MODE,
+    MAX_VOICE_SPEED,
+    provider_duration_bounds,
+    rebalance_motion_beats_duration,
+)
+from services.character_binding import (
+    apply_dialogue_emotion_prosody,
+    build_effective_voice_profiles,
+    faster_voice_options,
+    frozen_characters,
+    infer_dialogue_emotion,
+    scene_voice_options,
+)
 import os
 import re
 from datetime import UTC, datetime
@@ -48,7 +61,7 @@ def clean_tts_text(text: str) -> str:
     return "\n".join(cleaned_lines)
 
 
-async def synthesize_dialogue(scene, backend_dir, task_id, render_id):
+async def synthesize_dialogue(scene, backend_dir, task_id, render_id, *, allow_duration_extend: bool = False, max_duration: int = 12):
     from services.generation_contract import scene_event_offset, voice_speed
 
     lines = scene["dialogue_lines"]
@@ -67,7 +80,10 @@ async def synthesize_dialogue(scene, backend_dir, task_id, render_id):
     durations = []
     for index, line in enumerate(lines):
         text = clean_tts_text(line["text"])
-        options = scene_voice_options(scene, line["speaker"])
+        options = apply_dialogue_emotion_prosody(
+            scene_voice_options(scene, line["speaker"]),
+            infer_dialogue_emotion(text, line.get("emotion")),
+        )
         path = f"assets/{task_id}/audio/dialogue_{render_id}_{index}.mp3"
         duration = await tts_service.generate_voice(text, str(backend_dir / path), **options)
         if not math.isfinite(duration) or duration <= 0:
@@ -76,10 +92,22 @@ async def synthesize_dialogue(scene, backend_dir, task_id, render_id):
         rendered.append({"speaker": line["speaker"], "text": text, "path": f"backend/{path}",
                          "source_duration": duration, "voice_options": options})
 
+    # 配音反推分镜时长：仅当允许弹性扩充且对白明显偏紧时，在模型支持区间内自适应延展秒数
+    total_spoken = math.fsum(durations)
+    if allow_duration_extend and int(scene["duration"]) < max_duration and (
+        any(d > slot * 1.15 for d, slot in zip(durations, slots))
+        or total_spoken > (scene_end - offsets[0]) * 1.12
+    ):
+        needed_end = min(max_duration, max(int(scene["duration"]) + 1, math.ceil(offsets[0] + total_spoken / 1.08 + 0.35)))
+        if needed_end > int(scene["duration"]):
+            scene["_adapted_duration"] = needed_end
+            scene_end = float(needed_end)
+            slots = [end - start for start, end in zip(offsets, offsets[1:] + [scene_end])]
+
     if all(duration <= slot * MAX_VOICE_SPEED for duration, slot in zip(durations, slots)):
         speeds = [voice_speed(scene["scene_id"], duration, slot) for duration, slot in zip(durations, slots)]
     else:
-        speed = voice_speed(scene["scene_id"], math.fsum(durations), scene_end - offsets[0])
+        speed = voice_speed(scene["scene_id"], total_spoken, scene_end - offsets[0])
         speeds = [speed] * len(lines)
         latest = [0.0] * len(lines)
         cursor = scene_end
@@ -124,7 +152,7 @@ class VoiceAgent:
             task_scenes = [scene for scene in scenes]
             task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
             task = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
-            profiles = frozen_characters(task)
+            profiles = build_effective_voice_profiles(task, task_scenes)
             for scene in task_scenes:
                 scene["voice_profiles"] = profiles
 
@@ -176,17 +204,45 @@ class VoiceAgent:
 
             now = datetime.now(UTC)
             total_duration = 0.0
+            durations_changed = False
+            allow_flexible_duration = (
+                task.get("generation_mode") == AUTO_DIRECTOR_MODE and not task.get("duration_locked")
+            )
+            _, max_clip_seconds = provider_duration_bounds(settings.video_provider, settings.wan_video_model)
             for scene in task_scenes:
                 scene_id = str(scene["scene_id"])
                 if scene.get("dialogue_lines"):
                     audio = scene.get("dialogue_audio") or []
                     binding_changed = profiles and any(
-                        item.get("voice_options") != scene_voice_options(scene, line["speaker"])
+                        item.get("voice_options") != apply_dialogue_emotion_prosody(
+                            scene_voice_options(scene, line["speaker"]),
+                            infer_dialogue_emotion(line.get("text", ""), line.get("emotion")),
+                        )
                         for item, line in zip(audio, scene["dialogue_lines"])
                     )
                     if len(audio) != len(scene["dialogue_lines"]) or binding_changed or not all(resolve_media(line["path"]).is_file() for line in audio):
-                        audio = await synthesize_dialogue(scene, backend_dir, task_id, scene_id)
-                        await mongodb.update_one(SCENES_COLLECTION, {"_id": scene["_id"]}, {"dialogue_audio": audio})
+                        audio = await synthesize_dialogue(
+                            scene,
+                            backend_dir,
+                            task_id,
+                            scene_id,
+                            allow_duration_extend=allow_flexible_duration,
+                            max_duration=max_clip_seconds,
+                        )
+                        update_payload: dict[str, object] = {"dialogue_audio": audio}
+                        adapted_dur = scene.pop("_adapted_duration", None)
+                        if adapted_dur and adapted_dur > int(scene["duration"]):
+                            old_dur = int(scene["duration"])
+                            new_beats = rebalance_motion_beats_duration(scene.get("motion_beats") or [], old_dur, adapted_dur)
+                            scene["duration"] = adapted_dur
+                            scene["motion_beats"] = new_beats
+                            update_payload.update({
+                                "duration": adapted_dur,
+                                "motion_beats": new_beats,
+                                "duration_adapted_by_voice": True,
+                            })
+                            durations_changed = True
+                        await mongodb.update_one(SCENES_COLLECTION, {"_id": scene["_id"]}, update_payload)
                     total_duration += sum(line["end"] - line["start"] for line in audio)
                     continue
                 voiceover = clean_tts_text(str(scene.get("voiceover") or ""))
@@ -217,6 +273,31 @@ class VoiceAgent:
                 scene_duration = float(scene["audio_duration"]) if cached else await tts_service.generate_voice(
                     text=voiceover, output_path=str(scene_audio_path), **options
                 )
+
+                # 配音实测反推分镜时长：自主导演且未锁定总时长时，优先自然延展单镜至足够气口而非生硬加速或删词
+                if not cached and allow_flexible_duration:
+                    cur_dur = int(scene["duration"])
+                    voice_offset, _ = voice_window(scene)
+                    if scene_duration > slot * 1.12 and cur_dur < max_clip_seconds:
+                        new_dur = min(
+                            max_clip_seconds,
+                            max(cur_dur + 1, math.ceil(voice_offset + scene_duration / 1.08 + 0.45)),
+                        )
+                        if new_dur > cur_dur:
+                            new_beats = rebalance_motion_beats_duration(scene.get("motion_beats") or [], cur_dur, new_dur)
+                            scene["duration"] = new_dur
+                            scene["motion_beats"] = new_beats
+                            await mongodb.update_one(
+                                SCENES_COLLECTION,
+                                {"_id": f"{task_id}_{scene_id}"},
+                                {
+                                    "duration": new_dur,
+                                    "motion_beats": new_beats,
+                                    "duration_adapted_by_voice": True,
+                                },
+                            )
+                            _, slot = voice_window(scene)
+                            durations_changed = True
 
                 # 原生语速优化：若音频略长于分镜时长，通过 edge-tts 原生 rate 微调，避免 MoviePy 变调失真
                 if not cached and slot < scene_duration <= slot * MAX_VOICE_SPEED:
@@ -303,6 +384,14 @@ class VoiceAgent:
                 scene["speaker"] = speaker or "旁白"
                 scene["voice"] = scene_voice
                 total_duration += scene_duration
+
+            if durations_changed:
+                synced_total = sum(int(s["duration"]) for s in task_scenes)
+                await mongodb.update_one(
+                    "video_tasks",
+                    {"_id": task_id},
+                    {"duration": synced_total, "metadata.task_plan.duration": synced_total},
+                )
 
             if has_dialogue:
                 await mark_agent_success(task_id, self.agent_name, progress=90,

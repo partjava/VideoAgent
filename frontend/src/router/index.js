@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import Characters from "../views/Characters.vue";
 import Series from "../views/Series.vue";
 import SeriesDetail from "../views/SeriesDetail.vue";
+import StudioCraft from "../views/StudioCraft.vue";
 import CreateVideo from "../views/CreateVideo.vue";
 import TaskProgress from "../views/TaskProgress.vue";
 import VideoPreview from "../views/VideoPreview.vue";
@@ -10,6 +11,7 @@ import Settings from "../views/Settings.vue";
 import ComfyUISettings from "../views/ComfyUISettings.vue";
 
 const routes = [
+  { path: "/studio-craft", component: StudioCraft, meta: { title: "短剧导演工坊" } },
   { path: "/characters", component: Characters, meta: { title: "角色资产" } },
   { path: "/series", component: Series, meta: { title: "连载短剧" } },
   {

@@ -19,6 +19,34 @@ WAN3_MODELS = frozenset({"wan3.0-video", "wan3.0-video-prime"})
 FLASH_MODEL = "wan2.6-i2v-flash"
 
 
+def _describe_submit_error(res, model: str) -> str:
+    """把百炼返回的 4xx 错误转换为带处理建议的中文提示。"""
+    code = message = ""
+    try:
+        body = res.json()
+        code = str(body.get("code") or "")
+        message = str(body.get("message") or "")
+    except Exception:
+        message = (res.text or "")[:300]
+    detail = f"HTTP {res.status_code}" + (f" {code}" if code else "") + (f"：{message}" if message else "")
+    status = res.status_code
+    lowered = f"{code} {message}".lower()
+    if status == 401 or "invalidapikey" in lowered:
+        hint = "API Key 无效或已失效，请在「API 配置」页重新填写阿里云百炼 Key。"
+    elif status == 403 or "accessdenied" in lowered:
+        hint = (
+            f"当前账号没有调用 {model} 的权限。请到阿里云百炼控制台「模型广场」开通该模型，"
+            "或确认 Key 与服务地域（北京 / 新加坡）一致；也可以在「API 配置」页把视频模型临时切换为 wan2.6-i2v-flash。"
+        )
+    elif status == 429 or "throttl" in lowered or "quota" in lowered:
+        hint = "调用频率或额度受限，请稍后重试或检查百炼账户余额与免费额度。"
+    elif "datainspection" in lowered or "sensitive" in lowered or "green" in lowered:
+        hint = "提示词或首帧触发了内容安全审核，请修改该镜头的画面或台词后重试。"
+    else:
+        hint = "请求参数被拒绝，请检查模型名称、时长与画面比例是否被该模型支持。"
+    return f"{detail}。{hint}"
+
+
 class WanVideoService(BaseVideoService):
     @property
     def _normalized_model_name(self):
@@ -28,6 +56,10 @@ class WanVideoService(BaseVideoService):
     def supports_negative_prompt(self):
         name = self._normalized_model_name
         return name == FLASH_MODEL or name in SILENT_OUTPUT_MODELS
+
+    @property
+    def supports_last_frame(self):
+        return self._normalized_model_name in WAN3_MODELS
 
     def __init__(self, model=None, storage_root=None):
         profile = model_config("video", settings)
@@ -44,7 +76,7 @@ class WanVideoService(BaseVideoService):
                 cleaned = cleaned[: -len(suffix)].rstrip("/")
         return cleaned or self.api_url
 
-    def _render_paths(self, task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt):
+    def _render_paths(self, task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt, last_frame_path=None):
         source = Path(image_path)
         if not source.is_absolute():
             source = self.storage_root / str(image_path).replace("backend/", "", 1)
@@ -52,12 +84,18 @@ class WanVideoService(BaseVideoService):
         fingerprint.update(json.dumps([self.model, video_prompt, duration, ratio]).encode())
         if negative_prompt and self.supports_negative_prompt:
             fingerprint.update(negative_prompt.encode("utf-8"))
+        if last_frame_path and self.supports_last_frame:
+            last_src = Path(last_frame_path)
+            if not last_src.is_absolute():
+                last_src = self.storage_root / str(last_frame_path).replace("backend/", "", 1)
+            if last_src.is_file():
+                fingerprint.update(sha256(last_src.read_bytes()).digest())
         job = self.storage_root / "assets" / task_id / "video_jobs" / f"{scene_id}-{fingerprint.hexdigest()}.json"
         return source, job
 
     def has_pending_render(self, task_id, scene_id, image_path, video_prompt=None,
-                           duration=5, ratio="9:16", negative_prompt=None):
-        _, job = self._render_paths(task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt)
+                           duration=5, ratio="9:16", negative_prompt=None, last_frame_path=None):
+        _, job = self._render_paths(task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt, last_frame_path)
         return job.is_file()
 
     def _upload_file(self, file_path: str) -> str:
@@ -151,6 +189,7 @@ class WanVideoService(BaseVideoService):
         duration: int = 5,
         ratio: str = "9:16",
         negative_prompt: str | None = None,
+        last_frame_path: str | None = None,
     ) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true 开启。")
@@ -175,7 +214,7 @@ class WanVideoService(BaseVideoService):
             # 1. 如果是相对路径，则按 backend 根目录解析本地图片路径
             backend_dir = self.storage_root
             resolved_image_path, job = self._render_paths(
-                task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt
+                task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt, last_frame_path
             )
             job.parent.mkdir(parents=True, exist_ok=True)
             api_task_id = None
@@ -186,6 +225,7 @@ class WanVideoService(BaseVideoService):
             # Both API versions use the first frame to determine the aspect ratio.
             from tempfile import TemporaryDirectory
             from services.media_quality import write_aspect_frame
+            last_frame_uri = None
             with TemporaryDirectory(prefix="wan_frame_") as tmp:
                 normalized = Path(tmp) / "first_frame.png"
                 write_aspect_frame(resolved_image_path, normalized, ratio)
@@ -195,6 +235,17 @@ class WanVideoService(BaseVideoService):
                     with Image.open(normalized) as frame:
                         frame.convert("RGB").save(buffer, format="JPEG", quality=92)
                     first_frame = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+                    if wan3 and last_frame_path:
+                        resolved_last = Path(last_frame_path)
+                        if not resolved_last.is_absolute():
+                            resolved_last = self.storage_root / str(last_frame_path).replace("backend/", "", 1)
+                        if resolved_last.is_file():
+                            norm_last = Path(tmp) / "last_frame.png"
+                            write_aspect_frame(resolved_last, norm_last, ratio)
+                            last_buf = BytesIO()
+                            with Image.open(norm_last) as lframe:
+                                lframe.convert("RGB").save(last_buf, format="JPEG", quality=92)
+                            last_frame_uri = "data:image/jpeg;base64," + base64.b64encode(last_buf.getvalue()).decode("ascii")
                 elif api_task_id:
                     first_frame = None
                 else:
@@ -207,16 +258,14 @@ class WanVideoService(BaseVideoService):
                 "Content-Type": "application/json",
                 "X-DashScope-Async": "enable"
             }
+            media_list = [{"type": "first_frame", "url": first_frame}]
+            if last_frame_uri and wan3:
+                media_list.append({"type": "last_frame", "url": last_frame_uri})
             payload = {
                 "model": self.model,
                 "input": {
                     "prompt": video_prompt or "smooth movement, high quality, consistent with character",
-                    "media": [
-                        {
-                            "type": "first_frame",
-                            "url": first_frame
-                        }
-                    ]
+                    "media": media_list,
                 },
                 "parameters": {
                     "resolution": "720P",
@@ -245,6 +294,11 @@ class WanVideoService(BaseVideoService):
                     res = client.post(submit_url, json=payload, headers=headers)
                     if 400 <= res.status_code < 500:
                         job.unlink(missing_ok=True)
+                        reason = _describe_submit_error(res, self.model)
+                        # 仅内容审核类拒绝允许降级为静态镜头；鉴权/权限/额度问题必须中止，避免整片悄悄变成静帧
+                        if "内容安全审核" in reason:
+                            raise VideoRenderRejected(reason)
+                        raise RuntimeError(reason)
                     res.raise_for_status()
                     api_task_id = res.json().get("output", {}).get("task_id")
                     if not api_task_id:

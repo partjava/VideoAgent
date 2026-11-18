@@ -4,6 +4,15 @@ from models.task_model import VideoTaskStatus
 from models.asset_model import Asset
 from core.database import mongodb
 from services.audio_timing import narration_speed
+from services.shot_continuity import (
+    apply_color_match_to_clip,
+    apply_cut_transitions,
+    apply_micro_audio_fade,
+    measure_clip_rgb_stats,
+    measure_loudnorm_filter,
+    plan_shot_color_match,
+    wrap_ducked_bgm,
+)
 
 from agents.agent_utils import (
     ASSETS_COLLECTION,
@@ -109,36 +118,62 @@ class EditorAgent:
             aspect = (16, 9) if task.get("ratio") == "16:9" else (9, 16)
             with ExitStack() as resources:
                 clips, audio_segments = [], []
+                speech_windows: list[tuple[float, float]] = []
                 canvas = None
-                for scene, item, row in zip(task_scenes, mixed_inputs, timeline):
+                for idx, (scene, item, row) in enumerate(zip(task_scenes, mixed_inputs, timeline)):
                     path = resolve_media(item["path"])
                     if not path.is_file():
                         raise FileNotFoundError(f"Missing scene media: {path}")
                     duration = row["duration"]
+                    next_is_continue = (
+                        idx + 1 < len(task_scenes)
+                        and str(task_scenes[idx + 1].get("transition_type") or "") == "continue_action"
+                    )
                     if item["type"] == "dynamic_video":
                         source = resources.enter_context(VideoFileClip(str(path)))
                         clip = source.without_audio()
                         if source.duration < duration:
                             if duration - source.duration > 0.5:
                                 raise ValueError(f"Scene {scene['scene_id']} video is too short: {source.duration}s for {duration}s")
-                            # Preserve the planned clock; hold only the final frame.
-                            still = ImageClip(source.get_frame(max(0, source.duration - 1 / (source.fps or 24)))).set_duration(duration - source.duration)
-                            clip = concatenate_videoclips([clip, still], method="compose")
+                            ratio_speed = source.duration / max(0.1, duration)
+                            if ratio_speed >= 0.88:
+                                # 无感平滑微调时长，避免末尾突然定格卡死
+                                clip = clip.fx(vfx.speedx, ratio_speed).set_duration(duration)
+                            else:
+                                still = ImageClip(source.get_frame(max(0, source.duration - 1 / (source.fps or 24)))).set_duration(duration - source.duration)
+                                clip = concatenate_videoclips([clip, still], method="compose")
                         else:
-                            clip = clip.subclip(0, duration)
+                            extra = source.duration - duration
+                            has_opening_speech = bool(scene.get("dialogue_lines")) or (
+                                bool(str(scene.get("voiceover") or "").strip()) and float(scene.get("voice_start") or 0) < 0.4
+                            )
+                            if (
+                                extra >= 0.24
+                                and scene.get("transition_type") != "continue_action"
+                                and not next_is_continue
+                                and not has_opening_speech
+                            ):
+                                # 跳过 AI 视频前几帧常见起步呆立，切入即处于运动惯性中
+                                lead = min(0.16, extra - 0.04)
+                                clip = clip.subclip(lead, lead + duration)
+                            else:
+                                clip = clip.subclip(0, duration)
                     else:
                         if needs_video(scene):
                             raise ValueError(f"Dynamic scene has no video: {scene['scene_id']}")
                         with Image.open(path) as image:
                             clip = ImageClip(np.asarray(ImageOps.exif_transpose(image).convert("RGB"))).set_duration(duration)
-                            # Remotion / OpenMontage 风格：Ken Burns 缓慢平滑推镜（呼吸感动效）
-                            clip = clip.resize(lambda t: 1.0 + 0.05 * (t / max(0.1, duration)))
+                            # 静帧段交替推拉呼吸动效，增强连续镜质感
+                            if idx % 2 == 0:
+                                clip = clip.resize(lambda t, d=duration: 1.0 + 0.05 * (t / max(0.1, d)))
+                            else:
+                                clip = clip.resize(lambda t, d=duration: 1.045 - 0.045 * (t / max(0.1, d)))
                     if canvas is None:
                         units = max(2, int(min(clip.w / aspect[0], clip.h / aspect[1], 120) // 2) * 2)
                         canvas = (aspect[0] * units, aspect[1] * units)
                     if tuple(clip.size) != canvas:
-                        clip = clip.fl_image(lambda frame: np.asarray(ImageOps.fit(
-                            Image.fromarray(frame), canvas, method=Image.Resampling.LANCZOS)))
+                        clip = clip.fl_image(lambda frame, c=canvas: np.asarray(ImageOps.fit(
+                            Image.fromarray(frame), c, method=Image.Resampling.LANCZOS)))
                     clips.append(clip)
                     audio_path = scene_audio_map.get(scene["scene_id"])
                     if scene.get("dialogue_lines"):
@@ -148,7 +183,11 @@ class EditorAgent:
                         for line in lines:
                             audio = resources.enter_context(AudioFileClip(str(resolve_media(line["path"]))))
                             audio = _fit_dialogue_audio(audio, line["speed"], line["end"] - line["start"])
-                            audio_segments.append(audio.set_start(row["start"] + line["start"]))
+                            audio = apply_micro_audio_fade(audio)
+                            abs_start = row["start"] + line["start"]
+                            abs_end = row["start"] + line["end"]
+                            speech_windows.append((abs_start, abs_end))
+                            audio_segments.append(audio.set_start(abs_start))
                         audio_path = None
                     elif str(scene.get("voiceover") or "").strip() and not audio_path:
                         raise ValueError(f"Missing scene audio: {scene['scene_id']}")
@@ -158,30 +197,46 @@ class EditorAgent:
                         speed = narration_speed(scene, float(scene.get("audio_duration") or audio.duration), slot)
                         if speed != 1:
                             audio = audio.fx(vfx.speedx, speed)
+                        audio = apply_micro_audio_fade(audio)
+                        abs_start = row["start"] + offset
+                        speech_windows.append((abs_start, abs_start + float(audio.duration or slot)))
                         # Absolute placement preserves silence and missing-dialogue gaps.
-                        audio_segments.append(audio.set_start(row["start"] + offset))
+                        audio_segments.append(audio.set_start(abs_start))
                     for cue in scene.get("sound_cues") or []:
                         name = cue["name"]
                         if name not in {"footstep", "impact", "water", "paper", "wind"}:
                             continue
                         offset = scene_event_offset(scene, cue["start"])
-                        path = backend_dir / "data" / "sfx" / f"{name}.wav"
-                        if not path.is_file():
+                        cue_path = backend_dir / "data" / "sfx" / f"{name}.wav"
+                        if not cue_path.is_file():
                             continue
-                        effect = resources.enter_context(AudioFileClip(str(path)))
+                        effect = resources.enter_context(AudioFileClip(str(cue_path)))
                         effect = effect.subclip(0, min(effect.duration, duration - offset)).volumex(0.28)
+                        effect = apply_micro_audio_fade(effect, fade_in=0.015, fade_out=0.04)
                         audio_segments.append(effect.set_start(row["start"] + offset))
+
+                # 同场连续镜头自动接镜调色（RGB 均值与离散度向组内中位数收敛）
+                shot_match_plan = plan_shot_color_match(task_scenes, lambda i: measure_clip_rgb_stats(clips[i]))
+                for idx, scene in enumerate(task_scenes):
+                    sid = str(scene["scene_id"])
+                    if sid in shot_match_plan:
+                        clips[idx] = apply_color_match_to_clip(clips[idx], shot_match_plan[sid])
+
+                # 执行切点边界微过渡
+                transitions_applied = apply_cut_transitions(clips, task_scenes)
+
                 final_video = concatenate_videoclips(clips, method="compose")
                 resources.callback(final_video.close)
                 if audio_segments:
-                    # MoneyPrinterTurbo 风格：BGM 背景音乐自动铺底与混音
+                    # BGM 自动铺底与人声动态闪避（对白期平滑压低，空白/转场回升）
                     bgm_dir = backend_dir / "data" / "bgm"
-                    bgm_candidates = (list(bgm_dir.glob("*.mp3")) + list(bgm_dir.glob("*.wav"))) if bgm_dir.exists() else []
+                    bgm_candidates = sorted(list(bgm_dir.glob("*.mp3")) + list(bgm_dir.glob("*.wav"))) if bgm_dir.exists() else []
                     bgm_file = task.get("bgm_path") or (str(bgm_candidates[0]) if bgm_candidates else None)
                     if bgm_file and Path(bgm_file).is_file():
-                        from moviepy.audio.fx.all import audio_loop, volumex
+                        from moviepy.audio.fx.all import audio_loop
                         bgm = resources.enter_context(AudioFileClip(str(bgm_file)))
-                        bgm = audio_loop(bgm, duration=timeline[-1]["end"]).fx(volumex, 0.15)
+                        bgm = audio_loop(bgm, duration=timeline[-1]["end"])
+                        bgm = wrap_ducked_bgm(bgm, speech_windows, base_volume=0.17, duck_volume=0.075)
                         audio_segments.insert(0, bgm.set_start(0))
                     final_audio = CompositeAudioClip(audio_segments).set_duration(timeline[-1]["end"])
                     resources.callback(final_audio.close)
@@ -195,10 +250,12 @@ class EditorAgent:
                 if not subtitle_file.is_file():
                     raise FileNotFoundError("Subtitle file missing")
                 staged = output_file.with_name("final_staged.mp4")
-                subtitle_style = (
-                    "FontName=SimSun,FontSize=20,MarginV=28,Outline=1.5,Shadow=0"
-                    if task.get("subtitle_style") == "poetry" else "FontSize=16,Outline=2"
-                )
+                if task.get("subtitle_style") == "poetry":
+                    subtitle_style = "Alignment=2,FontName=SimSun,FontSize=19,MarginV=32,MarginL=14,MarginR=14,Outline=1.5,Shadow=0"
+                elif aspect == (9, 16):
+                    subtitle_style = "Alignment=2,FontSize=15,MarginV=34,MarginL=14,MarginR=14,BorderStyle=1,Outline=1.6,Shadow=0.6"
+                else:
+                    subtitle_style = "Alignment=2,FontSize=16,MarginV=20,MarginL=16,MarginR=16,BorderStyle=1,Outline=1.8,Shadow=0.5"
                 filters = [f"subtitles=subtitle.srt:force_style='{subtitle_style}'"]
                 title = " ".join((task.get("intro_title") or "").split())
                 title = title.translate(str.maketrans("", "", "{}<>\\")).strip()
@@ -211,9 +268,14 @@ class EditorAgent:
                     filters.append(
                         "subtitles=intro_title.srt:force_style='Alignment=8,FontSize=22,MarginV=34,Outline=2'"
                     )
-                cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", raw_file.name,
-                       "-vf", ",".join(filters),
-                       "-c:a", "copy", staged.name]
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                loudnorm_filter = measure_loudnorm_filter(ffmpeg_exe, raw_file) if audio_segments else None
+                cmd = [ffmpeg_exe, "-y", "-i", raw_file.name, "-vf", ",".join(filters)]
+                if loudnorm_filter:
+                    cmd += ["-af", loudnorm_filter, "-c:a", "aac", "-b:a", "192k"]
+                else:
+                    cmd += ["-c:a", "copy"]
+                cmd.append(staged.name)
                 result = subprocess.run(cmd, cwd=str(output_file.parent), capture_output=True, timeout=180)
                 if result.returncode:
                     raise RuntimeError(f"Subtitle burn failed: {result.stderr.decode(errors='replace')[-1000:]}")
@@ -222,6 +284,17 @@ class EditorAgent:
                 staged.replace(output_file)
                 raw_file.unlink(missing_ok=True)
                 output_file.with_name("timeline.json").write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
+                editing_meta = {
+                    "shot_color_match": {
+                        sid: {"gains": list(m.gains), "offsets": list(m.offsets)}
+                        for sid, m in shot_match_plan.items()
+                    },
+                    "transitions_applied": transitions_applied,
+                    "loudnorm_applied": bool(loudnorm_filter),
+                }
+                output_file.with_name("editing_meta.json").write_text(
+                    json.dumps(editing_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
             synthesis_msg = "Video composed with aligned scene audio and subtitles"
             source_type = "moviepy"
 

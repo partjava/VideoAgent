@@ -128,6 +128,32 @@ class QualityAgent:
                       "semantic_review": "not_run", "limitations": "Character identity and action execution require visual review"}
             result["static_fallbacks"] = [scene["scene_id"] for scene in scenes
                                            if scene.get("status") == "static_fallback"]
+            from services.shot_continuity import ShotColorMatch, audit_final_video_continuity
+            editing_meta_path = video_file.with_name("editing_meta.json")
+            editing_meta = {}
+            if editing_meta_path.is_file():
+                try:
+                    editing_meta = json.loads(editing_meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    editing_meta = {}
+            reconstructed_match = {
+                sid: ShotColorMatch(tuple(v.get("gains", (1.0, 1.0, 1.0))), tuple(v.get("offsets", (0.0, 0.0, 0.0))))
+                for sid, v in (editing_meta.get("shot_color_match") or {}).items()
+                if isinstance(v, dict)
+            }
+            try:
+                result["continuity_audit"] = await anyio.to_thread.run_sync(
+                    lambda: audit_final_video_continuity(
+                        video_file,
+                        scenes,
+                        timeline,
+                        shot_match_plan=reconstructed_match,
+                        transitions_applied=editing_meta.get("transitions_applied") or [],
+                    )
+                )
+                result["continuity_audit"]["loudnorm_applied"] = bool(editing_meta.get("loudnorm_applied"))
+            except Exception as audit_exc:
+                result["continuity_audit"] = {"smoothness_score": None, "error": str(audit_exc), "issues": []}
             plan = (task.get("metadata") or {}).get("task_plan") or {}
             if plan.get("video_type"):
                 from services.provider_factory import get_llm_service

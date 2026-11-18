@@ -12,14 +12,38 @@ from uuid import uuid4
 from PIL import Image
 from core.database import mongodb
 from models.character_model import CharacterFields, CharacterUpdate, PortraitView, ReferenceView
+from services.drama_craft_service import (
+    STYLE_QUALITY_BLOCKS,
+    build_character_sheet_4grid_prompt,
+    ensure_shoes_in_clothing,
+    infer_anti_drift_negatives,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-REFERENCE_FILENAMES = {"front": "anchor.png", "profile": "profile.png", "whole": "whole.png"}
+REFERENCE_FILENAMES = {
+    "front": "anchor.png",
+    "profile": "profile.png",
+    "whole": "whole.png",
+    "sheet": "sheet.png",
+}
 VIEW_PROMPTS = {
-    "front": "角色正面半身定妆照，正视镜头，面部五官清晰对称，光线柔和均匀，干净纯色摄影棚背景",
-    "profile": "同一角色侧面90度半身定妆照，侧脸轮廓清晰，发型、五官特征与服装细节与正面保持完全一致，干净纯色摄影棚背景",
-    "whole": "同一角色全身站立定妆照，从头到脚完整全身入镜，面部特征、发型与全身标志服装与正面保持完全一致，干净纯色摄影棚背景",
+    "front": (
+        "【角色设定图 - 正面平视锚点图】角色正面半身至胸口上方定妆照，真人正常7头身比例（严禁Q版大头），"
+        "正视镜头，面部五官清晰对称，平静中性表情（neutral expression），双肩端平，双手自然垂放身体两侧，"
+        "空手不持握任何独立道具（no props in hand, no pose），纯白无接缝影棚背景（#FFFFFF），45度柔光箱均匀受光，无文字无水印"
+    ),
+    "profile": (
+        "【角色设定图 - 90度正侧面定妆图】同一角色标准90度正侧面定妆照（strict 90-degree side profile view），"
+        "鼻梁、下颌线、后脑勺发型层次与肩背侧面轮廓清晰完整，五官特征与服装材质与正面保持完全一致，"
+        "身体自然挺直，双手自然垂放身体两侧，空手不持物，纯白无接缝影棚背景（#FFFFFF），无文字无水印"
+    ),
+    "whole": (
+        "【角色设定图 - 正面全身站立标准图】同一角色正面全身直立定妆照（full-body standing front view, head to toe fully visible），"
+        "头顶至鞋底完整入画，画面上下各留5%白边（严禁截断小腿或脚部），真人正常7头身比例（严禁Q版或大头娃娃比例），"
+        "双腿自然直立，双手自然垂放于身体两侧，空手不持握任何独立道具（no props in hand, no pose），"
+        "纯白无接缝影棚背景（#FFFFFF），脚底仅有极淡自然落地投影，无文字无水印"
+    ),
 }
 
 
@@ -192,22 +216,46 @@ class CharacterService:
         custom_prompt: str = "",
         style: str = "realistic",
     ) -> str:
+        if view == "sheet":
+            return build_character_sheet_4grid_prompt(profile, style=style, custom_prompt=custom_prompt)
         if custom_prompt and view == "front" and style == "realistic":
             return custom_prompt
-        style_prefix = {
-            "3d": "3D数字人建模渲染风格，虚幻引擎5（UE5）与Octane Render立体光影质感，标准3D角色资产正交视角（A-Pose标准站姿），五官立体精致，材质纹理清晰",
-            "anime": "高精度二次元动漫角色设定三视图风格，干净利落赛璐珞线稿与光影，标准角色立绘正交视角",
-            "realistic": "影视级真人写实定妆照风格，真实皮肤质感与自然摄影棚布光",
-        }.get(style, "")
+        style_prefix = STYLE_QUALITY_BLOCKS.get(style, STYLE_QUALITY_BLOCKS["realistic"])
         base_desc = VIEW_PROMPTS.get(view, VIEW_PROMPTS["front"])
+        face_dna = (profile.get("face_dna") or "").strip()
+        clothing = (profile.get("signature_clothing") or "").strip()
+        if view == "whole":
+            clothing = ensure_shoes_in_clothing(clothing, face_dna)
+        anti_drift = infer_anti_drift_negatives(face_dna, clothing, profile.get("name") or "")
         parts = [
             style_prefix,
             base_desc,
             (custom_prompt or "").strip(),
-            (profile.get("face_dna") or "").strip(),
-            (profile.get("signature_clothing") or "").strip(),
+            f"面部五官锚点：{face_dna}" if face_dna else "",
+            f"标志服装与鞋履：{clothing}" if clothing else "",
+            f"禁止项：{anti_drift}",
         ]
         return "。".join(p.strip("。 ") for p in parts if p and p.strip("。 "))
+
+    async def preview_prompts(self, character_id: str, style: str = "realistic") -> dict:
+        profile = await self.get(character_id)
+        return {
+            "character_id": character_id,
+            "name": profile.get("name"),
+            "style": style,
+            "prompts": {
+                "front": self._build_portrait_prompt(profile, "front", style=style),
+                "profile": self._build_portrait_prompt(profile, "profile", style=style),
+                "whole": self._build_portrait_prompt(profile, "whole", style=style),
+                "sheet": self._build_portrait_prompt(profile, "sheet", style=style),
+            },
+        }
+
+    async def batch_create(self, items: list[CharacterFields]) -> list[dict]:
+        created = []
+        for item in items:
+            created.append(await self.create(item))
+        return created
 
     async def _generate_single_view(
         self,
@@ -218,7 +266,7 @@ class CharacterService:
     ) -> dict:
         from services.provider_factory import get_image_service
         if view not in REFERENCE_FILENAMES:
-            raise ValueError("Reference view must be front, profile, or whole")
+            raise ValueError("Reference view must be front, profile, whole, or sheet")
         profile = await self.get(character_id)
         image_service = get_image_service()
         full_prompt = self._build_portrait_prompt(profile, view, prompt, style=style)
@@ -229,6 +277,7 @@ class CharacterService:
             and local_asset(front_path).is_file()
             and bool(getattr(image_service, "supports_reference_images", False))
         )
+        target_ratio = "16:9" if view == "sheet" else "9:16"
 
         def _invoke():
             if use_ref:
@@ -237,15 +286,24 @@ class CharacterService:
                         "character_portraits",
                         f"{uuid4().hex}_{view}",
                         full_prompt,
+                        ratio=target_ratio,
                         reference_images=[front_path],
                     )
                 except (TypeError, ValueError):
                     pass
-            return image_service.generate_image(
-                "character_portraits",
-                f"{uuid4().hex}_{view}",
-                full_prompt,
-            )
+            try:
+                return image_service.generate_image(
+                    "character_portraits",
+                    f"{uuid4().hex}_{view}",
+                    full_prompt,
+                    ratio=target_ratio,
+                )
+            except TypeError:
+                return image_service.generate_image(
+                    "character_portraits",
+                    f"{uuid4().hex}_{view}",
+                    full_prompt,
+                )
 
         result = await asyncio.to_thread(_invoke)
         if result.get("status") != "success" or not result.get("asset_path"):

@@ -174,6 +174,19 @@
             </div>
           </div>
 
+          <!-- 风格质感选择栏 -->
+          <div class="style-selector-bar">
+            <span class="style-selector-label">🎨 角色生图质感风格：</span>
+            <el-radio-group v-model="selectedStyle" size="small">
+              <el-radio-button value="realistic">写实短剧风（毛孔肌理）</el-radio-button>
+              <el-radio-button value="3d">3D 国漫风（UE5 SSS次表面散射）</el-radio-button>
+              <el-radio-button value="anime">2D 精品漫剧风（赛璐珞二分光影）</el-radio-button>
+            </el-radio-group>
+            <el-button size="small" type="info" plain @click="openPromptPreview(selectedCharacter)">
+              📋 查看/复制定妆 Prompt
+            </el-button>
+          </div>
+
           <!-- 正面 / 侧面 / 全身 三视图大图 -->
           <div class="reference-grid">
             <figure v-for="view in views" :key="view.key">
@@ -193,12 +206,41 @@
                   type="primary"
                   :loading="generatingKey === `${id(selectedCharacter)}:${view.key}`"
                   :disabled="busy"
-                  @click="generatePortrait(selectedCharacter, view.key, 'realistic', false, false)"
+                  @click="generatePortrait(selectedCharacter, view.key, selectedStyle, false, false)"
                 >
                   {{ storedReference(selectedCharacter, view.key) ? `重绘${view.label}` : `AI生成${view.label}` }}
                 </el-button>
               </figcaption>
             </figure>
+          </div>
+
+          <!-- 单张 16:9 横图四格角色设定板 -->
+          <div class="sheet-4grid-box">
+            <div class="sheet-4grid-header">
+              <div>
+                <strong>🖼️ 16:9 四格角色设定合集板（左1面部特写 + 左2正面全身 + 左3侧面全身 + 右1背面全身）</strong>
+                <p class="muted" style="margin: 2px 0 0; font-size: 12px">
+                  自动包含完整鞋履、7头身比例、双手自然垂放与职业服装约束，1 张图覆盖多视角参考需求。
+                </p>
+              </div>
+              <el-button
+                v-if="!selectedCharacter.archived"
+                size="small"
+                type="warning"
+                plain
+                :loading="generatingKey === `${id(selectedCharacter)}:sheet`"
+                :disabled="busy"
+                @click="generatePortrait(selectedCharacter, 'sheet', selectedStyle, false, false)"
+              >
+                {{ storedReference(selectedCharacter, "sheet") ? "重绘 16:9 四格设定板" : "✨ AI生成 16:9 四格设定板" }}
+              </el-button>
+            </div>
+            <img
+              v-if="storedReference(selectedCharacter, 'sheet')"
+              class="sheet-4grid-img"
+              :src="assetUrl(storedReference(selectedCharacter, 'sheet'))"
+              :alt="`${selectedCharacter.name} · 16:9 四格角色设定板`"
+            />
           </div>
 
           <div class="detail-description">
@@ -218,7 +260,7 @@
                 plain
                 :loading="generatingKey === `${id(selectedCharacter)}:all`"
                 :disabled="busy"
-                @click="generatePortrait(selectedCharacter, 'all', '3d', withTurntableVideo, true)"
+                @click="generatePortrait(selectedCharacter, 'all', selectedStyle, withTurntableVideo, true)"
               >
                 {{ withTurntableVideo ? "一键生成三视图+360°视频" : "一键生成三视图（仅生图）" }}
               </el-button>
@@ -274,6 +316,24 @@
         :title="editing ? '编辑角色 · 保存为待确认新版本' : '新建角色'"
         width="min(640px, 94vw)"
       >
+        <div class="ai-expand-box">
+          <span class="template-label">✨ AI 一句话定制角色卡（调用语言模型原创外貌锚点、含鞋服装与音色）：</span>
+          <div class="ai-expand-row">
+            <el-input
+              v-model="aiCharacterBrief"
+              placeholder="输入角色灵感，例如：被豪门退婚的腹黑外科医生，左眉有浅疤，穿黑色长风衣"
+              clearable
+            />
+            <el-button
+              type="primary"
+              :loading="expandingCharacter"
+              :disabled="!aiCharacterBrief.trim() && !form.name.trim()"
+              @click="handleAiExpandCharacter"
+            >
+              AI 生成人设
+            </el-button>
+          </div>
+        </div>
         <div class="template-bar">
           <span class="template-label">常用人设模板（点击一键填入）：</span>
           <div class="template-tags">
@@ -361,6 +421,34 @@
         @generate-portrait="handleStagePortrait"
         @generate-turntable="handleStageTurntable"
       />
+
+      <!-- 定妆照 Prompt 预览与复制弹窗（零费用） -->
+      <el-dialog
+        v-model="promptPreviewDialog"
+        :title="promptPreviewData ? `${promptPreviewData.name} · 定妆照 Prompt` : '定妆照 Prompt 预览'"
+        width="min(780px, 94vw)"
+      >
+        <div v-if="promptPreviewData" class="prompt-preview-list">
+          <div
+            v-for="(label, key) in {
+              sheet: '🖼️ 16:9 四格角色设定合集板',
+              front: '👤 正面平视锚点图（Front View）',
+              profile: '📐 90° 标准正侧面图（Profile View）',
+              whole: '🧍 正面全身站立图（Whole View）',
+            }"
+            :key="key"
+            class="prompt-preview-item"
+          >
+            <div class="prompt-preview-head">
+              <strong>{{ label }}</strong>
+              <el-button size="small" type="primary" link @click="copyPromptText(promptPreviewData.prompts?.[key])">
+                一键复制 Prompt
+              </el-button>
+            </div>
+            <pre class="prompt-preview-code">{{ promptPreviewData.prompts?.[key] }}</pre>
+          </div>
+        </div>
+      </el-dialog>
     </div>
   </BasicLayout>
 </template>
@@ -370,6 +458,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import BasicLayout from "../layouts/BasicLayout.vue";
 import Character3DStage from "../components/Character3DStage.vue";
 import { charactersApi } from "../api/characters";
+import { craftApi } from "../api/craft";
 const characters = ref([]),
   loading = ref(false),
   busy = ref(false),
@@ -387,7 +476,12 @@ const characters = ref([]),
   stageVisible = ref(false),
   stageCharacterId = ref(""),
   stageBusyAction = ref(""),
-  withTurntableVideo = ref(false);
+  withTurntableVideo = ref(false),
+  selectedStyle = ref("realistic"),
+  promptPreviewDialog = ref(false),
+  promptPreviewData = ref(null),
+  aiCharacterBrief = ref(""),
+  expandingCharacter = ref(false);
 
 const id = (c) => c?.character_id || c?.id;
 
@@ -496,6 +590,32 @@ const form = reactive({
   rate: "+0%",
   pitch: "+0Hz",
 });
+
+async function handleAiExpandCharacter() {
+  if (!aiCharacterBrief.value.trim() && !form.name.trim()) return;
+  expandingCharacter.value = true;
+  try {
+    const res = await craftApi.expandCharacter({
+      name: form.name.trim(),
+      brief: aiCharacterBrief.value.trim() || form.name.trim(),
+      style: selectedStyle.value === "anime" ? "漫剧" : "短剧",
+      market_mode: "cn",
+    });
+    Object.assign(form, {
+      name: res.name || form.name,
+      face_dna: res.face_dna || form.face_dna,
+      signature_clothing: res.signature_clothing || form.signature_clothing,
+      tts_voice: res.tts_voice || form.tts_voice,
+      rate: res.rate || form.rate,
+      pitch: res.pitch || form.pitch,
+    });
+    ElMessage.success("AI 已生成完整外貌锚点、含鞋履服装与匹配音色");
+  } catch (e) {
+    ElMessage.error(e.message || "AI 生成角色设定失败，请确认已开启付费模型服务");
+  } finally {
+    expandingCharacter.value = false;
+  }
+}
 
 function applyTemplate(tpl) {
   Object.assign(form, {
@@ -657,6 +777,28 @@ async function generatePortrait(
 function open3DStage(character) {
   stageCharacterId.value = id(character);
   stageVisible.value = true;
+}
+
+async function openPromptPreview(character) {
+  try {
+    promptPreviewData.value = await charactersApi.promptPreview(
+      id(character),
+      selectedStyle.value,
+    );
+    promptPreviewDialog.value = true;
+  } catch (e) {
+    ElMessage.error(e.message || "获取定妆 Prompt 失败");
+  }
+}
+
+async function copyPromptText(txt) {
+  if (!txt) return;
+  try {
+    await navigator.clipboard.writeText(txt);
+    ElMessage.success("已复制定妆照 Prompt 到剪贴板");
+  } catch {
+    ElMessage.warning("复制失败，请手动选中复制");
+  }
 }
 
 async function handleStagePortrait({ view, style, include_turntable = false }) {
@@ -1009,5 +1151,84 @@ p {
 .audio {
   width: 100%;
   margin-top: 20px;
+}
+.style-selector-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 14px;
+}
+.style-selector-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+.sheet-4grid-box {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 10px;
+}
+.sheet-4grid-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.sheet-4grid-img {
+  display: block;
+  width: 100%;
+  max-height: 240px;
+  object-fit: contain;
+  margin-top: 12px;
+  border-radius: 8px;
+  background: #ffffff;
+}
+.prompt-preview-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.prompt-preview-item {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 12px;
+  background: #f8fafc;
+}
+.prompt-preview-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.prompt-preview-code {
+  margin: 0;
+  padding: 10px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.ai-expand-box {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 10px;
+}
+.ai-expand-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 </style>

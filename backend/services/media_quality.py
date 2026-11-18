@@ -67,11 +67,47 @@ def inspect_video(path, expected_duration=None, ratio=None, require_audio=False)
         return {"duration": clip.duration, "width": clip.w, "height": clip.h, "has_audio": clip.audio is not None}
 
 
+def _frame_sharpness(frame) -> tuple[float, float]:
+    import numpy as np
+    arr = np.asarray(frame, dtype=np.float32)
+    gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    luma = float(gray.mean())
+    if gray.shape[0] < 4 or gray.shape[1] < 4:
+        return 0.0, luma
+    dx = np.abs(gray[:, 1:] - gray[:, :-1]).mean()
+    dy = np.abs(gray[1:, :] - gray[:-1, :]).mean()
+    return float(dx + dy), luma
+
+
 def extract_tail(path, destination, display_duration=None):
     from moviepy.editor import VideoFileClip
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with VideoFileClip(str(resolve_media(path))) as clip:
+        fps = clip.fps or 24
         end = min(clip.duration, display_duration) if display_duration is not None else clip.duration
-        clip.save_frame(str(destination), t=max(0, end - 1 / (clip.fps or 24)))
+        nominal = max(0.0, end - 1 / fps)
+        target_t = nominal
+        if display_duration != 0 and nominal >= 0.35:
+            candidates = sorted({round(max(0.0, nominal - offset), 4) for offset in (0.0, 1 / fps, min(0.14, 3 / fps))})
+            best_score = -1.0
+            scored = []
+            for t in candidates:
+                frame = clip.get_frame(t)
+                sharp, luma = _frame_sharpness(frame)
+                scored.append((t, sharp, luma, frame))
+            mean_luma = sum(item[2] for item in scored) / max(1, len(scored))
+            best_frame = None
+            for t, sharp, luma, frame in scored:
+                # 避开末帧偶发暗闪或压缩拖影，优先最新且清晰的一帧
+                penalty = 20.0 if (mean_luma - luma) > 18.0 else 0.0
+                score = sharp - penalty + (0.02 if t == nominal else 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_frame = frame
+            if best_frame is not None:
+                from PIL import Image
+                Image.fromarray(best_frame).save(str(destination))
+                return str(destination)
+        clip.save_frame(str(destination), t=target_t)
     return str(destination)

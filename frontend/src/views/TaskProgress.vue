@@ -43,7 +43,7 @@
             <span class="eyebrow">PRE-SHOOT REVIEW · 开拍前预审</span>
             <h2>首帧与配音已就绪，请检查分镜或试拍单镜</h2>
             <p>
-              你可以在下方时间线逐镜检查首帧构图、参考图视角和配音时长。对重点镜头点击「试拍本镜」只生成该 10 秒片段，确认满意后点击右侧按钮批量合成整集。
+              你可以在下方时间线逐镜检查首帧构图、参考图视角和配音时长。对重点镜头点击「试拍本镜」只生成该镜头片段，确认满意后点击右侧按钮批量合成整集。
             </p>
             <p v-if="activeTrial" class="trial-status running">
               正在试拍镜头 <strong>{{ activeTrial.scene_id }}</strong>，请稍候…
@@ -101,8 +101,38 @@
               </ol>
             </div>
             <div v-else-if="active.key === 'ScriptAgent' && script" class="stage-output">
-              <h3>{{ script.title || '视频剧本' }}</h3>
+              <div class="script-head-row">
+                <h3>{{ script.title || '视频剧本' }}</h3>
+                <div class="script-doctor-btns">
+                  <button type="button" class="copy-prompt" :disabled="reviewingScript" @click="runTaskScriptReview">
+                    {{ reviewingScript ? '正在审稿…' : '🔍 AI 剧本审稿' }}
+                  </button>
+                  <button type="button" class="locate-btn" :disabled="doctoringScript" @click="runTaskScriptDoctor">
+                    {{ doctoringScript ? '正在精修…' : '⚡ 一键去AI味精修' }}
+                  </button>
+                </div>
+              </div>
               <p class="script">{{ script.content }}</p>
+              <div v-if="scriptReviewReport" class="script-review-box">
+                <div class="script-review-summary">
+                  <strong>⚖️ 审稿评级：{{ scriptReviewReport.grade }} 级（{{ scriptReviewReport.overall_score }} 分）</strong>
+                  <span v-if="task?.metadata?.story_judge?.rewritten">
+                    已自动打回精修重写（初稿 {{ task.metadata.story_judge.before_score }} → {{ task.metadata.story_judge.after_score }} 分）
+                  </span>
+                  <span v-else>检出 {{ scriptReviewReport.issue_count }} 项可优化问题</span>
+                </div>
+                <ul v-if="task?.metadata?.story_judge?.changes_made?.length" class="beats">
+                  <li v-for="(chg, cidx) in task.metadata.story_judge.changes_made" :key="'sj-' + cidx">✓ {{ chg }}</li>
+                </ul>
+                <ul v-if="scriptReviewReport.issues?.length" class="beats issue-list">
+                  <li v-for="(iss, idx) in scriptReviewReport.issues" :key="idx" class="issue-row">
+                    <span>
+                      <strong>[{{ iss.rule_id }}]</strong> {{ iss.diagnosis }}
+                      <em style="color: #15803d">（建议：{{ iss.prescription }}）</em>
+                    </span>
+                  </li>
+                </ul>
+              </div>
             </div>
             <div v-else-if="active.key === 'QualityAgent' && report" class="stage-output">
               <p>{{ report.semantic_review?.verdict === 'pass' ? '内容覆盖检查通过' : report.semantic_review?.verdict === 'needs_review' ? '部分内容建议复核（点击问题可定位分镜）' : '媒体与时间轴检查通过' }}</p>
@@ -139,7 +169,34 @@
                   </button>
                 </li>
               </ul>
+              <p v-if="report.continuity_audit && report.continuity_audit.smoothness_score != null">
+                视听衔接体检：{{ report.continuity_audit.smoothness_score }} / 100 分
+                · 自动接镜调色 {{ report.continuity_audit.shot_color_match_count || 0 }} 镜
+                · 转场过渡 {{ report.continuity_audit.transitions_applied?.length || 0 }} 处
+                <template v-if="report.continuity_audit.loudnorm_applied"> · 响度已平衡</template>
+              </p>
+              <ul v-if="report.continuity_audit?.issues?.length" class="beats issue-list">
+                <li v-for="(item, i) in report.continuity_audit.issues" :key="'ca-' + i" class="issue-row">
+                  <span>
+                    <strong>{{ Number(item.time || 0).toFixed(1) }} 秒</strong>
+                    <template v-if="item.scene_index || item.scene_id">
+                      （镜头 {{ item.scene_index ? String(item.scene_index).padStart(2, '0') : item.scene_id }}）
+                    </template>
+                    · {{ item.issue }}
+                  </span>
+                  <button
+                    type="button"
+                    class="locate-btn"
+                    @click="jumpToIssue(item)"
+                  >
+                    定位切点 →
+                  </button>
+                </li>
+              </ul>
               <p v-if="report.static_fallbacks?.length">使用静态画面的镜头 {{ report.static_fallbacks.join('、') }}</p>
+              <p v-if="task?.metadata?.heal_attempts_used > 0">
+                AI 导演自愈重拍：已自动精修重拍 {{ task.metadata.heal_attempts_used }} 镜
+              </p>
             </div>
             <div v-else-if="['EditorAgent', 'ExportAgent'].includes(active.key) && finalVideo" class="stage-output">
               <video ref="finalVideoRef" class="final-video" :src="finalVideo" controls preload="metadata" playsinline></video>
@@ -177,8 +234,15 @@
                 <div class="shot-body">
                   <div class="shot-title">
                     <h3>镜头 {{ String(i + 1).padStart(2, '0') }}</h3>
-                    <span>{{ shotTimes[i] }} · {{ scene.duration }} 秒</span>
+                    <span>
+                      {{ shotTimes[i] }} · {{ scene.duration }} 秒
+                      <template v-if="scene.duration_adapted_by_voice"> · 配音自适应延展</template>
+                      <template v-if="scene.auto_healed_count > 0"> · 已自愈重拍</template>
+                    </span>
                   </div>
+                  <p v-if="scene.blocking" class="blocking-line">
+                    <strong>📐 空间站位锁</strong> {{ scene.blocking }}
+                  </p>
                   <p v-if="scene.visual_description" :class="{ 'selected-output': selected === 'StoryboardAgent' }">{{ scene.visual_description }}</p>
                   <p v-if="scene.voiceover" class="narration" :class="{ 'selected-output': selected === 'DialoguePolishAgent' }">{{ scene.voiceover }}</p>
                   <p v-if="scene.audio_text"><strong>实际配音稿</strong> {{ scene.audio_text }}</p>
@@ -208,6 +272,12 @@
                     <span v-else-if="scene.image_path" class="badge neutral">首帧就绪</span>
                     <span v-if="scene.audio_path || scene.dialogue_audio?.length" class="badge neutral">配音就绪</span>
                     <span v-if="scene.transition_type === 'continue_action'" class="badge running">承接上镜尾帧</span>
+                    <span v-if="scene.transition_mode" class="badge neutral">
+                      衔接：{{ transitionModeLabel(scene.transition_mode) }}
+                    </span>
+                    <span v-if="scene.three_layer_stripped" class="badge success">
+                      三层分离·身份冻结
+                    </span>
                     <span
                       v-for="(choice, cIdx) in scene.reference_choices || []"
                       :key="cIdx"
@@ -288,6 +358,7 @@
                     </ol>
                     <p v-if="scene.image_prompt"><strong>首帧</strong> {{ scene.image_prompt }}</p>
                     <p v-if="scene.video_prompt"><strong>运动</strong> {{ scene.video_prompt }}</p>
+                    <p v-if="scene.mcsla_summary"><strong>MCSLA五层公式</strong> {{ scene.mcsla_summary }}</p>
                     <details v-if="scene.planned_video_prompt" class="prompt-version">
                       <summary>待提交视频提示词</summary>
                       <pre>{{ scene.planned_video_prompt }}</pre>
@@ -319,6 +390,7 @@ import BasicLayout from '../layouts/BasicLayout.vue'
 import GenerationUsage from '../components/GenerationUsage.vue'
 import { videoApi } from '../api/video'
 import { seriesApi } from '../api/series'
+import { craftApi } from '../api/craft'
 
 const steps = [
   { key: 'TaskPlannerAgent', title: '创意规划', description: '理解你的描述，确定题材、时长、风格和内容结构。' },
@@ -346,6 +418,60 @@ const trialSubmitting = ref(null)
 const approvingShoot = ref(false)
 const highlightedSceneId = ref('')
 const finalVideoRef = ref(null)
+const reviewingScript = ref(false)
+const doctoringScript = ref(false)
+const customScriptReview = ref(null)
+
+const scriptReviewReport = computed(
+  () => customScriptReview.value || task.value?.metadata?.script_review_38 || null
+)
+
+const transitionModeLabel = (mode) =>
+  ({
+    freeze_handoff: '末帧定格承接',
+    angle_cut: '换机位硬切',
+    empty_shot: '空镜/道具过渡',
+    whip_morph: '动势转场',
+  })[mode] || mode
+
+async function runTaskScriptReview() {
+  if (!script.value?.content) return
+  reviewingScript.value = true
+  try {
+    customScriptReview.value = await craftApi.reviewScript({
+      script_text: script.value.content,
+      task_id: taskId.value,
+      duration: Number(task.value?.duration) || 60,
+    })
+  } catch (e) {
+    connectionIssue.value = e.message || '剧本审稿失败'
+  } finally {
+    reviewingScript.value = false
+  }
+}
+
+async function runTaskScriptDoctor() {
+  if (!script.value?.content) return
+  doctoringScript.value = true
+  try {
+    const res = await craftApi.doctorScript({
+      script_text: script.value.content,
+      title: script.value.title || '',
+      task_id: taskId.value,
+      save_to_task: true,
+    })
+    if (res.polished_script && script.value) {
+      script.value = { ...script.value, content: res.polished_script }
+    }
+    if (res.after_review) {
+      customScriptReview.value = res.after_review
+    }
+  } catch (e) {
+    connectionIssue.value = e.message || '剧本医生精修失败'
+  } finally {
+    doctoringScript.value = false
+  }
+}
 
 const viewLabel = (view) =>
   ({ front: '正面', side: '侧面', profile: '侧面', full: '全身', whole: '全身' })[view] || view || '正面'
@@ -666,7 +792,7 @@ async function resume() {
 .signal.success { background: #318260; }
 .hero-divider { height: 12px; width: 1px; background: #8997ad77; }
 h1, h2, h3, p { margin: 0; }
-.studio-hero h1 { color: #f6f8ff; margin: 12px 0 9px; font-size: clamp(26px, 3.5vw, 46px); letter-spacing: -.04em; overflow-wrap: anywhere; }
+.studio-hero h1 { color: #f6f8ff; margin: 12px 0 9px; font-size: clamp(22px, 2.7vw, 34px); line-height: 1.35; letter-spacing: -.02em; overflow-wrap: anywhere; }
 .studio-hero p { color: #c2d0e4; line-height: 1.7; overflow-wrap: anywhere; }
 .tags, .shot-tags, .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .tags span { padding: 5px 10px; border: 1px solid #e9f0ff28; border-radius: 7px; color: #e1eaf8; font-size: 12px; background: #ffffff09; }
@@ -775,4 +901,9 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 }
 @media (prefers-reduced-motion: reduce) { .meter div { transition: none; } }
 .story-section-label { margin:14px 20px 0; padding:9px 12px; border-radius:8px; background:#eef2ff; color:#3730a3; font-weight:650; font-size:13px; }
+.script-head-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.script-doctor-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.script-review-box { margin-top: 12px; padding: 12px 14px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; }
+.script-review-summary { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; color: #92400e; }
+.blocking-line { margin: 4px 0 6px; padding: 4px 8px; background: #eff6ff; border-left: 3px solid #3b82f6; border-radius: 4px; color: #1e3a8a !important; font-size: 12px !important; }
 </style>

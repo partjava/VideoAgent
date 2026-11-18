@@ -117,6 +117,7 @@ const statusFilter = ref('all')
 
 const getModeText = (mode) => {
   const modes = {
+    auto_director: 'AI 自主导演（弹性 4–12s）',
     key_scenes: '关键镜头动态',
     full_dynamic: '全动态视频',
     native_10s: '原生 10 秒动态',

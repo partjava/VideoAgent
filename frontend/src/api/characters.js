@@ -5,7 +5,10 @@ export const charactersApi = {
   list: (includeArchived = false) =>
     client.get("", { params: includeArchived ? { include_archived: true } : {} }),
   create: (data) => client.post("", data),
+  batchCreate: (items) => client.post("/batch", items),
   update: (id, data) => client.put(path(id), data),
+  promptPreview: (id, style = "realistic") =>
+    client.get(`${path(id)}/prompt-preview`, { params: { style } }),
   reference: (id, image_base64, view = "front") =>
     client.post(`${path(id)}/reference`, { image_base64, view }),
   confirm: (id) => client.post(`${path(id)}/confirm`),

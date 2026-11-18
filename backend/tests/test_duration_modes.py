@@ -24,7 +24,9 @@ class DurationModeTests(unittest.TestCase):
             CreateVideoTaskRequest(user_input="测试", duration=30, generation_mode="wan3_whole")
         for duration in (10, 30, 60, 90):
             request = CreateVideoTaskRequest(user_input="测试", duration=duration)
-            self.assertEqual(request.generation_mode, "native_10s")
+            self.assertEqual(request.generation_mode, "auto_director")
+        explicit_native = CreateVideoTaskRequest(user_input="测试", duration=60, generation_mode="native_10s")
+        self.assertEqual(explicit_native.generation_mode, "native_10s")
 
     def test_historical_whole_task_keeps_its_render_service(self):
         with patch("services.video.wan_video_service.model_config", return_value={

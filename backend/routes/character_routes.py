@@ -35,9 +35,19 @@ async def create_character(payload: CharacterFields):
     return await respond(character_service.create(payload))
 
 
+@router.post("/batch", response_model=ApiResponse)
+async def batch_create_characters(payload: list[CharacterFields]):
+    return await respond(character_service.batch_create(payload))
+
+
 @router.get("/{character_id}", response_model=ApiResponse)
 async def get_character(character_id: str):
     return await respond(character_service.get(character_id))
+
+
+@router.get("/{character_id}/prompt-preview", response_model=ApiResponse)
+async def preview_character_prompts(character_id: str, style: str = "realistic"):
+    return await respond(character_service.preview_prompts(character_id, style=style))
 
 
 @router.put("/{character_id}", response_model=ApiResponse)

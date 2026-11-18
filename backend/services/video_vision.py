@@ -2,6 +2,8 @@
 import base64
 import io
 import json
+import os
+from urllib.parse import urlsplit
 
 import httpx
 from PIL import Image
@@ -11,8 +13,46 @@ from services.generation_contract import validate_motion_beats
 from services.media_quality import resolve_media
 
 
+def _dashscope_chat_url(base: str) -> str:
+    cleaned = (base or "").strip().rstrip("/")
+    for suffix in ("/compatible-mode/v1", "/api/v1", "/v1"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+    return f"{cleaned}/compatible-mode/v1/chat/completions"
+
+
+def _review_endpoints() -> list[tuple[str, str]]:
+    from services.model_config import model_config
+
+    candidates: list[tuple[str, str]] = []
+    explicit_dash = bool(os.getenv("DASHSCOPE_API_BASE", "").strip())
+
+    def _add(base: str | None, key: str | None) -> None:
+        b = str(base or "").strip()
+        k = str(key or "").strip()
+        if not b or not k:
+            return
+        host = (urlsplit(b).hostname or "").lower()
+        if host != "dashscope.aliyuncs.com" and not host.endswith(".aliyuncs.com"):
+            return
+        pair = (_dashscope_chat_url(b), k)
+        if pair not in candidates:
+            candidates.append(pair)
+
+    if explicit_dash:
+        _add(getattr(settings, "dashscope_api_base", ""), getattr(settings, "dashscope_api_key", None))
+    for kind in ("image", "video"):
+        try:
+            cfg = model_config(kind, settings)
+            _add(cfg.get("url"), cfg.get("key"))
+        except Exception:
+            continue
+    _add(getattr(settings, "dashscope_api_base", "https://dashscope.aliyuncs.com"), getattr(settings, "dashscope_api_key", None))
+    return candidates
+
+
 def review_enabled():
-    return bool(settings.enable_paid_api and settings.video_review_model and settings.dashscope_api_key)
+    return bool(settings.enable_paid_api and settings.video_review_model and _review_endpoints())
 
 
 def _image_part(frame):
@@ -34,24 +74,35 @@ def _sample(path, seconds):
 
 
 def _review(instructions, context, frames):
-    if not review_enabled():
+    endpoints = _review_endpoints() if (settings.enable_paid_api and settings.video_review_model) else []
+    if not endpoints:
         raise RuntimeError("Visual review provider is disabled")
     content = [{"type": "text", "text": json.dumps(context, ensure_ascii=False)}]
     for second, image in frames:
         content.extend([{"type": "text", "text": f"Frame at {second:.2f}s"}, image])
+    payload = {
+        "model": settings.video_review_model,
+        "messages": [
+            {"role": "system", "content": instructions + " Return a single JSON object only."},
+            {"role": "user", "content": content},
+        ],
+    }
+    response = None
+    last_exc: Exception | None = None
     with httpx.Client(timeout=90) as client:
-        response = client.post(
-            f"{settings.dashscope_api_base}/compatible-mode/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
-            json={
-                "model": settings.video_review_model,
-                "messages": [
-                    {"role": "system", "content": instructions + " Return a single JSON object only."},
-                    {"role": "user", "content": content},
-                ],
-            },
-        )
-        response.raise_for_status()
+        for url, key in endpoints:
+            try:
+                response = client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
+                response.raise_for_status()
+                last_exc = None
+                break
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code in {400, 401, 403, 404} and len(endpoints) > 1:
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
         message = response.json()["choices"][0]["message"]["content"].strip()
     if message.startswith("```"):
         message = message.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -70,7 +121,7 @@ def review_opening_frame(scene, first_frame):
         "with room for the planned movement? Never require a future action to already have happened. "
         "Return verdict (pass, blocked, or uncertain) and reason in Chinese. Use blocked only when "
         "a required object or contact area is visibly absent, occluded, or outside the frame.",
-        {"camera_plan": scene["camera_plan"], "action": (scene.get("motion_beats") or [])[:2]},
+        {"camera_plan": scene.get("camera_plan"), "action": (scene.get("motion_beats") or [])[:2]},
         [(0, part)],
     )
 
@@ -111,9 +162,12 @@ def ending_is_verified(planned, observation):
 
 
 def replan_from_tail(previous, scene, first_frame):
+    prev_video = (previous or {}).get("video_path")
+    if not prev_video:
+        raise ValueError("Previous scene has no video clip for tail replanning")
     duration = int(scene["duration"])
     end = float(previous["duration"])
-    frames = _sample(previous["video_path"], [end - 0.8, end - 0.35])
+    frames = _sample(prev_video, [end - 0.8, end - 0.35])
     import numpy as np
     with Image.open(resolve_media(first_frame)) as image:
         frames.append((end, _image_part(np.asarray(image.convert("RGB")))))

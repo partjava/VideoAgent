@@ -27,6 +27,10 @@ class Scene(BaseModel):
     negative_prompt: str | None = None
     motion_beats: list[dict] | None = None
     transition_type: str = "cut"
+    transition_mode: str | None = None
+    blocking: str | None = None
+    mcsla_summary: str | None = None
+    three_layer_stripped: bool = False
     start_state: str | None = None
     end_state: str | None = None
     reaction_focus: str | None = None

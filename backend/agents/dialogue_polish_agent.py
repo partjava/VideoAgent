@@ -8,6 +8,7 @@ from services.provider_factory import get_llm_service
 
 from agents.agent_utils import (
     SCENES_COLLECTION,
+    deduplicate_scenes_by_index,
     get_required_task,
     mark_agent_failed,
     mark_agent_start,
@@ -30,10 +31,17 @@ class DialoguePolishAgent:
             )
 
             scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
-            task_scenes = [scene for scene in scenes]
-            task_scenes.sort(key=lambda scene: int(scene.get("scene_index", 0)))
+            task_scenes = await deduplicate_scenes_by_index(scenes, mongodb, SCENES_COLLECTION)
             if not task_scenes:
                 raise ValueError(f"Scenes not found for task: {task_id}")
+            if (
+                task.get("generation_mode") == "auto_director"
+                and not task.get("duration_locked")
+            ):
+                scenes_sum = sum(int(s.get("duration") or 0) for s in task_scenes)
+                if scenes_sum > 0 and scenes_sum != task.get("duration"):
+                    await mongodb.update_one("video_tasks", {"_id": task_id}, {"duration": scenes_sum})
+                    task["duration"] = scenes_sum
             if all(
                 (scene.get("dialogue_polished") or scene.get("status") == "dialogue_done")
                 and scene.get("speaker")

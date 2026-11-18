@@ -15,7 +15,16 @@ REFERENCE_MODELS = {
     "qwen-image-3.0", "qwen-image-3.0-pro",
     "qwen-image-2.0-pro-2026-06-22", "qwen-image-2.0-pro-2026-04-22",
     "qwen-image-2.0-pro-2026-03-03", "qwen-image-2.0-2026-03-03",
+    "wan2.7-image", "wan2.7-image-pro",
 }
+
+
+def _reference_limit(short_name: str) -> int:
+    if short_name in {"qwen-image-2.1-pro", "qwen-image-2.1-turbo"}:
+        return 10
+    if short_name in {"wan2.7-image", "wan2.7-image-pro"}:
+        return 9
+    return 3
 
 
 def _normalize_dashscope_base(url: str) -> str:
@@ -33,12 +42,20 @@ class QwenImageService(BaseImageService):
         short_name = (model or "").rsplit("/", 1)[-1]
         return model in REFERENCE_MODELS or short_name in REFERENCE_MODELS
 
+    @property
+    def max_reference_images(self) -> int:
+        if not self.supports_reference_images:
+            return 0
+        model = model_config("image", settings)["model"]
+        short_name = (model or "").rsplit("/", 1)[-1]
+        return _reference_limit(short_name)
+
     def _reference_content(self, paths, model):
         from services.character_service import local_asset, validate_image
         short_name = (model or "").rsplit("/", 1)[-1]
         if model not in REFERENCE_MODELS and short_name not in REFERENCE_MODELS:
             raise ValueError(f"Configured image model {model} does not support reference images")
-        limit = 10 if short_name in {"qwen-image-2.1-pro", "qwen-image-2.1-turbo"} else 3
+        limit = _reference_limit(short_name)
         if len(paths) > limit:
             raise ValueError(f"Configured image model supports at most {limit} reference images")
         content = []
@@ -88,7 +105,7 @@ class QwenImageService(BaseImageService):
                     ]
                 },
                 "parameters": {
-                    "size": "1080*1920"
+                    "size": "1920*1080" if ratio == "16:9" else "1080*1920"
                 }
             }
             if negative_prompt:

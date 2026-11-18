@@ -38,6 +38,7 @@ class PipelineState(TypedDict):
     error: Optional[str]
     results: Annotated[dict[str, Any], _merge_results_dict]
     pre_shoot_review: bool
+    heal_rounds: int
 
 
 # ── Node 函数：每个 Agent 封装为一个节点 ──────────────────────
@@ -150,6 +151,40 @@ async def quality_node(state: PipelineState) -> dict:
     return _merge_results(state, "quality", result)
 
 
+async def director_heal_node(state: PipelineState) -> dict:
+    print(f"[Pipeline] Entering director_heal_node")
+    from services.director_heal_service import execute_director_self_heal
+
+    quality_res = (state.get("results") or {}).get("quality")
+    result = await execute_director_self_heal(state["task_id"], quality_res)
+    print(f"[Pipeline] Exiting director_heal_node: {result.get('reason')}")
+    return {
+        "heal_rounds": int(state.get("heal_rounds") or 0) + 1,
+        **_merge_results(state, "director_heal", result),
+    }
+
+
+def route_after_quality(state: PipelineState) -> str:
+    if int(state.get("heal_rounds") or 0) >= 1:
+        return "export"
+    q = (state.get("results") or {}).get("quality") or {}
+    if not isinstance(q, dict):
+        return "export"
+    cont = q.get("continuity_audit") or {}
+    vis = q.get("visual_review") or {}
+    has_cont_warn = bool(cont.get("suspect_frames")) or any(
+        isinstance(item, dict) and item.get("severity") == "warning"
+        for item in (cont.get("issues") or [])
+    )
+    has_defect = bool(vis.get("issues")) or has_cont_warn or bool(q.get("static_fallbacks"))
+    return "director_heal" if has_defect else "export"
+
+
+def route_after_director_heal(state: PipelineState) -> str:
+    heal_res = (state.get("results") or {}).get("director_heal") or {}
+    return "subtitle" if heal_res.get("healed") is True else "export"
+
+
 async def export_node(state: PipelineState) -> dict:
     print(f"[Pipeline] Entering export_node")
     agent = ExportAgent()
@@ -194,6 +229,7 @@ def build_pipeline(*, resume_shoot: bool = False) -> StateGraph:
     workflow.add_node("subtitle", subtitle_node)
     workflow.add_node("editor", editor_node)
     workflow.add_node("quality", quality_node)
+    workflow.add_node("director_heal", director_heal_node)
     workflow.add_node("export", export_node)
 
     # 第一阶段：串行（任务规划 → 脚本 → 分镜 → 润色 → 提示词）
@@ -211,12 +247,11 @@ def build_pipeline(*, resume_shoot: bool = False) -> StateGraph:
     workflow.add_edge("video", "subtitle")
 
 
-    # 第三阶段：串行（字幕 → 剪辑 → 质检 → 导出）
+    # 第三阶段：串行（字幕 → 剪辑 → 质检 → 导演自愈 → 导出）
     workflow.add_edge("subtitle", "editor")
     workflow.add_edge("editor", "quality")
-
-    workflow.add_edge("quality", "export")
-
+    workflow.add_conditional_edges("quality", route_after_quality, ["director_heal", "export"])
+    workflow.add_conditional_edges("director_heal", route_after_director_heal, ["subtitle", "export"])
     workflow.add_edge("export", END)
 
     return workflow
@@ -239,6 +274,7 @@ async def run_pipeline(task_id: str, *, resume_shoot: bool = False) -> dict[str,
         initial_state: PipelineState = {
             "task_id": task_id, "status": "running", "error": None, "results": {},
             "pre_shoot_review": bool(task.get("pre_shoot_review")),
+            "heal_rounds": 0,
         }
         final_state = await app.ainvoke(initial_state)
         status = waiting if final_state.get("status") == waiting else "success"

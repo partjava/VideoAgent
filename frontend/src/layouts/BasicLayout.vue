@@ -18,6 +18,10 @@
           <el-icon><Plus /></el-icon>
           <span>创建视频</span>
         </el-menu-item>
+        <el-menu-item index="/studio-craft" aria-label="短剧导演工坊">
+          <el-icon><MagicStick /></el-icon>
+          <span>短剧导演工坊</span>
+        </el-menu-item>
         <el-menu-item index="/series" aria-label="连载短剧"
           ><el-icon><VideoPlay /></el-icon><span>连载短剧</span></el-menu-item
         >

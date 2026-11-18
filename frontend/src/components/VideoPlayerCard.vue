@@ -142,22 +142,25 @@ const handleDownloadSubtitle = () => {
   justify-content: center;
   align-items: center;
   position: relative;
-  min-height: 380px;
+  min-height: 360px;
+  padding: 12px;
+  overflow: hidden;
 }
 
 .video-wrapper {
   width: 100%;
   max-width: 480px;
-  max-height: 520px;
   display: flex;
   justify-content: center;
   align-items: center;
 }
 
 .custom-video {
-  width: 100%;
-  height: auto;
-  max-height: 520px;
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 62vh;
+  object-fit: contain;
   border-radius: 4px;
 }
 

@@ -2,8 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ReferenceView = Literal["front", "profile", "whole"]
-PortraitView = Literal["front", "profile", "whole", "all"]
+ReferenceView = Literal["front", "profile", "whole", "sheet"]
+PortraitView = Literal["front", "profile", "whole", "sheet", "all"]
 PortraitStyle = Literal["realistic", "anime", "3d"]
 
 

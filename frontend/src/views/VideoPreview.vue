@@ -245,6 +245,13 @@
                 <span class="meta-label">状态</span>
                 <el-tag type="success" size="small" effect="dark">生成成功</el-tag>
               </div>
+              <div v-if="taskDetail.metadata?.quality_report?.continuity_audit?.smoothness_score != null" class="meta-row">
+                <span class="meta-label">衔接流畅度</span>
+                <span class="meta-value">
+                  {{ taskDetail.metadata.quality_report.continuity_audit.smoothness_score }} / 100
+                  （调色 {{ taskDetail.metadata.quality_report.continuity_audit.shot_color_match_count || 0 }} 镜）
+                </span>
+              </div>
             </div>
           </el-card>
 
@@ -273,7 +280,7 @@
         </div>
       </div>
 
-      <!-- OpenCut / OpenMontage: 分镜工作台与局部重生成 -->
+      <!-- 分镜工作台与局部重生成 -->
       <details v-if="taskDetail?.status === 'success'" @toggle="showProcess = $event.target.open">
         <summary>完整生成过程</summary>
         <TaskProgress v-if="showProcess" embedded />
@@ -314,12 +321,13 @@ const qualityIssues = computed(() => {
   const report = taskDetail.value?.metadata?.quality_report
   if (!report) return []
   const visual = Array.isArray(report.visual_review?.issues) ? report.visual_review.issues : []
+  const continuity = Array.isArray(report.continuity_audit?.issues) ? report.continuity_audit.issues : []
   const semRaw = Array.isArray(report.semantic_review?.located_issues)
     ? report.semantic_review.located_issues
     : Array.isArray(report.semantic_review?.issues)
       ? report.semantic_review.issues.map(raw => (typeof raw === 'string' ? { issue: raw } : raw))
       : []
-  return [...visual, ...semRaw]
+  return [...visual, ...continuity, ...semRaw]
 })
 
 async function jumpToQualityIssue(item) {
@@ -470,6 +478,7 @@ const handleRerunScene = async (scene, type) => {
 
 const getModeText = (mode) => {
   const modes = {
+    auto_director: 'AI 自主导演（弹性 4–12s）',
     key_scenes: '关键镜头动态 (推荐)',
     full_dynamic: '全动态视频 (精美)',
     native_10s: '原生 10 秒动态镜头',
@@ -754,7 +763,7 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
-/* OpenCut / OpenMontage Studio Editing */
+/* Studio Editing */
 .studio-editing-section {
   margin-top: 32px;
 }

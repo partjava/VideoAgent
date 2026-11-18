@@ -275,12 +275,89 @@
           </div>
         </el-card>
 
+        <!-- 跨集四本连续性台账 -->
+        <el-card shadow="never" class="section" v-if="project.continuity_ledgers">
+          <div class="heading">
+            <div>
+              <h2>📒 跨集四本连续性台账（防止跨集战损复位、道具瞬移、角色未卜先知穿帮）</h2>
+              <p class="hint">
+                实时追踪全季「物理与服装台账、信息认知差台账、关键道具归属台账、人物恩怨弧线台账」。
+              </p>
+            </div>
+            <el-button size="small" type="primary" plain @click="openLedgerEditor">
+              编辑连续性台账
+            </el-button>
+          </div>
+          <div class="ledger-four-grid">
+            <div class="ledger-card">
+              <h4>① 物理状态与战损服装台账</h4>
+              <div
+                v-for="(item, idx) in project.continuity_ledgers.physical_ledger || []"
+                :key="'p' + idx"
+                class="ledger-row"
+              >
+                <strong>{{ item.character }}</strong> · {{ item.location }}
+                <div class="hint">{{ item.costume_state }}｜{{ item.injury_or_mark }}</div>
+              </div>
+            </div>
+            <div class="ledger-card">
+              <h4>② 信息认知与秘密差台账（防未卜先知）</h4>
+              <div
+                v-for="(item, idx) in project.continuity_ledgers.knowledge_ledger || []"
+                :key="'k' + idx"
+                class="ledger-row"
+              >
+                <strong>{{ item.character }}</strong>
+                <div class="hint">已知：{{ item.known_facts }}</div>
+                <div class="hint">盲区：{{ item.hidden_blindspots }}</div>
+              </div>
+            </div>
+            <div class="ledger-card">
+              <h4>③ 关键道具归属与状态台账</h4>
+              <div
+                v-for="(item, idx) in project.continuity_ledgers.prop_ledger || []"
+                :key="'pr' + idx"
+                class="ledger-row"
+              >
+                <strong>{{ item.prop_name }}</strong>（持有人：{{ item.holder }}）
+                <div class="hint">{{ item.condition }} · {{ item.narrative_role }}</div>
+              </div>
+            </div>
+            <div class="ledger-card">
+              <h4>④ 恩怨筹码与关系弧线台账</h4>
+              <div
+                v-for="(item, idx) in project.continuity_ledgers.relationship_ledger || []"
+                :key="'r' + idx"
+                class="ledger-row"
+              >
+                <strong>{{ item.pair }}</strong> · {{ item.tension_level }}
+                <div class="hint">{{ item.unsettled_debt }}</div>
+              </div>
+            </div>
+          </div>
+        </el-card>
+
         <GenerationUsage
           v-if="projectId"
           scope-type="series"
           :scope-id="String(projectId)"
         />
       </template>
+
+      <el-dialog
+        v-model="ledgerDialog"
+        title="编辑跨集四本连续性台账"
+        width="min(760px, 94vw)"
+      >
+        <p class="hint">修改后将同步更新本季后续剧集的跨集状态约束。</p>
+        <el-input v-model="ledgerJson" type="textarea" :rows="14" />
+        <template #footer>
+          <el-button @click="ledgerDialog = false">取消</el-button>
+          <el-button type="primary" :loading="busy" @click="saveLedgerChanges">
+            保存四本台账
+          </el-button>
+        </template>
+      </el-dialog>
 
       <el-dialog
         v-model="snapshotDialog"
@@ -431,7 +508,9 @@ const project = ref(null),
   stateJson = ref(""),
   diffDialog = ref(false),
   diffData = ref(null),
-  diffEpisode = ref(null);
+  diffEpisode = ref(null),
+  ledgerDialog = ref(false),
+  ledgerJson = ref("");
 let timer,
   fetching = false,
   disposed = false;
@@ -556,6 +635,30 @@ async function action(fn) {
 async function approveEpisodeShoot(episode) {
   if (!episode?.task_id) return;
   await action(() => seriesApi.approveShoot(projectId, episode.task_id));
+}
+function openLedgerEditor() {
+  ledgerJson.value = JSON.stringify(
+    project.value?.continuity_ledgers || {},
+    null,
+    2,
+  );
+  ledgerDialog.value = true;
+}
+async function saveLedgerChanges() {
+  let parsed;
+  try {
+    parsed = JSON.parse(ledgerJson.value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error();
+    }
+  } catch {
+    error.value = "台账 JSON 格式有误，请检查括号与引号";
+    return;
+  }
+  await action(async () => {
+    await seriesApi.saveLedgers(projectId, parsed);
+    ledgerDialog.value = false;
+  });
 }
 async function openDependencyDiff(episode) {
   await action(async () => {
@@ -816,6 +919,31 @@ p {
 }
 .el-progress :deep(.el-progress__text) {
   min-width: 140px;
+}
+.ledger-four-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+.ledger-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.ledger-card h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #1e293b;
+}
+.ledger-row {
+  padding: 6px 0;
+  border-top: 1px dashed #cbd5e1;
+  font-size: 13px;
+}
+.ledger-row:first-of-type {
+  border-top: none;
 }
 @media (max-width: 650px) {
   .outline-grid,

@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 import imageio_ffmpeg
 from models.response_model import ApiResponse
-from models.series_model import CreateSeriesRequest, OutlineRequest, ConfirmSnapshotRequest, PublishNotesRequest, CoverRequest
+from models.series_model import CreateSeriesRequest, OutlineRequest, ConfirmSnapshotRequest, PublishNotesRequest, CoverRequest, ContinuityLedgersRequest
 from services.series_service import series_service, BACKEND
 from services.publish_materials import write_notes, write_cover
 from services.snapshot_diff import compare_states
@@ -56,6 +56,11 @@ async def generate_outline(series_id: str):
 @router.put('/{series_id}/outline')
 async def update_outline(series_id: str, payload: OutlineRequest):
     return await respond(series_service.update_outline(series_id, payload.episodes))
+
+
+@router.put('/{series_id}/ledgers')
+async def update_continuity_ledgers(series_id: str, payload: ContinuityLedgersRequest):
+    return await respond(series_service.update_ledgers(series_id, payload.continuity_ledgers))
 
 
 @router.post('/{series_id}/confirm')

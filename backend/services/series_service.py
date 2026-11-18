@@ -71,19 +71,36 @@ class SeriesService:
         from services.character_service import character_service
         characters = await character_service.get_confirmed_profiles(payload.character_ids)
         sid = 'series_' + uuid4().hex[:16]
-        project = {'_id': sid, 'series_id': sid, **payload.model_dump(), 'characters': copy.deepcopy(characters),
+        dump = payload.model_dump(exclude={'initial_episodes'})
+        project = {'_id': sid, 'series_id': sid, **dump, 'characters': copy.deepcopy(characters),
                    'status': 'draft', 'outline_revision': 1, 'outline_confirmed': False,
                    'stop_requested': False, 'created_at': now(), 'updated_at': now(), 'episodes': []}
         for number in range(1, payload.total_episodes + 1):
             project['episodes'].append({'episode_num': number, 'title': '', 'opening_hook': '', 'core_event': '',
                 'ending_hook': '', 'status': 'draft', 'revision': 1, 'task_id': None,
                 'input_snapshot_id': None, 'output_snapshot_id': None, 'revisions': []})
+        if payload.initial_episodes and len(payload.initial_episodes) == payload.total_episodes:
+            try:
+                normalized = normalize_outline(payload.initial_episodes, payload.total_episodes)
+                for old, new in zip(project['episodes'], normalized):
+                    old.update(new, status='pending')
+            except ValueError:
+                pass
         await mongodb.insert_one(PROJECTS, project)
         if payload.generation_limit is not None:
             from services.generation_usage import set_limit
 
             await set_limit('series', sid, payload.generation_limit)
         return public(project)
+
+    async def update_ledgers(self, sid: str, continuity_ledgers: dict):
+        project = await self._claim(sid)
+        try:
+            project['continuity_ledgers'] = copy.deepcopy(continuity_ledgers)
+            return await self._save(project, project['_prior_status'])
+        except Exception:
+            await self._release_error(project)
+            raise
 
     async def _claim(self, sid, target='editing', allowed=None):
         project = await self.require(sid)
@@ -135,15 +152,33 @@ class SeriesService:
             if any(e['task_id'] or e.get('revisions') for e in project['episodes']):
                 raise ValueError('大纲已锁定；请新建项目')
             from services.llm.deepseek_service import DeepSeekService
-            prompt = {'title': project['title'], 'brief': project['brief'], 'characters': project['characters'],
-                      'total_episodes': project['total_episodes'], 'episode_duration': project['episode_duration']}
-            result = await asyncio.to_thread(DeepSeekService()._call_api,
-                '你是连载短剧总编剧。只返回 JSON {"episodes":[...]}。严格按总集数，episode_num 从1连续。'
-                '每集包括 title, opening_hook, core_event, ending_hook。开场抓人，事件有因果，结尾承接下一集。'
-                '保持角色身份及道具状态连续，不虚构实际拍摄观察。', json.dumps(prompt, ensure_ascii=False), 6000)
+            prompt = {
+                'title': project['title'],
+                'brief': project['brief'],
+                'characters': project['characters'],
+                'total_episodes': project['total_episodes'],
+                'episode_duration': project['episode_duration'],
+                'market_mode': project.get('market_mode', 'cn'),
+            }
+            system_msg = (
+                '你是连载短剧总编剧。必须严格根据用户输入的故事梗概与角色生成全季分集大纲与初始四本连续性台账。\n'
+                '要求：\n'
+                '1) 若 market_mode=="en"，输出地道出海英文短剧大纲；否则输出高节奏中文爆款短剧大纲。\n'
+                '2) 每集遵循 15 秒换挡节奏：opening_hook（前3秒强视觉冲突或死线数字）、core_event（正面交锋与当集物证亮牌结算）、ending_hook（动作半途或新危机撞门断章钩子）。\n'
+                '3) 必须返回 JSON：{"episodes": [{"episode_num": 1, "title": "...", "opening_hook": "...", "core_event": "...", "ending_hook": "..."}], '
+                '"continuity_ledgers": {"physical_ledger": [...], "knowledge_ledger": [...], "prop_ledger": [...], "relationship_ledger": [...]}}。'
+            )
+            result = await asyncio.to_thread(
+                DeepSeekService()._call_api,
+                system_msg,
+                json.dumps(prompt, ensure_ascii=False),
+                6000,
+            )
             normalized = normalize_outline(result.get('episodes', []), project['total_episodes'])
             for old, new in zip(project['episodes'], normalized):
                 old.update(new, status='pending')
+            if isinstance(result.get('continuity_ledgers'), dict):
+                project['continuity_ledgers'] = result['continuity_ledgers']
             project['outline_revision'] += 1
             project['outline_confirmed'] = False
             return await self._save(project, 'draft')
@@ -237,6 +272,8 @@ class SeriesService:
                 previous = await self._predecessor(project, episode['episode_num'])
                 context = {'episode_outline': {k: episode[k] for k in ['episode_num', 'title', 'opening_hook', 'core_event', 'ending_hook']},
                            'characters': project['characters'], 'previous_snapshot': previous,
+                           'continuity_ledgers': project.get('continuity_ledgers'),
+                           'market_mode': project.get('market_mode', 'cn'),
                            'outline_revision': project['outline_revision'], 'episode_revision': episode['revision']}
                 if not episode['task_id']:
                     task = await task_service.create_task(CreateVideoTaskRequest(

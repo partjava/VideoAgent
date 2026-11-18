@@ -52,6 +52,9 @@ class TaskService:
             generation_mode=payload.generation_mode,
             intro_title=payload.intro_title,
             subtitle_style=payload.subtitle_style,
+            auto_heal=payload.auto_heal,
+            max_heal_attempts=payload.max_heal_attempts,
+            duration_locked=payload.duration is not None,
             provider_mode="real",
             status=VideoTaskStatus.CREATED,
             progress=0,
@@ -62,6 +65,9 @@ class TaskService:
 
         document = _task_to_document(task)
         document["pre_shoot_review"] = payload.pre_shoot_review
+        document["auto_heal"] = payload.auto_heal
+        document["max_heal_attempts"] = payload.max_heal_attempts
+        document["duration_locked"] = payload.duration is not None
         document["generation_limit"] = payload.generation_limit
         if getattr(payload, "character_ids", None):
             from services.character_service import get_confirmed_profiles

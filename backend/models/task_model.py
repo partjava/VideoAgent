@@ -32,8 +32,11 @@ class VideoTask(BaseModel):
     ratio: str | None = Field(default="9:16", description="Video aspect ratio")
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
-    generation_mode: str = Field(default="full_dynamic", description="Video generation mode")
+    generation_mode: str = Field(default="auto_director", description="Video generation mode")
     pre_shoot_review: bool = False
+    auto_heal: bool = True
+    max_heal_attempts: int = Field(default=2, ge=0, le=3)
+    duration_locked: bool = False
     generation_limit: int | None = Field(default=None, ge=1, le=10000)
     status: VideoTaskStatus = Field(default=VideoTaskStatus.CREATED)
     progress: int = Field(default=0, ge=0, le=100)
@@ -52,8 +55,10 @@ class CreateVideoTaskRequest(BaseModel):
     ratio: str = "9:16"
     intro_title: str | None = Field(default=None, max_length=60)
     subtitle_style: str = "standard"
-    generation_mode: Literal["native_10s", "full_dynamic", "paired_5s", "key_scenes"] = "native_10s"
+    generation_mode: Literal["auto_director", "native_10s", "full_dynamic", "paired_5s", "key_scenes"] = "auto_director"
     pre_shoot_review: bool = False
+    auto_heal: bool = True
+    max_heal_attempts: int = Field(default=2, ge=0, le=3)
     generation_limit: int | None = Field(default=None, ge=1, le=10000)
     character_ids: list[str] = Field(default_factory=list, max_length=20)
 

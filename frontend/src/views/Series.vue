@@ -6,7 +6,12 @@
           <h1>连载短剧</h1>
           <p>从故事梗概到逐集成片，每一集都由你确认后继续。</p>
         </div>
-        <el-button type="primary" @click="dialog = true">新建连载</el-button>
+        <div class="row">
+          <el-button type="success" plain @click="router.push('/studio-craft')">
+            📖 小说/长文一键拆剧 →
+          </el-button>
+          <el-button type="primary" @click="dialog = true">新建连载</el-button>
+        </div>
       </div>
       <el-alert
         v-if="error"
@@ -80,6 +85,11 @@
                 ><el-radio-button label="9:16" /><el-radio-button
                   label="16:9" /></el-radio-group
             ></el-form-item>
+            <el-form-item label="剧本市场模式"
+              ><el-radio-group v-model="form.market_mode"
+                ><el-radio-button value="cn">国内中文剧</el-radio-button
+                ><el-radio-button value="en">出海英文剧</el-radio-button></el-radio-group
+            ></el-form-item>
           </div>
           <el-form-item label="固定角色（仅可选择已确认版本）"
             ><el-select
@@ -147,6 +157,7 @@ const form = reactive({
   episode_duration: 30,
   style: "短剧",
   ratio: "9:16",
+  market_mode: "cn",
   character_ids: [],
   auto_continue: false,
   pre_shoot_review: false,

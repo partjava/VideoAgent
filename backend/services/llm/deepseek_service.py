@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from typing import Any
 
@@ -68,6 +69,177 @@ def _normalize_openai_base_url(url: str) -> str:
     return cleaned
 
 
+def _close_json_stack(candidate: str) -> str:
+    """清理尾部悬空键名/逗号并补全未闭合的引号与括号栈。"""
+    c = candidate.rstrip()
+    if c.endswith("\\"):
+        c = c[:-1]
+    in_str = False
+    esc = False
+    for ch in c:
+        if esc:
+            esc = False
+        elif ch == "\\" and in_str:
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+    if in_str:
+        c += '"'
+
+    # 去掉没有对应冒号/值的尾部残缺键，如 `{"k": 1, "bad_k"` 或 `{"bad_k"`
+    for _ in range(3):
+        prev = c
+        c = re.sub(r',\s*"[^"]*"\s*:\s*$', "", c)
+        c = re.sub(r',\s*"[^"]*"\s*$', "", c)
+        c = re.sub(r'\{\s*"[^"]*"\s*$', "{", c)
+        c = re.sub(r":\s*$", ": null", c)
+        c = re.sub(r",(\s*[}\]])", r"\1", c).rstrip(", \t\r\n")
+        if c == prev:
+            break
+
+    restack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in c:
+        if esc:
+            esc = False
+        elif ch == "\\" and in_str:
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch in "{[":
+                restack.append("}" if ch == "{" else "]")
+            elif ch in "}]" and restack and restack[-1] == ch:
+                restack.pop()
+
+    return c + "".join(reversed(restack))
+
+
+def _repair_truncated_json(text: str) -> list[str]:
+    """生成被 max_tokens 截断 JSON 的修复候选集（保留半截字段或回退至上一完整分隔位）。"""
+    start = text.find("{")
+    if start < 0:
+        return []
+    fragment = text[start:]
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    comma_positions: list[int] = []
+
+    for idx, ch in enumerate(fragment):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_string:
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+                if not stack:
+                    return [fragment[: idx + 1]]
+        elif ch == ",":
+            comma_positions.append(idx)
+
+    if not stack:
+        return [fragment]
+
+    results = [_close_json_stack(fragment)]
+    for pos in reversed(comma_positions[-3:]):
+        if pos > 1:
+            results.append(_close_json_stack(fragment[:pos]))
+    return results
+
+
+def _escape_inner_quotes(text: str) -> str:
+    """在标准 JSON 解析失败后，转义中文字符串内部的未转义英文双引号。"""
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    n = len(text)
+
+    def _next_non_ws(pos: int) -> tuple[str, int]:
+        j = pos
+        while j < n and text[j] in " \t\r\n":
+            j += 1
+        return (text[j], j) if j < n else ("", n)
+
+    for idx, ch in enumerate(text):
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            if not in_string:
+                in_string = True
+                out.append(ch)
+            else:
+                nxt, nxt_idx = _next_non_ws(idx + 1)
+                is_closing = nxt in (":", "}", "]", "")
+                if not is_closing and nxt == ",":
+                    after_comma, _ = _next_non_ws(nxt_idx + 1)
+                    is_closing = after_comma in ('"', "{", "[", "}", "]", "t", "f", "n", "-") or after_comma.isdigit()
+                if is_closing:
+                    in_string = False
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _extract_and_parse_json(content: str) -> dict[str, Any]:
+    """容错解析模型返回的 JSON（清理思考标签、Markdown围栏、尾逗号、内嵌引号、换行及截断恢复）。"""
+    text = re.sub(r"<think>.*?</think>", "", str(content or ""), flags=re.DOTALL).strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    else:
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+
+    first_brace = text.find("{")
+    if first_brace > 0:
+        text = text[first_brace:]
+
+    candidates = [
+        text,
+        re.sub(r",(\s*[}\]])", r"\1", text),
+    ]
+    escaped_quotes = _escape_inner_quotes(text)
+    candidates.append(escaped_quotes)
+    candidates.append(re.sub(r",(\s*[}\]])", r"\1", escaped_quotes))
+
+    for raw in (text, escaped_quotes):
+        for repaired in _repair_truncated_json(raw):
+            candidates.append(repaired)
+            candidates.append(re.sub(r",(\s*[}\]])", r"\1", repaired))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    raise ValueError(f"JSON format error. Snippet: {content[:200]}")
+
+
 class DeepSeekService(BaseLLMService):
     def _call_api(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> dict[str, Any]:
         if not settings.enable_paid_api:
@@ -76,70 +248,69 @@ class DeepSeekService(BaseLLMService):
         if not profile["key"]:
             raise ValueError("未找到 DEEPSEEK_API_KEY，请在环境变量中配置。")
 
-        # 使用 LangChain ChatOpenAI 调用 DeepSeek（DeepSeek API 兼容 OpenAI 格式）
-        llm = ChatOpenAI(
-            model=profile["model"],
-            api_key=profile["key"],
-            base_url=_normalize_openai_base_url(profile["url"]),
-            temperature=0.65,
-            max_tokens=max_tokens,
-            timeout=300,
-        )
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
-        print(f"[DeepSeekService] Requesting model={profile['model']} (max_tokens={max_tokens})...", flush=True)
-        t0 = time.time()
-        response = llm.invoke(messages)
-        print(f"[DeepSeekService] Response received in {time.time()-t0:.1f}s ({len(response.content)} chars)", flush=True)
-        content = response.content
+        base_url = _normalize_openai_base_url(profile["url"])
 
-        if not content:
-            print(f"[DeepSeekService] API returned empty content.")
-            raise ValueError("DeepSeek returned an empty response.")
+        def _invoke(use_json_mode: bool, temperature: float, sys_msg: str) -> str:
+            kwargs: dict[str, Any] = {
+                "model": profile["model"],
+                "api_key": profile["key"],
+                "base_url": base_url,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "timeout": 300,
+            }
+            if use_json_mode:
+                kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+            llm = ChatOpenAI(**kwargs)
+            messages = [
+                SystemMessage(content=sys_msg),
+                HumanMessage(content=user_prompt),
+            ]
+            print(f"[DeepSeekService] Requesting model={profile['model']} (max_tokens={max_tokens}, json_mode={use_json_mode})...", flush=True)
+            t0 = time.time()
+            response = llm.invoke(messages)
+            content = response.content if response else ""
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            print(f"[DeepSeekService] Response received in {time.time()-t0:.1f}s ({len(str(content or ''))} chars)", flush=True)
+            return str(content or "")
 
-        # 尝试从文本中提取 JSON 对象
-        cleaned_content = content.strip()
-
-        # 找第一个 { 和最后一个 }
-        start = cleaned_content.find("{")
-        end = cleaned_content.rfind("}")
-        if start >= 0 and end > start:
-            cleaned_content = cleaned_content[start:end+1]
-
-        # 清理 Markdown 代码块包裹
-        if cleaned_content.startswith("```json"):
-            cleaned_content = cleaned_content[7:]
-        elif cleaned_content.startswith("```"):
-            cleaned_content = cleaned_content[3:]
-        if cleaned_content.endswith("```"):
-            cleaned_content = cleaned_content[:-3]
-        cleaned_content = cleaned_content.strip()
-
-        # 如果 JSON 被截断，尝试修复最后一个不完整的字段
-        try:
-            return json.loads(cleaned_content)
-        except json.JSONDecodeError:
-            # 截断修复：找到最后一个完整的键值对
+        last_err: Exception | None = None
+        for attempt, (use_json_mode, temperature, sys_msg) in enumerate(
+            [
+                (True, 0.65, system_prompt),
+                (False, 0.25, system_prompt + "\n注意：只能输出一个合法 JSON 对象，字符串内部禁止出现未转义英文双引号 \" ，不要输出 ```json 标记。"),
+            ],
+            start=1,
+        ):
             try:
-                # 尝试补 }
-                if not cleaned_content.endswith("}"):
-                    cleaned_content += "}"
-                return json.loads(cleaned_content)
-            except json.JSONDecodeError:
-                # 去掉最后不完整的字段重试
-                for _ in range(3):
-                    last_comma = cleaned_content.rfind(",")
-                    if last_comma < 10:
-                        break
-                    cleaned_content = cleaned_content[:last_comma] + "}"
+                content = _invoke(use_json_mode, temperature, sys_msg)
+            except Exception as invoke_exc:
+                msg = str(invoke_exc).lower()
+                if use_json_mode and (
+                    getattr(invoke_exc, "status_code", None) == 400
+                    or any(k in msg for k in ("response_format", "json_object", "json mode", "unsupported", "invalid parameter"))
+                ):
                     try:
-                        return json.loads(cleaned_content)
-                    except json.JSONDecodeError:
+                        content = _invoke(False, temperature, sys_msg)
+                    except Exception as fallback_exc:
+                        last_err = fallback_exc
                         continue
-                print(f"[DeepSeekService] JSON parse failed. Raw: {content[:300]}")
-                raise ValueError(f"JSON format error. Snippet: {content[:200]}")
+                else:
+                    raise
+            if not content:
+                last_err = ValueError("DeepSeek returned an empty response.")
+                continue
+            try:
+                return _extract_and_parse_json(content)
+            except ValueError as parse_exc:
+                print(f"[DeepSeekService] JSON parse failed on attempt {attempt}. Raw: {content[:300]}")
+                last_err = parse_exc
+
+        raise last_err or ValueError("DeepSeek returned invalid JSON.")
 
     def plan_task(
         self,
@@ -157,10 +328,26 @@ class DeepSeekService(BaseLLMService):
                 "你是爆款短视频金牌导演与创意总监。你的任务是把用户的一句话需求转化为极具戏剧张力、"
                 "充满反差感、节奏紧凑、绝不枯燥乏味的视频方案。坚决拒绝平铺直叙和平庸AI流水账。必须输出严格 JSON。"
             )
+            mode_guidance = (
+                "当前为全自主导演（auto_director）模式：严禁套用『每段必须10秒』『固定3段』机械模板！"
+                "未锁定总时长时，按内容密度自主决定最合理的总时长（12–75秒均可）与节拍数（2–8个节拍均可）："
+                "主力剧情/对峙/连贯戏每段 8–12 秒减少切缝，开场钩子/惊愕特写/反转点可用 4–7 秒紧凑切镜。"
+                if generation_mode == "auto_director"
+                else (
+                    "若生成模式为 native_10s，自动时长选 10 的整数倍，未指定则 30 秒。"
+                    if generation_mode == "native_10s"
+                    else f"生成模式：{generation_mode}"
+                )
+            )
+            beats_guidance = (
+                "plot_beats: 数组，每个包含 beat_name, description, suggested_duration（整数秒，推荐主力戏8-12秒、快切反应/钩子4-7秒）。根据叙事自然拆分 2–8 个节拍，不必凑3段。"
+                if generation_mode == "auto_director"
+                else "plot_beats: 数组，每个包含 beat_name 和 description。native_10s 模式先确定最终 duration（用户指定时以指定值为准），然后输出恰好 duration / 10 个节拍，每个节拍对应一个10秒段落的核心事件。其他模式输出3–5个节拍。"
+            )
             user_prompt = f"""\
 用户原始需求：{user_input}
-目标时长：{str(duration) + " 秒（固定）" if duration is not None else "从原句提取；未指定则自行选择"}
-若生成模式为 native_10s，自动时长选 10 的整数倍，未指定则 30 秒。
+目标时长：{str(duration) + " 秒（固定）" if duration is not None else "从原句提取；未指定则由导演按内容张力自主决定（12-75秒）"}
+{mode_guidance}
 画面风格：{style or "自动选择"}（漫剧=漫画插画，短剧=写实影视）
 发布场景：{platform or "通用视频"}
 画面比例：{ratio}
@@ -173,10 +360,11 @@ class DeepSeekService(BaseLLMService):
 配音：{style_rules["voice"]}
 字幕：{style_rules["subtitle"]}
 
-创意与叙事原则（反乏味、反套路）：
-- 强化【核心戏剧冲突】与【身份/认知反差】：拒绝白开水流水账！主角面对困境必须有戏剧化错位或反转，情绪起伏要有过山车般的冲击力。
-- 黄金前3秒抓人：开篇首秒直接抛出最具视觉冲击力或最具冲突性的情境，拒绝长篇大论的慢热铺垫。
-- 结尾有力：给出一个意想不到的爆笑反转、深刻共鸣或悬念钩子。
+创意与叙事原则（反乏味、反套路、禁止一分钟站桩水时长）：
+- 强化【核心戏剧冲突】与【身份/认知反差】：拒绝白开水流水账！40-75秒视频绝不允许整集只写“在桌前互相放狠话”这一件小事，必须拆出 3~4 个递增冲突回合（如：0~15s 破局逼宫 → 15~32s 动手加码冲突升级 → 32~48s 亮底牌/反杀打脸 → 48~60s 突发第三股压迫或更高反转断章）！
+- 空间调度与情绪弧线强制变化：每相邻两拍必须有明显体位调度或景别反差（起身逼近、退步撞椅、猛拍桌面、抢步拦门、逼退墙角），且人物情绪必须有跨度（从轻蔑嗤笑 → 突然拍案暴怒 → 震惊血色褪尽/僵住 → 压低嘶哑发声），严禁全片维持同一个表情坐着对聊。
+- 黄金前3秒抓人：开篇首秒直接抛出最具视觉冲击力或最具冲突性的动作情境，拒绝长篇大论的慢热铺垫。
+- 结尾有力：给出一个意想不到的强反转或悬念钩子。
 
 先识别 video_type，只能选 story（剧情）、explainer（科普/教程）、product（产品介绍）。
 - story：铺垫、发展、解决，角色与道具保持一致。
@@ -184,13 +372,13 @@ class DeepSeekService(BaseLLMService):
 - product：使用场景、功能演示、总结。只使用用户提供的产品事实，不捏造规格、效果或承诺。
 - plot_beats 依次列出开头、核心内容、结尾。每段写明观众应看到或听到什么。短片首秒直接出现可见的事件、现象或演示结果，把背景交代放进随后动作或旁白。结尾给出结果及主体反应。
 - 原生10秒模式的每个节拍写清同一事件的三个阶段：什么打破开场局面、哪个交互或发现推动变化、观众最后看到了什么结果。
-- 用户明确指定的题材、时长、风格优先。未指定时默认约30秒，可按内容调整。
+- 用户明确指定的题材、时长、风格优先。未指定时按故事自然节奏决定合理时长（不固定凑30秒或10的倍数）。
 
 返回 JSON 字段：
 - video_type: story、explainer 或 product
 - topic: 视频主题
 - optimized_brief: 完整剧情梗概（200字以内的故事大纲）
-- characters: 数组，每个角色包含 name, appearance（具体外貌描述）, personality, role_in_story
+- characters: 数组，每个角色包含 name, gender（"male" 或 "female"）, appearance（具体外貌描述）, personality, role_in_story
 - duration: 整数秒
 - style: 漫剧或短剧，用户未指定时按内容选择
 - platform: 发布平台
@@ -199,7 +387,7 @@ class DeepSeekService(BaseLLMService):
 - target_audience: 目标观众
 - objective: 视频目标（吸引关注/引发讨论/情感共鸣/悬念追更）
 - visual_world: 全片统一视觉世界设定（时代、地点、色调、氛围）
-- plot_beats: 数组，每个包含 beat_name 和 description。native_10s 模式先确定最终 duration（用户指定时以指定值为准），然后输出恰好 duration / 10 个节拍，每个节拍对应一个10秒段落的核心事件。其他模式输出3–5个节拍。
+- {beats_guidance}
 - conflict: 核心冲突是什么
 - climax: 高潮或反转是什么
 - ending_hook: 结尾钩子（悬念/反转/情绪高点）
@@ -207,7 +395,7 @@ class DeepSeekService(BaseLLMService):
 - voice_style: 配音风格
 - subtitle_style: 字幕风格
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=2500)
+            result = self._call_api(system_prompt, user_prompt, max_tokens=4000)
             result["source"] = "deepseek"
             result["user_input"] = user_input
             planned_duration = result.get("duration")
@@ -263,11 +451,21 @@ class DeepSeekService(BaseLLMService):
                     "voice_start 等于第一句时间。旁白段 dialogue_lines 为空。"
                     "content 展示同一份分段剧本。"
                 )
+            elif mode == "auto_director":
+                segment_rules = (
+                    "当前为全自主导演（auto_director）模式：输出 segments 结构化段落数组，"
+                    "段落数量由戏剧节奏自主决定（2–8 段均可，严禁硬凑 3 段或强制每段 10 秒）。"
+                    "每段填写 plot、duration（整数秒：主力对话与连续调度戏推荐 8–12 秒，强钩子/反应特写/反转冲击可用 4–7 秒，区间 4–12 秒）、"
+                    "voice_start、voiceover、dialogue_lines。"
+                    "多人对白填写 speaker、text、start（0 ≤ start < duration）以及可选 emotion（从 mocking / angry / cold_threat / shocked / urgent / calm 选择以驱动配音语调剧烈起伏）。"
+                    "voice_start 等于第一句时间。旁白段 dialogue_lines 为空。content 展示同一份完整分段剧本。"
+                )
             else:
                 segment_rules = "segments 返回空数组，在 content 中编写完整画面和对应台词。"
             system_prompt = (
-                "你是爆款短视频金牌编剧。你的剧本以戏剧张力强、反差感拉满、台词有梗生动著称。"
-                "每句台词都要推动剧情或情绪。冲突强度服从题材，画面动作必须能在段落时长内完成。必须输出严格 JSON。"
+                "你是顶级短剧总编剧与分镜导演。你的剧本严格遵循『15秒四挡推进』、"
+                "『每2-3句对白必插强视觉△物理动作（物理结果/身份反差/物证对抗）』与『台词去AI味规则』。"
+                "严禁出现“眼神微动、微微一怔、心里一紧”等不可拍心理套话，严禁“然而、不仅如此、显而易见、命运的齿轮”等书面腔。必须输出严格 JSON。"
             )
             user_prompt = f"""\
 项目方案：{json.dumps(task_plan, ensure_ascii=False, default=str)}
@@ -276,35 +474,97 @@ class DeepSeekService(BaseLLMService):
 
 内容类型：{resolved_style}
 
-剧本核心原则（反平庸、反乏味规则）：
-- 每段围绕一个可见事件推进。开场让观众看懂人物的目的，结尾给出一个可见结果或反应。冲突和反转只在符合题材、时长足够时使用。
-- 每段写清局面发生了什么变化，以及观众能从哪个动作、线索或人物反应看出来。移动道具或改变机位应服务于这项变化。
-- 黄金3秒视觉钩子：开篇第一秒直接抛出最具视觉冲击或身份错位的画面，禁止慢热铺垫。
-- 角色台词必须有性格、有灵魂、有爆梗：台词要口语化、接地气、情绪饱满，体现人物性格色彩，融入角色标志性金句但必须产生搞笑或热血化学反应，严禁枯燥说教与空洞抒情。
+剧本核心原则：
+- 单集 15 秒四挡推进：
+  1) 0~15s 抓人立事（强视觉动作开场 + 亮明具体数字/死线/压迫处境，严禁环境空镜与日常寒暄铺垫）；
+  2) 15~45s 正面交锋（至少2轮筹码或动作拉扯）；
+  3) 45~85s 亮牌翻转（当集结算，物证与大白话利害结论同轮直给，反派当场付出可见代价）；
+  4) 85~110s 余波断章钩子（在动作半途或新危机破门瞬间戛然而止）。
+- 拦截站桩纯对白与无效微动作：每 2~3 句对白必插一条强视觉 △（物理结果 / 身份反差 / 物证对抗），彻底封杀“眼神微动、微微一怔、心里一紧、心中五味杂陈”等镜头拍不出来的无效微动作。
+- 台词去 AI 味：物证与大白话利害结论同轮直给（拒当谜语人）；专业/玄学设定词当句翻译成“多少钱/判几年/谁死谁活”；采用 3~6 字快刀短句与 8~16 字算账句快慢变速；禁用“然而、不仅如此、显而易见、命运的齿轮”等书面套话。
 
 脚本要求：
 - 按项目方案的 video_type 编写。剧情用角色行动和对白推进，科普按现象、解释、结论展开，产品介绍按场景、演示、总结展开。
 - 保留原始需求中的关键信息。每一段都写出画面和对应的台词或旁白，结尾必须完成开头提出的叙事或说明目标。
+- 拒绝原地复读与车轱辘吵架：第 1 段 0~5s 必须直接拍物证/动作/具体数字死线立事；中段至少包含【两轮实质筹码加码或反扑升级】（每轮必须出现新信息、新动作或新代价，严禁同一句威胁话换个说法重复）；结尾最后 3~5 秒再引爆核心反转钩子，绝不提前漏底。
+- 紧凑对白与零冷场原则：每段 voice_start 控制在 0.2~0.7 秒内立刻起音（禁止留 1.5 秒以上无声呆立再开口）；每段台词/旁白总汉字数控制在 floor(duration * 3.0) ~ floor(duration * 3.8) 字之间，句子之间仅留 0.25~0.45 秒呼吸气口，严禁留下 2 秒以上的整段无声干瞪眼；多角色对手戏务必拆分写进 dialogue_lines，且 speaker 必须填写清晰纯角色姓名（禁止混写“旁白”代读角色对白）。
 - 先写画面推进：首秒动作钩子 → 行动让局面发生变化 → 清晰结果和反应。10秒以内的短片尽量围绕一个事件，不用多秒站立、凝视或慢慢准备来铺垫。
 - 当前模式的结构要求：{segment_rules}
-- 旁白按每秒约 3.5 个汉字估算，标点不计。字数上限为 max(0, floor((duration - voice_start - 0.5) * 3.5))。多人对白每句按距下一句的时间预算，最后一句留 0.5 秒给画面。旁白补充画外信息，关键结果出现前不提前揭晓。
+- 旁白按每秒约 3.5 个汉字估算，标点不计；末尾保留约 0.4~0.8 秒稳定收束动作即可，不要故意留白几秒静音。旁白只补画外信息，关键结果出现前不提前揭晓。
 - 科普避免虚构事实，产品介绍不添加未提供的规格与功效。
 
 返回 JSON 字段：
 - title: 本集标题（吸引眼球的短句）
 - hook: 开头钩子（前3秒抓住观众的台词或画面描述）
 - content: 完整剧本（旁白+对白混排）
-- segments: 原生10秒模式的结构化段落数组，其他模式返回空数组
+- segments: native_10s 或 auto_director 模式输出结构化段落数组，其他模式返回空数组
 - ending: 结尾钩子台词
 - publish_copy: 发布文案（带悬念的短文案，引导点赞关注）
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=2500)
+            result = self._call_api(system_prompt, user_prompt, max_tokens=3600)
             result["source"] = "deepseek"
-            if mode != "native_10s":
+            if mode not in {"native_10s", "auto_director"}:
                 result["segments"] = []
             return result
         except Exception as e:
             raise RuntimeError(f"DeepSeek generate_script failed: {e}") from e
+
+    def rewrite_script_with_judgment(
+        self,
+        task_plan: dict[str, Any],
+        draft_script: dict[str, Any],
+        judge_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """根据情节审稿与节奏诊断，结构化重写爆款短剧剧本与 segments。"""
+        mode = str(task_plan.get("generation_mode") or "auto_director")
+        target_duration = int(task_plan.get("duration") or 48)
+        seg_constraint = (
+            f"保持 segments 总段数与每段 duration 严格为 10 秒（共 {max(1, target_duration // 10)} 段）。"
+            if mode == "native_10s"
+            else "segments 数量 4–7 段、每段整数 4–12 秒（总时长贴近剧情需要且节奏紧凑，40–65 秒优先）。"
+        )
+        system_prompt = (
+            "你是金牌爆款短剧总编剧兼剧本医生。你刚刚审完一份节奏拖沓、缺乏筹码升级、对白过于稀碎或存在无声干瞪眼的初稿。"
+            "请你保留原有核心设定与角色姓名，彻底重构写出一版高张力、无废话、密集攻防、反转精准落底的结构化剧本。"
+            "必须输出严格 JSON。"
+        )
+        user_prompt = f"""\
+项目方案：{json.dumps(task_plan, ensure_ascii=False, default=str)}
+
+待改写初稿：{json.dumps(draft_script, ensure_ascii=False, default=str)}
+
+审稿诊断发现的病灶：{json.dumps(judge_report, ensure_ascii=False, default=str)}
+
+重写必须逐条落实的硬要求：
+1. 【砍掉原地复读】：绝不重复同一轮筹码或原地干吵。每 1 段都必须推动局面出现新物理变化（亮出新证/动作逼近/代价落下/局势反转）。
+2. 【消灭无声干瞪眼】：每段 voice_start 控制在 0.2~0.7 秒；每段 spoken 总字数必须饱满（约为 duration * 3.0 ~ duration * 3.8 个汉字，如 8 秒段落配 24~30 字紧凑攻防短句），相邻 dialogue_lines 间隔 0.25~0.45 秒，绝不留 2 秒以上空画面发呆！
+3. 【台词去 AI 味】：3~6 字快刀短句 + 8~16 字利害算账句变速，每 2~3 句插 `△` 可拍摄物理动作（content 中体现）；禁写眼神微动/然而/不仅如此/命运的齿轮。
+4. 【角色分声线清晰】：dialogue_lines 中每句明确标出说话人纯姓名 speaker 与递增 start，不把角色台词混写成旁白。
+5. 【反转严格落定最后 1 段】：前段层层压迫蓄势，结尾核心悬念或物证亮牌严格放在最后 1 段最后 3~5 秒引爆，绝不在倒数第二段提前剧透！
+6. 【时长结构约束】：{seg_constraint}
+
+返回严格 JSON 对象：
+{{
+  "title": "...",
+  "hook": "...",
+  "content": "...",
+  "segments": [
+    {{
+      "duration": 8,
+      "plot": "...",
+      "voice_start": 0.3,
+      "voiceover": "...",
+      "dialogue_lines": [{{"speaker": "角色名", "text": "...", "start": 0.3}}]
+    }}
+  ],
+  "ending": "...",
+  "publish_copy": "...",
+  "changes_made": ["改动说明1", "改动说明2"]
+}}
+"""
+        result = self._call_api(system_prompt, user_prompt, max_tokens=4500)
+        result["source"] = "deepseek"
+        return result
 
     def generate_storyboard(
         self,
@@ -314,6 +574,12 @@ class DeepSeekService(BaseLLMService):
     ) -> list[dict[str, Any]]:
         try:
             dynamic_hint = {
+                "auto_director": (
+                    "全自主导演模式（auto_director）：所有分镜 need_dynamic_video 都设为 true。"
+                    "如果剧本含 segments，一个段落严格对应一个分镜并保持其规划好的 duration、对白与时间；"
+                    "若无 segments，自由按内容节拍拆镜（不限定段数，主力对话与连贯动作 8–12 秒减少切缝，强钩子与面部反应特写 4–7 秒），单镜整数 4–12 秒。"
+                    "由导演按画面因果自主挑选 transition_type（cut 换机位 / continue_action 连续动作接力 / scene_change 换场）。"
+                ),
                 "native_10s": "每个故事段落恰好一条10秒动态视频。分镜数量严格等于总时长除以10。所有 duration=10、need_dynamic_video=true、transition_type=cut。每段用独立首帧，一次生成完整事件。旁白按该10秒段落编写，中间不断句重启。",
                 "full_dynamic": "所有分镜 need_dynamic_video 都设为 true。",
                 "paired_5s": (
@@ -329,8 +595,15 @@ class DeepSeekService(BaseLLMService):
                 "你是短剧/漫剧分镜导演。你要把剧本拆成连续的视觉镜头，"
                 "每个镜头都必须能画成一张图并动起来。角色外貌必须全片一致。必须输出严格 JSON。"
             )
+            feedback_block = ""
+            if script.get("review_feedback"):
+                feedback_block = (
+                    f"\n[上一版分镜审片发现如下时序/剧透偏差，本版务必逐条修正]："
+                    f"{json.dumps(script['review_feedback'], ensure_ascii=False)}\n"
+                )
             user_prompt = f"""\
 剧本：{json.dumps(script, ensure_ascii=False, default=str)}
+{feedback_block}
 画面风格：{script.get("visual_style") or "跟随剧本设定"}。短剧为真人演员实景拍摄，使用自然五官比例、皮肤纹理和实物材质；漫剧为漫画插画。角色名和故事题材不能改变所选媒介。
 目标时长：{target_duration or 60} 秒
 生成模式：{generation_mode}
@@ -350,26 +623,33 @@ class DeepSeekService(BaseLLMService):
 - start_state 和 end_state 写明角色位置、朝向、持物手、道具位置及动作阶段；连续动作必须使本镜 start_state 与上镜 end_state 一致。
 - 每个分镜时长至少 4 秒，不足 4 秒的补到 4 秒。
 - 每个分镜服务同一条内容主线。第一镜首帧构图就要看清动作对象，首秒发生可见变化。每个镜头须推进事件，保留结果和反应的时长。
-- 景别由内容决定。道具接触、按钮按下等细节要让主体和接触点清晰可见。需要换景别时在镜头之间切；用户要求同机位或继续动作时，靠清晰的主体位移和反应做出节奏。
-- visual_description 写清一个可见事件的起因、主要动作和结果。优先使用清楚的体态变化、单向位移或一次关键接触。避免同一拍安排高速碰撞、多件物体飞散、多个角色同时做复杂动作。情绪可以通过当前景别能看清的视线、表情或姿态表达。
+- 景别由内容决定。道具接触、按钮按下等细节要让主体和接触点清晰可见。需要换景别或插切第二画面（例如门缝推开、手机震动特写）时，必须单独拆出一个独立分镜，绝不能在同一分镜内部写“突然切到门/切手再切回”，避免视频模型自发硬切鬼影叠化。
+- visual_description 写清一个可见事件的起因、主要动作和结果。禁止连续两镜都只是双方坐在原地动嘴！同时保持单一镜头内肩臂结构完整与统一景别；长镜（7–12秒）如果在前半段说完台词，后半段必须安排对方的具体动作反应、肢体逼近或接话台词填满表演（严禁结尾剩2秒以上互盯傻站着）；且谁发主声、镜头焦点或口型动作就落在谁身上。
 - visual_description 必须包含角色的外貌特征（发型、服装、体型），确保每个镜头角色可识别。
-- character_state 写清角色当下的姿态、视线、表情和情绪变化，强度服从剧情。
+- character_state 必须写出本镜【起始情绪 → 突发触发后的结尾情绪跨度】（绝不能全程面无表情）。
 - scene_continuity 必须说明如何继承上一镜头的角色位置、表情、道具、场景和色调。
 - transition_note 必须说明最后一帧怎么接下一镜头（动作延续/切景/表情变化）。
 - shot_type 用影视镜头语言：特写、近景、中景、全景、过肩、俯拍、仰拍等。
-- voice_start 写台词相对本段开始的秒数，台词在所描述的动作之后出现，必须留够朗读时间。sound_cues 写发生时间和音效名，仅支持 footstep、impact、water、paper、wind，没有就返回空数组。
+- voice_start 写台词相对本段开始的秒数，台词在所描述的动作之后出现，必须留够朗读时间。sound_cues 写发生时间和音效名，仅支持 footstep、impact、water、paper、wind；凡画面出现拍桌/关门/碰撞（impact）、走动逼近/踩踏（footstep）、翻甩文件/撕纸（paper）、倒茶/溅水（water）或压迫冷风/氛围转折（wind），主动填写 1 条精准的音效时间点（0 ≤ start < duration），无明显声源再返回空数组。
+- 对“最后3秒/末尾才发生”的关键反转或进门线索，严格放在最后 1–2 个分镜中呈现，严禁提前剧透写进中段分镜末尾。
 - voiceover 写这个镜头对应的旁白或角色台词，这是直接送入 TTS 配音的文本。
 - 如果剧本是多人对白，必须保留关键原对白的说话人、意思和顺序，不改成独白。为该分镜输出 dialogue_lines，按出声顺序填写 speaker、text（纯台词）、start（本段开始后的秒数）。按该分镜 duration 安排对白，超出时删去次要对白，给每句话留出自然读时。voiceover 同步填写这些台词拼接后的纯文本。纯旁白场景的 dialogue_lines 为空。
 - voiceover 禁止出现“李白：”“旁白：”“某某说：”这类角色标签，禁止包含括号、音效或动作指示（如“（大笑）”、“【音效】”）。
 - 没有已定稿台词时，按 max(0, floor((duration - voice_start - 0.5) * 3.5)) 估算旁白汉字数上限，标点不计，保留收尾空间。
 - subtitle 直接使用 voiceover 原文，不再缩写。
 - 禁止空泛词：震撼、电影感、高质量、氛围感、未来感大片、引发思考。
+- 空间站位声明（blocking）：每个分镜必须显式写明谁在画左/画右、依托什么物件、身体与视线朝向、锁死 180° 轴线及每人身后的固定背景物理参照物（如门框、窗台、书桌沿、立柱），防止人物未动而背景漂移。单人镜严禁在 visual_description 中点名画外其他角色姓名（防AI克隆双胞胎或硬塞画外人）。
+- 跨镜衔接与景别节奏：9:16 竖屏优先靠抢白台词钩、未完动作打断或信息反差切换（少用拖沓纯空镜）；16:9 横屏可用短反应镜、环境空镜与斜轴纵深推镜。段内避免连续3镜同景别（默认1级景别递进）；continue_action 接缝必须保持 0 级同档景别，且前镜末段禁用极大远景。跨镜新增角色须写明前1.5秒从何侧入画或先声后人，禁止无交代凭空出现。
+- 小道具单实例与朝向锁：手机、信封、证件、照片等带正反面的关键道具，须写清屏幕/字迹面朝向（朝手心还是朝镜头），拿起后原桌面位置须变空。
+- 段缝衔接模式（transition_mode）：从 freeze_handoff（末帧定格承接）、angle_cut（换机位硬切）、empty_shot（空镜/道具过渡）、whip_morph（动势转场）中选填。
 
 每个分镜返回字段：
 - scene_id
 - scene_index
 - duration
 - shot_type
+- blocking（空间站位声明与180°轴线锁）
+- transition_mode（freeze_handoff / angle_cut / empty_shot / whip_morph）
 - voiceover
 - voice_cue（台词应该落在的可见动作，比如抬眼直视镜头）
 - voice_start
@@ -419,8 +699,10 @@ class DeepSeekService(BaseLLMService):
                 for scene in scenes
             ]
             system_prompt = (
-                "你是金牌台词精修导演。你的任务是把每个分镜的配音文本润色成极具感染力、情绪饱满、"
-                "有梗且富有角色灵魂的对白/旁白。坚决拒绝平淡无味的AI假大空说教腔。必须输出严格 JSON。"
+                "你是短剧台词精修导演。请对每个分镜的配音文本进行去AI味精修："
+                "1) 砍掉书面连接词（严禁然而、不仅如此、显而易见、命运的齿轮）；"
+                "2) 3~6字短句与8~16字大白话利害算账句快慢变速，单句不超过15字；"
+                "3) 物证与大白话利害结论同步直给，把专业设定词当句翻译成多少钱/判几年/谁输谁赢。必须输出严格 JSON。"
             )
             user_prompt = f"""\
 分镜列表：{json.dumps(clean_scenes, ensure_ascii=False, default=str)}
@@ -477,6 +759,10 @@ class DeepSeekService(BaseLLMService):
                     "transition_note": scene.get("transition_note"),
                     "audio_hint": scene.get("audio_hint"),
                     "camera_motion": scene.get("camera_motion"),
+                    "blocking": scene.get("blocking"),
+                    "transition_mode": scene.get("transition_mode"),
+                    "character_ids": scene.get("character_ids") or [],
+                    "continuity_handoff": scene.get("continuity_handoff"),
                     "camera_section_number": scene.get("camera_section_number"),
                     "camera_section_offset": scene.get("camera_section_offset"),
                     "previous_segment_context": scene.get("previous_segment_context"),
@@ -514,15 +800,16 @@ movement 只能是 fixed/track/pan/tilt/push/pull，时间用整组秒数，固�
 构图：{ratio_desc}
 
 请为每个分镜生成给 Qwen-Image 和当前配置的视频生成模型使用的提示词。
-如果分镜提供 previous_segment_context，将其作为上一段已经写好的剧情和计划收尾画面。按当前分镜设计新的首帧，承接仍相关的人物状态、道具和剧情因果。允许按分镜切换场景或机位，不重演上一段已经完成的动作，不把计划收尾当作实际尾帧。只输出当前分镜的提示词和逐秒描述。
+如果分镜提供 previous_segment_context，将其作为上一段已经写好的剧情、blocking 站位和 final_second 收尾物态（手拿什么、道具落在何处、人物朝向与伤痕状态）。按当前分镜设计新的首帧，严格延续仍相关的人物左右轴线、手持/放下道具的归属位置（上一镜放下、甩出或转交的道具绝不可在本镜首帧无故捏回原主手里）和剧情因果。允许按分镜切换场景或机位，不重演上一段已经完成的动作，不把计划收尾当作实际尾帧。只输出当前分镜的提示词和逐秒描述。
 
-image_prompt 要求：
+image_prompt 要求（采用三层工艺分离与八段式结构）：
 - 首帧的角色姿态、道具状态和相对位置以 start_state 为唯一时序依据，与第0秒的起始画面一致。visual_description 仅提供静态场景与角色信息，剥离动作过程、后续姿态、接触结果及事后痕迹。只描述此刻已经存在、能直接画出来的画面。
+- **三层分离与防变脸原则**：如果全片角色已绑定参考图（visual_bible 中包含 bound_characters 或 series_context 中的 characters 带 reference_path），image_prompt 中对于已绑定角色严禁长篇重描五官与服饰细节（否则生图模型会覆盖参考图），只写 `[CHARACTER] 角色名(@角色名参考图) — same identity, 画面方位与朝向`，把文字重心留给 `[BACKGROUND]`、`[ACTION]`、`[SCENE]`、`[CAMERA]`、`[LIGHT]`、`[TEXT]`、`[STYLE]`；单镜具名清晰人脸严格 ≤ 2 人，超出人物描述为远景虚化剪影（blurred silhouette in shallow DoF bokeh）。
+- 首帧防呆立与势能起手：非 continue_action 的动态镜头，首帧尽量构图在“动作刚启动 0.1 秒、视线与重心已蓄势”的预备态（而非直立木桩照），并遵循每镜透出的 `continuity_handoff`（新增角色入画来源、180°轴线背景锚点与景别建议）。
+- 严格区分首帧分镜与定妆照光影：禁用“纯白背景、影棚平光”，改为明确物理主光源方向与冷暖色温对比 + 侧逆轮廓边缘光（rim light）。
 - 如果 start_state 是桌面中转后、取物之前，画清道具和支撑面的接触、递物者已经撤开的手，以及接物者尚未碰到道具的双手。若放置动作在本镜内发生，首帧仍保留原持有状态。
 - 必须注明画面风格（{style_hint}），确保全片风格统一。
-- 只描述首帧中实际可见的角色和外貌特征。空镜和纯物品特写保持无人，手部特写仅描述入画部位。禁止为了重复全片角色设定而新增人物。
-- 包含角色表情、动作姿态、场景环境、道具、构图、光线、色调。
-- 必须继承 scene_continuity 和 character_state，保证相邻镜头角色一致。
+- 只描述首帧中实际可见的角色。空镜和纯物品特写保持无人，手部特写仅描述入画部位。禁止为了重复全片角色设定而新增人物。
 - 不要出现 4K、8K、超高清、极致细节、超高解析度。
 - 不要要求图片里生成大段文字；如需要文字，只允许短词、标签、数字或图标。
 
@@ -536,30 +823,43 @@ image_prompt 要求：
 - 禁止把后期字幕、字卡或标题安排写进 camera、action、起止状态、衔接说明或收尾构图。结尾保留剧情画面。
 {legacy_camera_rules}
 
-video_prompt 要求（参考 video-shotcraft 与 Seedance 2.0 工业级运镜规范）：
+video_prompt 要求：
 - 这是给图生视频模型的动作提示词，必须基于首帧图片（@首帧）自然演进，严格保持人物面孔、服装颜色及光影一致。
 - 先确定观众需要依次看清的起因、关键交互和结果，再分配具体秒点。动作幅度、速度和停顿服从剧情。情绪通过当前景别能看见的表情、视线、手势或姿态呈现。
 - 运镜写清起始构图、拍摄侧、跟随目标、方向和落点。注明是哪一个可见动作触发了取景或焦点变化。关键接触期间保留双方和接触点，构图稳定时写清画面要保持的范围。
 - 每秒只突出一个观看重点。人物互动时允许焦点沿因果转到另一人或关键道具，保持各人的左右位置、视线与拍摄轴线。只有动作确实影响环境时才写可见的环境反馈。
-- 逐秒 action 描述从哪里到哪里、哪一侧肢体发力、接触点、速度和方向、接触后的道具反馈、视线或重心如何变化。没有接触的动作写清位移或姿态变化。
+- 逐秒 action 描述从哪里到哪里、哪一侧肢体发力、接触点、速度和方向、接触后的道具反馈、视线或重心如何变化；涉及物理接触按“靠近 → 触碰点 → 施力方向 → 物体/身体位移反应 → 落定稳定”先后顺序写清（未触碰前绝不提前后仰）。反应镜头按“感官触发 → 停顿半拍（定眼神/停手） → 眼眉下颌肌肉微动渗出 → 身体决断”演绎。
+- 末拍收束缓冲：每个分镜最后一秒的后 0.6 秒须落定在稳定可读姿态与视觉终态（若下镜为 continue_action 则严禁大幅甩头或快速出画，确保尾帧清晰可接）。
 - start_state/end_state 写出画面内位置、朝向、支撑脚或持物手，以及重要道具的位置与状态。下一秒延用上一秒的结束状态。
 - action 的第一个动作必须能从该秒 start_state 直接发生，最后一个动作必须产生该秒 end_state。重要道具的位置、持物人、持物手、朝向和接触面发生变化时，把靠近、接触、承重转移与松手按实际顺序写入对应秒；秒末仍在接触就写明保持的接触点。人物转身、出画或改变视线时交代可见的过程。
 - camera 的起始景别、拍摄侧和取景目标承接上一秒的结束构图。运镜跨秒时，写清当前秒推进到哪里及下一秒从哪里接上。关键交互和揭晓期间保持接触点或反应主体可见，不安排突然切镜或让关键主体无故出画。
 - continue_action 的首秒延续上一段尾部的姿态、运动方向、光线和机位，从未完成的动作继续。已经落下、打开或离开画面的东西保持其结果，不要复位。
 - video_prompt 只概括首帧继承、镜头运动、关键动作目标与结尾衔接。逐秒时间和动作只写在 motion_beats，避免同一时间轴在两个字段里重复或冲突。
+- 必须按逐镜递进写清强烈的情绪弧线与身体发力动态：相邻秒必须体现动作发力阶段和面部微表情剧变（如猛然拍桌站起、倾身压近、骤然僵住瞳孔微缩），避免整镜从头到尾站桩僵直微呼吸。
 - 不要只写"缓慢运动、自然运动、画面更生动"。
 - 不要突然换场景、换主体、换服装、换道具，不要加入无关角色。
+- **六条运镜与动作稳定性约束（强制执行）**：
+  1) 严禁文学比喻（禁写“端坐如钟、目光如炬、心如刀绞”，防AI凭空生成铜钟或火把，只写纯物理动作）；
+  2) 单人镜严禁点名画外角色（单人特写只写“目光投向画右前方画外”，绝不出现画外角色名字，防AI克隆双胞胎）；
+  3) 一镜一视线（短镜头只锁死1个视线落点，严禁眼球左右乱飘）；
+  4) 情绪必须拆解为面部肌肉与呼吸动作（如“瞳孔骤缩、下颌绷紧、胸口起伏”）；
+  5) 反光道具零光效描写（玉佩/金属只写“哑光实心物理材质原色”，禁写“泛着幽光/映出火苗”防变灯泡）；
+  6) 句尾环境微锁（每镜结尾保持“；身后固定背景结构与主光色温保持不变”）。
+  7) **单镜一镜到底锁（最高优先）**：同一分镜所有秒的 `motion_beats.camera` 必须保持同一个连续机位景别（如全段都用“中近景缓慢跟推”），严禁在同一条片段里写“0-2s 中景 -> 2-4s 手部特写 -> 4-6s 切木门”，否则视频模型会触发段内硬切导致重影叠化与道具错乱！需要特写反打或看门外请留给下一条独立分镜；
+  8) 严禁要求屏幕/纸面生成可读长文字（禁止拍“信封/合同/手机显示清晰成段小字”，防乱码错字；文件类道具用红印章/牛皮纸角标替代，关键内容由配音和后期字幕承载）；全程严禁AI自发生成画面内字幕与文字气泡。
 - **动作描述必须委婉、暗示性**，禁用暴力/战争词汇："杀"、"斩"、"刺"、"砍"、"箭穿"、"纵火"、"焚烧"、"挥剑"、"拔剑"、"打斗"、"激战"、"厮杀"、"受伤"、"流血"。用"手势变化"、"快速转身"、"高举手臂"、"用力投出"、"握紧拳头"、"抬手示意"、"身体前倾"等中性动作描述代替。
 
 每个分镜返回字段：
 - scene_id
+- blocking（空间站位声明，明确画左/画右、依托物、朝向与180°轴线锁）
+- transition_mode（freeze_handoff / angle_cut / empty_shot / whip_morph）
 - image_prompt
 - image_negative_prompt: 针对该首帧最可能出现的结构、位置或材质错误，列出具体可见缺陷。只排除不需要的额外肢体、错误接触、文字、水印或风格偏差，按当前画面取舍。
 - video_negative_prompt: 针对该镜头的动作和运镜，列出具体的时序缺陷，包括道具瞬移、接触穿模、角色外观漂移、动作倒放或非计划的抖动；排除画面浮现字幕、标题或字卡，保留情节所需的道具内文字。不要排除分镜要求的静止、运动或效果。两个负面词字段用简短短语，不堆砌画质评分词。
 - video_prompt
 - motion_beats: 对象数组，每条包含 start、end、subject、camera、start_state、action、end_state。按片段本地时间从0秒逐秒写到 duration，时间连续且不重叠。每条都写完整可见画面：camera 写景别、机位、取景重点及运镜；start_state 写人物在画面中的方位、姿态、视线和相关道具的位置；action 写动作方向、肢体和接触点如何变化；end_state 写秒末可见结果，下一条从该结果继续。停顿也写清保持的画面。输出只描述当前分镜的实际内容，不包含示例、类比、占位词或模板说明。
 - motion_beats 的 start 和 end 必须使用 JSON 数字，单位为秒，不加引号或单位后缀。
-- 原生10秒段落必须返回十条逐秒描述。每秒的 camera、start_state、action、end_state 合计以50–90个汉字为写作参考，优先补足构图、走位、接触过程和秒末状态。共同的外貌、服装、场景和光线放在 continuity_note 中，逐秒字段无需重复堆砌。每秒只写当前段落能拍到的内容。
+- 每个动态分镜必须返回条数与自身 duration 完全相等的逐秒描述（如 6 秒返回 6 条、8 秒返回 8 条、11 秒返回 11 条，严格从 0 到 duration 秒）。每秒的 camera、start_state、action、end_state 合计精炼控制在 30–55 个汉字，突出构图、发力部位、接触过程和秒末结果（总提示词避免臃肿稀释模型注意力）。共同的外貌、服装、场景和光线放在 continuity_note 中，逐秒字段不重复堆砌。每秒只写当前段落能拍到的内容。
 - 画面中要看清什么，先在 video_prompt 指明接触点和景别；每秒写清入画侧、接触面的相对位置、力的方向、动作结果和可见反应。不要用气氛词代替位移。
 - 图片只能画出动作开始状态，不得提前呈现动作结果；末段结果必须符合 end_state。
 - first_frame_focus: 首帧最重要的可见主体
@@ -698,3 +998,31 @@ video_prompt 要求（参考 video-shotcraft 与 Seedance 2.0 工业级运镜规
             }
         except Exception as e:
             raise RuntimeError(f"DeepSeek generate_single_prompt failed: {e}") from e
+
+    def doctor_scene_prompt(self, scene: dict[str, Any], diagnosis_reasons: list[str]) -> dict[str, Any]:
+        """质检发现单镜瑕疵后，针对病灶进行局部外科手术式提示词自愈改写。"""
+        duration = int(scene.get("duration") or 5)
+        system_prompt = (
+            "你是 AI 短剧片段修复导演。成片质检发现某个单镜片段存在局部瑕疵，请在严格保留原剧情、原角色、"
+            f"原时长（{duration} 秒）与逐秒结构前提下，仅针对诊断病灶重写更稳妥的动作与镜头描述。"
+            "重点：稳定曝光与主光色温、去掉易产生闪白或穿模的急剧甩头与复杂多手指切换、增强动作物理连续性。必须输出严格 JSON。"
+        )
+        user_prompt = json.dumps(
+            {
+                "scene_id": scene.get("scene_id"),
+                "duration": duration,
+                "transition_type": scene.get("transition_type"),
+                "transition_mode": scene.get("transition_mode"),
+                "blocking": scene.get("blocking"),
+                "diagnosis_reasons": diagnosis_reasons,
+                "current_video_prompt": scene.get("video_prompt"),
+                "current_motion_beats": scene.get("motion_beats"),
+                "start_state": scene.get("start_state"),
+                "end_state": scene.get("end_state"),
+                "required_json_keys": ["video_prompt", "motion_beats", "transition_type", "heal_summary"],
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        result = self._call_api(system_prompt, user_prompt, max_tokens=2200)
+        return result if isinstance(result, dict) else {}

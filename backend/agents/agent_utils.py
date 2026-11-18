@@ -123,3 +123,32 @@ def assert_no_mock_assets(assets: list[dict[str, Any]]) -> None:
                 f"Mock asset is not allowed in real generation: "
                 f"{asset_id} ({asset_type}) at {path}"
             )
+
+
+async def deduplicate_scenes_by_index(
+    scenes: list[dict[str, Any]],
+    mongodb_client: Any,
+    collection_name: str = SCENES_COLLECTION,
+) -> list[dict[str, Any]]:
+    """清理并发或异常残留的同序号分镜，按 scene_index 保留最新记录并排序返回。"""
+    by_index: dict[int, dict[str, Any]] = {}
+    stale_ids: list[Any] = []
+    for scene in scenes:
+        idx = int(scene.get("scene_index") or 0)
+        prev = by_index.get(idx)
+        if prev is None:
+            by_index[idx] = scene
+        else:
+            prev_ts = str(prev.get("updated_at") or prev.get("created_at") or "")
+            cur_ts = str(scene.get("updated_at") or scene.get("created_at") or "")
+            if cur_ts >= prev_ts:
+                stale_ids.append(prev.get("_id"))
+                by_index[idx] = scene
+            else:
+                stale_ids.append(scene.get("_id"))
+    for stale_id in stale_ids:
+        if stale_id is not None:
+            await mongodb_client.delete_one(collection_name, {"_id": stale_id})
+    deduped = list(by_index.values())
+    deduped.sort(key=lambda s: int(s.get("scene_index") or 0))
+    return deduped

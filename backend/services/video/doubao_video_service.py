@@ -13,6 +13,7 @@ class DoubaoVideoService(BaseVideoService):
     """Doubao Video Generation (Volcengine Ark platform) image-to-video service."""
 
     API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+    supports_last_frame = True
 
     def _get_headers(self) -> dict[str, str]:
         key = settings.volcengine_api_key.strip() if settings.volcengine_api_key else ""
@@ -61,7 +62,9 @@ class DoubaoVideoService(BaseVideoService):
             (r"打斗", "交手"),
             # 流血与受伤
             (r"受伤", "受创"),
-            (r"流血", "带伤"),
+            (r"流血|鲜血淋漓|血肉模糊|血流成河|喷血|吐血", "带伤"),
+            (r"割喉|刺穿胸膛|砍头|爆头|碎尸|虐杀|砍杀|刺杀", "寒光掠过，对方僵住后退"),
+            (r"掐死|勒死|窒息而死", "手掌逼近肩颈施压，对方呼吸急促后退"),
             (r"捂着伤口", "捂着肩膀"),
             (r"捂着受伤的", "捂着"),
         ]
@@ -97,6 +100,7 @@ class DoubaoVideoService(BaseVideoService):
         video_prompt: str | None = None,
         duration: int = 5,
         ratio: str = "9:16",
+        last_frame_path: str | None = None,
     ) -> dict[str, Any]:
         if not settings.enable_paid_api:
             raise ValueError(
@@ -116,6 +120,23 @@ class DoubaoVideoService(BaseVideoService):
 
             # 2. 将图片编码为 base64 data-URI
             image_data_uri = self._image_to_base64_url(resolved_image_path)
+            content_items: list[dict[str, Any]] = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_uri},
+                    "role": "first_frame",
+                }
+            ]
+            if last_frame_path:
+                resolved_last = last_frame_path
+                if not Path(last_frame_path).is_absolute():
+                    resolved_last = str(backend_dir / str(last_frame_path).replace("backend/", ""))
+                if Path(resolved_last).is_file():
+                    content_items.append({
+                        "type": "image_url",
+                        "image_url": {"url": self._image_to_base64_url(resolved_last)},
+                        "role": "last_frame",
+                    })
 
             # 3. 提交图生视频任务
             # Seedance 最低支持 4 秒，最高 12 秒
@@ -126,22 +147,14 @@ class DoubaoVideoService(BaseVideoService):
             safe_prompt = self._sanitize_prompt(video_prompt or "")
             if safe_prompt != video_prompt:
                 print(f"[DoubaoVideoService] Sanitized video_prompt for {scene_id}")
+            content_items.append({
+                "type": "text",
+                "text": safe_prompt or "smooth movement, high quality, consistent with character",
+            })
             submit_url = f"{self.API_BASE}/contents/generations/tasks"
             payload: dict[str, Any] = {
                 "model": settings.volcengine_model,
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_data_uri
-                        },
-                        "role": "first_frame"
-                    },
-                    {
-                        "type": "text",
-                        "text": safe_prompt or "smooth movement, high quality, consistent with character"
-                    }
-                ],
+                "content": content_items,
                 "resolution": "1080p",
                 "ratio": ratio,
                 "duration": clamped_duration,

@@ -242,10 +242,25 @@ import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, SecretStr
 
+from urllib.parse import urlsplit
+
+from services.image.qwen_image_service import REFERENCE_MODELS as SUPPORTED_QWEN_IMAGE_MODELS
 from services.model_config import KINDS, model_config, save_models, saved_models, validate_config
 from services.video.wan_video_service import FLASH_MODEL, SILENT_OUTPUT_MODELS, WAN3_MODELS
 
 SUPPORTED_WAN_VIDEO_MODELS = SILENT_OUTPUT_MODELS | WAN3_MODELS | {FLASH_MODEL}
+SUPPORTED_DASHSCOPE_IMAGE_MODELS = frozenset(SUPPORTED_QWEN_IMAGE_MODELS) | {
+    "wan2.7-image",
+    "wan2.6-image",
+    "wan2.5-t2i-preview",
+    "wanx2.1-t2i-turbo",
+    "wanx2.1-t2i-plus",
+}
+
+
+def _is_dashscope_url(base: str) -> bool:
+    host = (urlsplit(dashscope_base_url(base)).hostname or "").lower()
+    return host == "dashscope.aliyuncs.com" or host.endswith(".aliyuncs.com")
 
 
 def dashscope_base_url(base: str) -> str:
@@ -337,8 +352,8 @@ def matches_third_party_video_catalog(item: dict, model_id: str) -> bool:
         return False
     return bool(
         re.search(
-            r"(?:^|[-_])(?:video|i2v|t2v|v2v|r2v|s2v|kling|vidu|seedance|"
-            r"cogvideox?|hunyuan-video|luma|runway|sora|hailuo|minimax-video|pika|mochi)(?:[-_\d]|$)",
+            r"(?:^|[-_/])(?:video|i2v|t2v|v2v|r2v|s2v|kling|vidu|seedance|veo|wanx?\d*(?:\.\d+)*|"
+            r"cogvideox?|hunyuan-video|luma|runway|sora|hailuo|minimax-video|pika|mochi)(?:[-_\d.]|$)",
             name,
         )
     )
@@ -368,6 +383,7 @@ def matches_model_catalog(kind, item, model_id):
             or name.startswith(
                 (
                     "z-image-",
+                    "z-image",
                     "gpt-image-",
                     "dall-e-",
                     "flux-",
@@ -381,8 +397,11 @@ def matches_model_catalog(kind, item, model_id):
                     "ideogram",
                     "recraft",
                     "imagen-",
+                    "nano-banana",
+                    "midjourney",
                 )
             )
+            or bool(re.search(r"gemini.*image", name))
         )
 
     non_chat = re.search(
@@ -403,7 +422,7 @@ def effective_model(kind, payload):
     current = model_config(kind)
     url = payload.url.strip().rstrip("/")
     key = payload.key.get_secret_value().strip() if payload.key else ""
-    if not key and url == current["url"]:
+    if not key and dashscope_base_url(url) == dashscope_base_url(current["url"]):
         key = current["key"]
     try:
         return validate_config({"url": url, "model": payload.model.strip(), "key": key})
@@ -522,7 +541,7 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
     if not config["key"]:
         raise HTTPException(422, detail="Enter a key for this URL.")
     candidates = model_catalog_candidates(kind, config["url"])
-    official_video = kind == "video" and candidates[0] == "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+    official_dashscope = _is_dashscope_url(config["url"])
     headers = {"Authorization": f"Bearer {config['key']}"}
     items = None
     last_response = None
@@ -557,14 +576,19 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
         and (model_id := item["id"].strip()) and matches_model_catalog(kind, item, model_id)
     })
     suggestion_source = "none"
-    if official_video:
+    if official_dashscope and kind == "video":
         suggested_models = sorted(SUPPORTED_WAN_VIDEO_MODELS.difference(models))
         suggestion_source = "official" if suggested_models else "none"
-    elif kind == "video" and available and not models:
+    elif official_dashscope and kind == "image":
+        suggested_models = sorted(SUPPORTED_DASHSCOPE_IMAGE_MODELS.difference(models))
+        suggestion_source = "official" if suggested_models else "none"
+    elif kind == "video" and available:
         suggested_models = sorted({
             model_id for item in items
             if isinstance(item, dict) and isinstance(item.get("id"), str)
-            and (model_id := item["id"].strip()) and matches_third_party_video_catalog(item, model_id)
+            and (model_id := item["id"].strip())
+            and model_id not in models
+            and matches_third_party_video_catalog(item, model_id)
         })
         suggestion_source = "catalog" if suggested_models else "none"
     else:
@@ -572,6 +596,7 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
     return {"status": "success", "data": {
         "models": models,
         "available": available,
+        "raw_count": len(items) if available else 0,
         "suggested_models": suggested_models,
         "suggestion_source": suggestion_source,
         "endpoint": last_response.request.url.path if (last_response is not None and getattr(last_response, "request", None) is not None) else None,

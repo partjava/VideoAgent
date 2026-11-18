@@ -10,10 +10,24 @@ from services.task_service import task_service
 from services.camera_plan import normalize_camera_plan
 from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE
 from services.visual_style import PHOTO_RULES, PHOTO_EXCLUSIONS, lock_visual_style
-from services.character_binding import series_prompt_context
+from services.character_binding import (
+    characters_in_scene,
+    frozen_characters,
+    reference_choices_for_scene,
+    series_prompt_context,
+)
+from services.drama_craft_service import (
+    build_eight_segment_image_prompt,
+    build_mcsla_video_overview,
+    ensure_scene_blocking,
+    infer_transition_mode,
+    sanitize_video_prompt_mcsla,
+    strip_redundant_face_dna_when_referenced,
+)
+from services.shot_continuity import build_scene_continuity_handoff
 
-DEFAULT_IMAGE_NEGATIVE_PROMPT = "多余肢体，手指结构混乱，五官错位，无关文字，水印，主体边缘异常断裂"
-DEFAULT_VIDEO_NEGATIVE_PROMPT = "道具瞬移，非计划抖动，突然变脸，肢体穿模，多余肢体，服装颜色突变，画面撕裂，非计划倒放"
+DEFAULT_IMAGE_NEGATIVE_PROMPT = "多余肢体，手指结构混乱，五官错位，无关文字，水印，主体边缘异常断裂，纯白影棚背景，Q版大头比例"
+DEFAULT_VIDEO_NEGATIVE_PROMPT = "道具瞬移，非计划抖动，突然变脸，肢体穿模，多余肢体，多余手臂，断臂嫁接，双胞胎重影，画外角色闯入，服装颜色突变，画面撕裂，非计划倒放，画面内自带字幕，文字气泡，英文乱码，水印"
 
 from agents.agent_utils import (
     SCENES_COLLECTION,
@@ -43,6 +57,9 @@ class PromptAgent:
                 if paired:
                     scene["camera_section_offset"] = 5 * (index % 2)
                     scene["camera_section_number"] = index // 2 + 1
+                scene["continuity_handoff"] = build_scene_continuity_handoff(
+                    task_scenes, index, ratio=str(task.get("ratio", "9:16")), bound_cast=frozen_characters(task) or None
+                )
             # 旧字符串节拍必须重新生成，不能仅凭图片提示词复用。
             def complete(scene):
                 try:
@@ -73,6 +90,9 @@ class PromptAgent:
                      "series_context": series_prompt_context(task)}
             fixed = json.dumps(bible, ensure_ascii=False)
 
+            bound_cast = frozen_characters(task) or world.get("characters", [])
+            all_cast_names = [c.get("name") for c in bound_cast if isinstance(c, dict) and c.get("name")]
+
             def generate(batch):
                 return llm_service.generate_image_prompts(batch, ratio=ratio, style=_style, visual_bible=bible)
 
@@ -95,9 +115,51 @@ class PromptAgent:
                 prompt["video_negative_prompt"] = (
                     video_negative.strip() if isinstance(video_negative, str) else ""
                 ) or DEFAULT_VIDEO_NEGATIVE_PROMPT
-                prompt["image_prompt"] = f"固定角色与世界设定（只绘制本镜实际出场角色）：{fixed}\n{prompt['image_prompt']}"
-                if scene.get("start_state"):
-                    prompt["image_prompt"] = f"首帧时刻的画面状态：{scene['start_state']}\n{prompt['image_prompt']}"
+
+                # ── 空间站位声明（Blocking）与段缝衔接模式 ──
+                prompt["blocking"] = prompt.get("blocking") or scene.get("blocking") or ensure_scene_blocking(scene, bound_cast)
+                prompt["transition_mode"] = prompt.get("transition_mode") or scene.get("transition_mode") or infer_transition_mode(scene)
+                handoff = scene.get("continuity_handoff") or {}
+                if handoff.get("next_is_continue") and beats:
+                    last_end_state = str(beats[-1].get("end_state") or "").strip("。 ")
+                    if last_end_state and "稳态" not in last_end_state:
+                        beats[-1]["end_state"] = f"{last_end_state}，收束至清晰可截稳态"
+                prompt["continuity_handoff"] = handoff
+
+                # ── 分镜首帧三层工艺分离（绑定参考图时自动剥离五官重描 + 单镜具名角色 ≤2 人） ──
+                scene_refs = reference_choices_for_scene(task, scene)
+                visible_cast = characters_in_scene(task, scene)
+                if scene_refs and visible_cast:
+                    primary_cast = visible_cast[:2]
+                    overflow_cast = visible_cast[2:]
+                    stripped_img = strip_redundant_face_dna_when_referenced(prompt["image_prompt"], primary_cast)
+                    prompt["image_prompt"] = build_eight_segment_image_prompt(
+                        {**scene, **prompt},
+                        stripped_img,
+                        bound_profiles=primary_cast,
+                        overflow_profiles=overflow_cast,
+                        style=_style or "短剧",
+                        ratio=ratio,
+                    )
+                    prompt["three_layer_stripped"] = True
+                else:
+                    prompt["image_prompt"] = f"固定角色与世界设定（只绘制本镜实际出场角色）：{fixed}\n{prompt['image_prompt']}"
+                    if scene.get("start_state"):
+                        prompt["image_prompt"] = f"首帧时刻的画面状态：{scene['start_state']}\n{prompt['image_prompt']}"
+                    prompt["three_layer_stripped"] = False
+
+                # ── 视频提示词 MCSLA 五层结构 + 动作物理化清洗 + 敏感词转译（≤1400字） ──
+                sanitized_video = sanitize_video_prompt_mcsla(
+                    prompt["video_prompt"],
+                    scene={**scene, **prompt},
+                    all_character_names=all_cast_names,
+                )
+                prompt["video_prompt"] = sanitized_video["prompt"]
+                prompt["mcsla_summary"] = build_mcsla_video_overview(
+                    {**scene, **prompt},
+                    all_character_names=all_cast_names,
+                )
+
                 if _style == "短剧":
                     style_lock = PHOTO_RULES
                     prompt["image_prompt"] = lock_visual_style(prompt["image_prompt"], _style)
@@ -106,7 +168,8 @@ class PromptAgent:
                     prompt["image_negative_prompt"] = PHOTO_EXCLUSIONS + "，" + str(prompt.get("image_negative_prompt") or "")
                     prompt["video_negative_prompt"] = PHOTO_EXCLUSIONS + "，" + str(prompt.get("video_negative_prompt") or "")
 
-            if native:
+            sequential = native or not paired
+            if sequential:
                 prompts = []
                 previous_context = None
                 rebuilding = False
@@ -127,10 +190,13 @@ class PromptAgent:
                         prompt["previous_segment_context"] = previous_context
                         prepare(prompt, scene)
                         await self._save_prompt(task_id, prompt)
+                    handoff = scene.get("continuity_handoff") or {}
                     previous_context = {
                         "scene_index": scene["scene_index"],
                         "visual_description": scene.get("visual_description"),
                         "voiceover": scene.get("voiceover"),
+                        "blocking": prompt.get("blocking"),
+                        "next_transition_type": scene.get("transition_type") or handoff.get("mode"),
                         "key_action": prompt.get("video_prompt"),
                         "final_second": prompt["motion_beats"][-1],
                         "closing_composition": prompt.get("last_frame_for_transition"),
@@ -156,7 +222,7 @@ class PromptAgent:
                     f"首帧构图：{plan['opening']}。景别：{plan['framing']}。机位：{plan['viewpoint']}。"
                     f"关键可见位置：{plan['focus']}。\n" + str(first_prompt.get("image_prompt") or "")
                 )
-            if not native:
+            if not sequential:
                 for prompt in prompts:
                     prepare(prompt, expected[str(prompt["scene_id"])])
                 for prompt in prompts:
@@ -180,6 +246,7 @@ class PromptAgent:
             "image_prompt", "image_negative_prompt", "video_negative_prompt", "video_prompt", "motion_beats", "camera_plan",
             "camera_section_offset", "camera_section_number", "first_frame_focus",
             "last_frame_for_transition", "continuity_note", "previous_segment_context",
+            "blocking", "transition_mode", "mcsla_summary", "three_layer_stripped", "continuity_handoff",
         )
         await mongodb.update_one(
             SCENES_COLLECTION,

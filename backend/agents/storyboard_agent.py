@@ -1,17 +1,34 @@
 import anyio
 import re
 from datetime import UTC, datetime
-from services.character_binding import series_prompt_context, validate_series_scene
+from typing import Any
+from services.character_binding import frozen_characters, series_prompt_context, validate_series_scene
+from services.drama_craft_service import ensure_scene_blocking, infer_transition_mode
 
+from config import settings
 from core.database import mongodb
 from models.scene_model import Scene
 from models.task_model import VideoTaskStatus
 from services.provider_factory import get_llm_service
-from services.generation_contract import NATIVE_GENERATION_MODE, PAIRED_GENERATION_MODE, build_timeline, validate_native_scenes, validate_paired_scenes, validate_scene_durations, voice_window, scene_event_offset
+from services.task_service import task_service
+from services.generation_contract import (
+    AUTO_DIRECTOR_MODE,
+    NATIVE_GENERATION_MODE,
+    PAIRED_GENERATION_MODE,
+    build_timeline,
+    provider_duration_bounds,
+    validate_auto_director_scenes,
+    validate_native_scenes,
+    validate_paired_scenes,
+    validate_scene_durations,
+    voice_window,
+    scene_event_offset,
+)
 
 from agents.agent_utils import (
     SCENES_COLLECTION,
     SCRIPTS_COLLECTION,
+    deduplicate_scenes_by_index,
     get_required_task,
     mark_agent_failed,
     mark_agent_start,
@@ -104,24 +121,33 @@ class StoryboardAgent:
         try:
             task = await get_required_task(task_id)
             
-            # 检查分镜是否已生成
+            # 检查分镜是否已生成；若存在并发或历史残余导致的重复 scene_index，先去重或清理重建
             scenes = await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=100)
             existing_scenes = [scene for scene in scenes]
             if existing_scenes:
-                existing_scenes.sort(key=lambda s: int(s.get("scene_index", 0)))
-                # 清除 MongoDB 的 _id 字段保证返回纯字典
-                for scene in existing_scenes:
-                    if "_id" in scene:
-                        scene.pop("_id")
-                await mark_agent_success(
-                    task_id,
-                    self.agent_name,
-                    progress=50,
-                    status=VideoTaskStatus.STORYBOARD_DONE,
-                    message="Skipped StoryboardAgent (scenes already exist)",
-                    extra_fields={"metadata.scene_count": len(existing_scenes)},
-                )
-                return existing_scenes
+                deduped = await deduplicate_scenes_by_index(existing_scenes, mongodb, SCENES_COLLECTION)
+                for scene in deduped:
+                    scene.pop("_id", None)
+                try:
+                    validate_storyboard_scenes(
+                        deduped,
+                        target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
+                        enforce_voiceover_density=False,
+                        whole=task.get("generation_mode") == "wan3_whole",
+                    )
+                    await mark_agent_success(
+                        task_id,
+                        self.agent_name,
+                        progress=50,
+                        status=VideoTaskStatus.STORYBOARD_DONE,
+                        message="Skipped StoryboardAgent (scenes already exist)",
+                        extra_fields={"metadata.scene_count": len(deduped)},
+                    )
+                    return deduped
+                except ValueError:
+                    for sc in await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=200):
+                        if sc.get("_id") is not None:
+                            await mongodb.delete_one(SCENES_COLLECTION, {"_id": sc["_id"]})
 
             await mark_agent_start(task_id, self.agent_name, progress=40)
 
@@ -140,44 +166,120 @@ class StoryboardAgent:
             _generation_mode = str(task.get("generation_mode", "full_dynamic"))
             if _generation_mode == "wan3_whole":
                 storyboard_context["segments"] = []
-            scenes_data = await anyio.to_thread.run_sync(
-                lambda _script=storyboard_context, _td=_target_duration, _gm=_generation_mode:
-                    llm_service.generate_storyboard(
-                        _script,
-                        target_duration=_td,
-                        generation_mode=_gm,
-                    )
-            )
-            target_duration = _target_duration
             segments = script.get("segments") or []
-            if _generation_mode == NATIVE_GENERATION_MODE and segments:
-                if len(scenes_data) != len(segments):
-                    raise ValueError("原生10秒分镜必须与剧本段落一一对应")
-                scenes_data.sort(key=lambda scene: int(scene["scene_index"]))
-                for scene, segment in zip(scenes_data, segments):
-                    lines = segment.get("dialogue_lines") or []
-                    voiceover = "\n".join(line["text"] for line in lines) if lines else segment.get("voiceover", "")
-                    scene.update(
-                        voiceover=voiceover, subtitle=voiceover,
-                        voice_start=lines[0]["start"] if lines else segment["voice_start"],
-                        dialogue_lines=lines,
-                    )
-            validate_storyboard_scenes(
-                scenes_data,
-                target_duration=target_duration,
-                enforce_voiceover_density=False,
-                whole=_generation_mode == "wan3_whole",
-            )
 
-            if _generation_mode == PAIRED_GENERATION_MODE:
-                validate_paired_scenes(scenes_data, target_duration)
-            elif _generation_mode == NATIVE_GENERATION_MODE:
-                validate_native_scenes(scenes_data, target_duration)
+            async def _draft_and_validate(ctx: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+                draft = await anyio.to_thread.run_sync(
+                    lambda _script=ctx, _td=_target_duration, _gm=_generation_mode:
+                        llm_service.generate_storyboard(
+                            _script,
+                            target_duration=_td,
+                            generation_mode=_gm,
+                        )
+                )
+                resolved_duration = _target_duration
+                if _generation_mode == NATIVE_GENERATION_MODE and segments:
+                    if len(draft) != len(segments):
+                        raise ValueError("原生10秒分镜必须与剧本段落一一对应")
+                    draft.sort(key=lambda scene: int(scene["scene_index"]))
+                    for scene, segment in zip(draft, segments):
+                        lines = segment.get("dialogue_lines") or []
+                        voiceover = "\n".join(line["text"] for line in lines) if lines else segment.get("voiceover", "")
+                        scene.update(
+                            voiceover=voiceover, subtitle=voiceover,
+                            voice_start=lines[0]["start"] if lines else segment["voice_start"],
+                            dialogue_lines=lines,
+                        )
+                elif _generation_mode == AUTO_DIRECTOR_MODE:
+                    min_s, max_s = provider_duration_bounds(settings.video_provider)
+                    draft.sort(key=lambda scene: int(scene.get("scene_index") or 1))
+                    for idx, scene in enumerate(draft):
+                        scene["scene_index"] = idx + 1
+                        scene["need_dynamic_video"] = True
+                        if idx == 0 and scene.get("transition_type") == "continue_action":
+                            scene["transition_type"] = "cut"
+                        if segments and idx < len(segments):
+                            segment = segments[idx]
+                            seg_dur = max(min_s, min(max_s, int(segment.get("duration") or scene.get("duration") or 8)))
+                            lines = segment.get("dialogue_lines") or []
+                            voiceover = "\n".join(line["text"] for line in lines) if lines else segment.get("voiceover", "")
+                            if voiceover:
+                                scene.update(
+                                    duration=seg_dur,
+                                    voiceover=voiceover,
+                                    subtitle=voiceover,
+                                    voice_start=lines[0]["start"] if lines else segment.get("voice_start", 0),
+                                    dialogue_lines=lines,
+                                )
+                            else:
+                                scene["duration"] = seg_dur
+                        else:
+                            scene["duration"] = max(min_s, min(max_s, int(scene.get("duration") or 8)))
+                    if not task.get("duration_locked"):
+                        resolved_duration = sum(int(s["duration"]) for s in draft)
+                        await task_service.update_task_fields(
+                            task_id,
+                            {"duration": resolved_duration, "metadata.task_plan.duration": resolved_duration},
+                        )
+                validate_storyboard_scenes(
+                    draft,
+                    target_duration=resolved_duration,
+                    enforce_voiceover_density=False,
+                    whole=_generation_mode == "wan3_whole",
+                )
+                if _generation_mode == PAIRED_GENERATION_MODE:
+                    validate_paired_scenes(draft, resolved_duration)
+                elif _generation_mode == NATIVE_GENERATION_MODE:
+                    validate_native_scenes(draft, resolved_duration)
+                elif _generation_mode == AUTO_DIRECTOR_MODE:
+                    validate_auto_director_scenes(
+                        draft, target_duration=resolved_duration, bounds=provider_duration_bounds(settings.video_provider)
+                    )
+                return draft, resolved_duration
+
+            scenes_data, target_duration = await _draft_and_validate(storyboard_context)
+
+            # 出图/出视频前前置剧透与结尾契合核查：发现把末尾反转剧透到前中段时，免费在文字阶段重写一次
+            if task.get("user_input") and settings.enable_paid_api and hasattr(llm_service, "review_story_coverage"):
+                try:
+                    pre_review_inputs = [
+                        {
+                            "scene_id": sc.get("scene_id"),
+                            "scene_index": sc.get("scene_index"),
+                            "duration": sc.get("duration"),
+                            "picture": sc.get("visual_description"),
+                            "narration": sc.get("voiceover"),
+                            "media": "video" if sc.get("need_dynamic_video") else "still image",
+                        }
+                        for sc in scenes_data
+                    ]
+                    pre_review = await anyio.to_thread.run_sync(
+                        llm_service.review_story_coverage,
+                        task.get("user_input", ""),
+                        plan.get("plot_beats", []),
+                        pre_review_inputs,
+                    )
+                    raw_issues = [str(x).strip() for x in (pre_review.get("issues") or []) if str(x).strip()]
+                    if pre_review.get("verdict") != "pass" and any(
+                        kw in msg for msg in raw_issues for kw in ("剧透", "提前", "最后", "结尾", "未按", "不一致", "遗漏")
+                    ):
+                        print(f"[StoryboardAgent] Task {task_id}: pre-shoot semantic check flagged {len(raw_issues)} timing/spoiler issue(s); rewriting once before image/video generation...", flush=True)
+                        revised_scenes, revised_dur = await _draft_and_validate({**storyboard_context, "review_feedback": raw_issues})
+                        scenes_data, target_duration = revised_scenes, revised_dur
+                except Exception as exc:
+                    print(f"[StoryboardAgent] Pre-shoot semantic review skipped safely: {exc}", flush=True)
+
+            for stale in await mongodb.find_many(SCENES_COLLECTION, {"task_id": task_id}, limit=200):
+                if stale.get("_id") is not None:
+                    await mongodb.delete_one(SCENES_COLLECTION, {"_id": stale["_id"]})
 
             saved_scenes: list[dict[str, object]] = []
-            for item in scenes_data:
+            bound_cast = frozen_characters(task) or plan.get("characters", [])
+            for idx, item in enumerate(scenes_data):
                 validate_series_scene(task, item)
                 now = datetime.now(UTC)
+                blocking_text = ensure_scene_blocking(item, bound_cast)
+                t_mode = infer_transition_mode(item, idx)
                 scene = Scene(
                     character_ids=item.get("character_ids") or [],
                     scene_id=str(item["scene_id"]),
@@ -189,6 +291,8 @@ class StoryboardAgent:
                     voice_start=item.get("voice_start", 0),
                     sound_cues=item.get("sound_cues") or [],
                     transition_type=str(item.get("transition_type") or "cut"),
+                    transition_mode=t_mode,
+                    blocking=blocking_text,
                     start_state=item.get("start_state"),
                     end_state=item.get("end_state"),
                     reaction_focus=item.get("reaction_focus"),

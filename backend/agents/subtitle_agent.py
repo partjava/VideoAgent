@@ -71,7 +71,8 @@ class SubtitleAgent:
                     fields["audio_alignment_digest"] = digest
                     await mongodb.update_one(SCENES_COLLECTION, {"_id": scene["_id"]}, fields)
                     scene.update(fields)
-            srt_content = render_srt(task_scenes)
+            task_doc = await mongodb.find_one("video_tasks", {"_id": task_id}) or {}
+            srt_content = render_srt(task_scenes, wrap_width=24 if task_doc.get("ratio") == "16:9" else 15)
 
             # 3. 保存 SRT 文件
             backend_dir = Path(__file__).resolve().parents[1]

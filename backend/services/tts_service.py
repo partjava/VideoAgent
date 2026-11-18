@@ -13,8 +13,8 @@ VOICE_MAP = {
 }
 
 
-def resolve_voice_for_speaker(speaker: str | None) -> str:
-    """根据说话人名称自动推断最适合的 edge-tts 音色。"""
+def resolve_voice_for_speaker(speaker: str | None, context_hint: str | None = None) -> str:
+    """根据说话人名称与可选角色描述自动推断最适合的 edge-tts 音色。"""
     if not speaker:
         return VOICE_MAP["narrator"]
 
@@ -22,22 +22,25 @@ def resolve_voice_for_speaker(speaker: str | None) -> str:
     if any(k in s for k in ("旁白", "解说", "讲述", "主持人", "narrator", "voiceover")):
         return VOICE_MAP["narrator"]
 
-    if any(k in s for k in ("李白", "少年", "青年", "书生", "小哥", "徒弟", "男孩", "学生", "少爷", "同学")):
-        return VOICE_MAP["male_young"]
+    combined = f"{s} {(context_hint or '').strip().lower()}".strip()
 
-    if any(k in s for k in ("考官", "老师", "教授", "大人", "将军", "皇上", "陛下", "掌柜", "老者", "老人", "父亲", "大叔", "长老", "师傅", "官员")):
-        return VOICE_MAP["male_mature"]
-
-    if any(k in s for k in ("少女", "女孩", "妹妹", "小姐", "丫鬟", "闺秀", "姑娘", "学妹")):
+    if any(k in combined for k in ("少女", "女孩", "妹妹", "小姐", "丫鬟", "闺秀", "姑娘", "学妹", "千金", "女配", "女主", "旗袍", "female_young")):
         return VOICE_MAP["female_young"]
 
-    if any(k in s for k in ("母亲", "夫人", "妇女", "阿姨", "妈妈", "奶奶", "师娘", "大娘")):
+    if any(k in combined for k in ("母亲", "夫人", "妇女", "阿姨", "妈妈", "奶奶", "师娘", "大娘", "太太", "妻子", "female_warm")):
         return VOICE_MAP["female_warm"]
 
-    if any(k in s for k in ("男", "哥", "爷", "汉")):
+    if any(k in combined for k in ("李白", "少年", "青年", "书生", "小哥", "徒弟", "男孩", "学生", "少爷", "同学", "少帅", "男主")):
         return VOICE_MAP["male_young"]
-    if any(k in s for k in ("女", "姐", "妹", "娘")):
+
+    if any(k in combined for k in ("考官", "老师", "教授", "大人", "将军", "皇上", "陛下", "掌柜", "老者", "老人", "父亲", "大叔", "长老", "师傅", "官员", "副总", "董事长", "总裁", "局长", "警官", "管家")):
+        return VOICE_MAP["male_mature"]
+
+    if any(k in combined for k in ("女性", "女生", "女子", "女士", "长发", "female", "女", "姐", "妹", "娘", "她")):
         return VOICE_MAP["female_young"]
+
+    if any(k in combined for k in ("男性", "男生", "男子", "男士", "寸头", "胡渣", "西装", "军装", "male", "男", "哥", "爷", "汉", "他")):
+        return VOICE_MAP["male_young"]
 
     return VOICE_MAP["narrator"]
 
