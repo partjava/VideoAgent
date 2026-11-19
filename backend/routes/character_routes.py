@@ -111,7 +111,9 @@ async def preview_voice(character_id: str, payload: VoicePreviewRequest = VoiceP
 
 
 @router.delete("/{character_id}", response_model=ApiResponse)
-async def archive_character(character_id: str):
+async def archive_or_delete_character(character_id: str, permanent: bool = False):
+    if permanent:
+        return await respond(character_service.delete_permanent(character_id))
     return await respond(character_service.archive(character_id))
 
 

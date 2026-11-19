@@ -70,6 +70,16 @@ class SiliconFlowVideoService(BaseVideoService):
         job = self.storage_root / "assets" / task_id / "video_jobs" / f"sf-{scene_id}-{fp.hexdigest()}.json"
         return source, job
 
+    @staticmethod
+    def _read_confirmed_task_id(job: Path) -> str | None:
+        if not job.is_file():
+            return None
+        try:
+            raw_id = json.loads(job.read_text(encoding="utf-8")).get("task_id")
+            return str(raw_id).strip() if raw_id else None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
     def has_pending_render(
         self,
         task_id: str,
@@ -83,7 +93,7 @@ class SiliconFlowVideoService(BaseVideoService):
     ) -> bool:
         res_opt = str(resolution or getattr(settings, "siliconflow_video_resolution", "768p") or "768p")
         _, job = self._render_paths(task_id, scene_id, image_path, video_prompt, duration, ratio, res_opt, last_frame_path)
-        return job.is_file()
+        return bool(self._read_confirmed_task_id(job))
 
     def generate_video(
         self,
@@ -113,11 +123,11 @@ class SiliconFlowVideoService(BaseVideoService):
                 task_id, scene_id, image_path, video_prompt, api_duration, ratio, res_opt, last_frame_path
             )
             job.parent.mkdir(parents=True, exist_ok=True)
-            request_id = None
-            if job.is_file():
-                request_id = json.loads(job.read_text(encoding="utf-8")).get("task_id")
-                if not request_id:
-                    raise RuntimeError("Previous SiliconFlow video submission is unconfirmed. Check console before retrying.")
+            request_id = self._read_confirmed_task_id(job)
+            if job.is_file() and not request_id:
+                # Stale placeholder left by an interrupted process or network drop before requestId arrived;
+                # remove it so retry can submit cleanly instead of permanently locking the scene.
+                job.unlink(missing_ok=True)
 
             images_payload: list[dict[str, str]] = []
             if not request_id:
@@ -137,63 +147,86 @@ class SiliconFlowVideoService(BaseVideoService):
             status_url = f"{self.api_base}/video/status"
 
             with httpx.Client(timeout=60.0) as client:
-                if not request_id:
-                    payload = {
-                        "model": self.model,
-                        "prompt": video_prompt or "smooth cinematic movement, consistent character appearance",
-                        "duration": api_duration,
-                        "resolution": res_opt,
-                        "ratio": ratio,
-                        "images": images_payload,
-                    }
-                    with job.open("x", encoding="utf-8") as handle:
-                        json.dump({"task_id": None}, handle)
-                    res = client.post(submit_url, json=payload, headers=headers)
-                    if res.status_code == 429:
-                        time.sleep(3)
-                        res = client.post(submit_url, json=payload, headers=headers)
-                    if 400 <= res.status_code < 500:
-                        job.unlink(missing_ok=True)
-                        body_txt = res.text[:300]
-                        if any(k in body_txt.lower() for k in ("sensitive", "safety", "content", "policy", "审核")):
-                            raise VideoRenderRejected(f"SiliconFlow 内容审核拒绝: HTTP {res.status_code} {body_txt}")
-                        raise RuntimeError(f"SiliconFlow 提交参数被拒绝: HTTP {res.status_code} {body_txt}")
-                    res.raise_for_status()
-                    request_id = res.json().get("requestId")
+                transient_retried = False
+                while True:
                     if not request_id:
-                        job.unlink(missing_ok=True)
-                        raise RuntimeError(f"SiliconFlow 未返回 requestId: {res.text[:300]}")
-                    staged = job.with_suffix(".tmp")
-                    staged.write_text(json.dumps({"task_id": request_id}), encoding="utf-8")
-                    staged.replace(job)
-
-                video_url: str | None = None
-                for attempt in range(180):
-                    time.sleep(5)
-                    try:
-                        poll_res = client.post(status_url, json={"requestId": request_id}, headers=headers)
-                        if poll_res.status_code == 429:
+                        payload = {
+                            "model": self.model,
+                            "prompt": video_prompt or "smooth cinematic movement, consistent character appearance",
+                            "duration": api_duration,
+                            "resolution": res_opt,
+                            "ratio": ratio,
+                            "images": images_payload,
+                        }
+                        res = client.post(submit_url, json=payload, headers=headers)
+                        if res.status_code == 429:
                             time.sleep(3)
-                            continue
-                        poll_res.raise_for_status()
-                        poll_data = poll_res.json()
-                    except (httpx.TransportError, httpx.HTTPError) as net_err:
-                        print(f"[SiliconFlowVideoService] Polling warning (attempt {attempt + 1}): {net_err}", flush=True)
-                        continue
+                            res = client.post(submit_url, json=payload, headers=headers)
+                        if 400 <= res.status_code < 500:
+                            job.unlink(missing_ok=True)
+                            body_txt = res.text[:300]
+                            if any(k in body_txt.lower() for k in ("sensitive", "safety", "content", "policy", "审核")):
+                                raise VideoRenderRejected(f"SiliconFlow 内容审核拒绝: HTTP {res.status_code} {body_txt}")
+                            raise RuntimeError(f"SiliconFlow 提交参数被拒绝: HTTP {res.status_code} {body_txt}")
+                        res.raise_for_status()
+                        request_id = res.json().get("requestId")
+                        if not request_id:
+                            job.unlink(missing_ok=True)
+                            raise RuntimeError(f"SiliconFlow 未返回 requestId: {res.text[:300]}")
+                        staged = job.with_suffix(".tmp")
+                        staged.write_text(json.dumps({"task_id": request_id}), encoding="utf-8")
+                        staged.replace(job)
 
-                    status = str(poll_data.get("status") or "")
-                    if status == "Succeed":
-                        results = poll_data.get("results") or {}
-                        videos = results.get("videos") or []
-                        video_url = (
-                            videos[0].get("url")
-                            if videos and isinstance(videos[0], dict)
-                            else results.get("url")
-                        )
-                        break
-                    if status == "Failed":
-                        job.unlink(missing_ok=True)
-                        raise VideoRenderRejected(f"SiliconFlow 视频生成失败: {poll_data.get('reason') or 'unknown error'}")
+                    video_url: str | None = None
+                    retry_submit = False
+                    for attempt in range(180):
+                        time.sleep(5)
+                        try:
+                            poll_res = client.post(status_url, json={"requestId": request_id}, headers=headers)
+                            if poll_res.status_code == 429:
+                                time.sleep(3)
+                                continue
+                            poll_res.raise_for_status()
+                            poll_data = poll_res.json()
+                        except (httpx.TransportError, httpx.HTTPError) as net_err:
+                            print(f"[SiliconFlowVideoService] Polling warning (attempt {attempt + 1}): {net_err}", flush=True)
+                            continue
+
+                        status = str(poll_data.get("status") or "")
+                        if status == "Succeed":
+                            results = poll_data.get("results") or {}
+                            videos = results.get("videos") or []
+                            video_url = (
+                                videos[0].get("url")
+                                if videos and isinstance(videos[0], dict)
+                                else results.get("url")
+                            )
+                            break
+                        if status == "Failed":
+                            job.unlink(missing_ok=True)
+                            reason = str(poll_data.get("reason") or "unknown error")
+                            lower_reason = reason.lower()
+                            is_transient = any(
+                                k in lower_reason
+                                for k in ("unknown error", "request failed", "internal", "timeout", "busy", "server error")
+                            ) and not any(
+                                k in lower_reason for k in ("sensitive", "safety", "policy", "审核")
+                            )
+                            if is_transient and not transient_retried and images_payload:
+                                transient_retried = True
+                                request_id = None
+                                retry_submit = True
+                                print(
+                                    f"[SiliconFlowVideoService] Transient failure for {scene_id} ({reason}), retrying submission once...",
+                                    flush=True,
+                                )
+                                time.sleep(3)
+                                break
+                            raise VideoRenderRejected(f"SiliconFlow 视频生成失败: {reason}")
+
+                    if retry_submit:
+                        continue
+                    break
 
                 if not video_url:
                     raise TimeoutError("Polling SiliconFlow video task timed out.")

@@ -3,10 +3,11 @@
     <div class="page" v-loading="loading">
       <!-- ==================== 一级页面：多人物紧凑卡片列表 ==================== -->
       <template v-if="!selectedCharacter">
-        <div class="heading">
+        <div class="heading va-workspace-header">
           <div>
+            <span class="va-eyebrow">CHARACTER LIBRARY · 角色资产库</span>
             <h1>角色资产库</h1>
-            <p>集中管理所有剧集人物。点击任意人物「查看详情」可进入三视图定妆照、配音试听与 3D 空间检视台。</p>
+            <p>集中管理所有剧集人物。点击任意人物卡片或「详细信息 →」可进入三视图定妆照、配音试听与 3D 空间检视台。</p>
           </div>
           <div class="toolbar">
             <el-input
@@ -61,7 +62,7 @@
               <img
                 v-if="storedReference(character, 'front')"
                 class="front-cover-img"
-                :src="assetUrl(storedReference(character, 'front'))"
+                :src="assetUrl(storedReference(character, 'front'), character.updated_at || character.revision)"
                 :alt="`${character.name} · 正面定妆照`"
               />
               <div v-else class="front-cover-placeholder">
@@ -103,6 +104,28 @@
                 >
                   详细信息 →
                 </el-button>
+                <el-button
+                  v-if="!character.confirmed"
+                  size="small"
+                  type="danger"
+                  link
+                  class="danger-quick-btn"
+                  :disabled="busy"
+                  @click.stop="removePermanent(character)"
+                >
+                  删除
+                </el-button>
+                <el-button
+                  v-else
+                  size="small"
+                  type="danger"
+                  link
+                  class="danger-quick-btn"
+                  :disabled="busy"
+                  @click.stop="archive(character)"
+                >
+                  归档
+                </el-button>
               </template>
               <template v-else>
                 <el-button
@@ -119,6 +142,16 @@
                   @click.stop="openDetail(character)"
                 >
                   详细信息
+                </el-button>
+                <el-button
+                  size="small"
+                  type="danger"
+                  link
+                  class="danger-quick-btn"
+                  :disabled="busy"
+                  @click.stop="removePermanent(character)"
+                >
+                  永久删除
                 </el-button>
               </template>
             </div>
@@ -212,7 +245,7 @@
               <img
                 v-if="storedReference(selectedCharacter, view.key)"
                 class="portrait detail-portrait"
-                :src="assetUrl(storedReference(selectedCharacter, view.key))"
+                :src="assetUrl(storedReference(selectedCharacter, view.key), selectedCharacter.updated_at || selectedCharacter.revision)"
                 :alt="`${selectedCharacter.name} · ${view.label}`"
               />
               <div v-else class="portrait detail-portrait placeholder">未上传</div>
@@ -257,7 +290,7 @@
             <img
               v-if="storedReference(selectedCharacter, 'sheet')"
               class="sheet-4grid-img"
-              :src="assetUrl(storedReference(selectedCharacter, 'sheet'))"
+              :src="assetUrl(storedReference(selectedCharacter, 'sheet'), selectedCharacter.updated_at || selectedCharacter.revision)"
               :alt="`${selectedCharacter.name} · 16:9 四格角色设定板`"
             />
           </div>
@@ -309,8 +342,11 @@
               >
                 确认角色
               </el-button>
-              <el-button type="danger" link @click="archive(selectedCharacter)">
+              <el-button type="danger" link :disabled="busy" @click="archive(selectedCharacter)">
                 归档
+              </el-button>
+              <el-button type="danger" link :disabled="busy" @click="removePermanent(selectedCharacter)">
+                永久删除
               </el-button>
             </template>
             <template v-else>
@@ -321,6 +357,9 @@
                 @click="restore(selectedCharacter)"
               >
                 恢复角色
+              </el-button>
+              <el-button type="danger" link :disabled="busy" @click="removePermanent(selectedCharacter)">
+                永久删除
               </el-button>
             </template>
           </div>
@@ -410,7 +449,7 @@
             <img
               v-if="pendingReferences[view.key] || storedReference(editing, view.key)"
               class="upload-preview"
-              :src="pendingReferences[view.key] || assetUrl(storedReference(editing, view.key))"
+              :src="pendingReferences[view.key] || assetUrl(storedReference(editing, view.key), editing?.updated_at || editing?.revision)"
               :alt="`${view.label}参考图预览`"
             />
           </el-form-item>
@@ -669,12 +708,16 @@ function switchAdjacentCharacter(delta) {
   }
 }
 
-const assetUrl = (value) =>
-  !value
-    ? ""
-    : value.startsWith("http") || value.startsWith("data:")
+const assetUrl = (value, version = "") => {
+  if (!value) return "";
+  const base =
+    value.startsWith("http") || value.startsWith("data:")
       ? value
       : `/${value.replace(/^\/+/, "").replace(/^backend\//, "")}`;
+  if (base.startsWith("data:")) return base;
+  const ver = version === 0 || version ? String(version).trim() : "";
+  return ver ? `${base}${base.includes("?") ? "&" : "?"}v=${encodeURIComponent(ver)}` : base;
+};
 
 async function load() {
   loading.value = true;
@@ -899,6 +942,26 @@ async function archive(character) {
   }
 }
 
+async function removePermanent(character) {
+  try {
+    await ElMessageBox.confirm(
+      `永久删除“${character.name}”及其所有本地定妆照文件？此操作不可恢复。`,
+      "删除角色",
+      { type: "warning", confirmButtonText: "确认删除", cancelButtonText: "取消" },
+    );
+    const cid = id(character);
+    await act(async () => {
+      await charactersApi.removePermanent(cid);
+      ElMessage.success(`已删除角色「${character.name}」`);
+    });
+    if (selectedCharacterId.value === cid) {
+      selectedCharacterId.value = "";
+    }
+  } catch (e) {
+    if (e instanceof Error) error.value = e.message;
+  }
+}
+
 async function restore(character) {
   await act(async () => {
     await charactersApi.restore(id(character));
@@ -950,17 +1013,19 @@ p {
 /* ==================== 一级页面：紧凑人物卡片网格 ==================== */
 .compact-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(255px, 1fr));
-  gap: 20px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 265px), 1fr));
+  gap: 18px;
   margin-top: 16px;
 }
 .compact-card {
-  border-radius: 14px;
-  border: 1px solid #e2e8f0;
-  transition: transform 0.18s ease, box-shadow 0.18s ease;
+  border-radius: var(--va-radius-lg);
+  border: 1px solid var(--va-border);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
 }
 .compact-card:hover {
-  transform: translateY(-3px);
+  transform: translateY(-2px);
+  border-color: var(--va-brand-border);
+  box-shadow: var(--va-shadow-md);
 }
 .compact-card-top {
   display: flex;
@@ -969,21 +1034,21 @@ p {
   margin-bottom: 10px;
 }
 .person-index {
-  font-size: 12px;
+  font-size: 0.72rem;
   font-weight: 700;
-  color: #2563eb;
-  background: #eff6ff;
-  padding: 2px 10px;
+  color: var(--va-brand-hover);
+  background: var(--va-brand-soft);
+  padding: 3px 10px;
   border-radius: 999px;
 }
 .front-cover-box {
   position: relative;
   width: 100%;
-  height: 220px;
-  border-radius: 10px;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--va-radius-md);
   overflow: hidden;
-  background: #f1f5f9;
-  border: 1px solid #e2e8f0;
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+  border: 1px solid var(--va-border);
   cursor: pointer;
 }
 .front-cover-img {
@@ -1000,8 +1065,8 @@ p {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  color: #94a3b8;
-  font-size: 13px;
+  color: var(--va-ink-muted);
+  font-size: 0.8125rem;
 }
 .empty-avatar-icon {
   font-size: 36px;
@@ -1065,6 +1130,10 @@ p {
 .compact-actions .el-button {
   flex: 1;
   margin: 0;
+}
+.compact-actions .danger-quick-btn {
+  flex: 0 0 auto;
+  padding: 0 4px;
 }
 
 /* ==================== 二级页面：人物详情视图 ==================== */
@@ -1133,17 +1202,21 @@ p {
 }
 .reference-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+  gap: 14px;
 }
 .reference-grid figure {
   margin: 0;
   text-align: center;
+  padding: 10px;
+  background: var(--va-surface-subtle);
+  border: 1px solid var(--va-border);
+  border-radius: var(--va-radius-md);
 }
 .view-caption {
-  margin-top: 6px;
-  color: #64748b;
-  font-size: 13px;
+  margin-top: 8px;
+  color: var(--va-ink-muted);
+  font-size: 0.8125rem;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1151,11 +1224,12 @@ p {
   flex-wrap: wrap;
 }
 .portrait {
+  display: block;
   width: 100%;
-  height: 136px;
+  aspect-ratio: 3 / 4;
   object-fit: contain;
-  background: #f1f5f9;
-  border-radius: 8px;
+  background: #eef2f6;
+  border-radius: var(--va-radius-sm);
 }
 .placeholder {
   display: grid;

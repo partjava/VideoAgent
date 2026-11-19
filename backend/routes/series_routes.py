@@ -9,7 +9,15 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 import imageio_ffmpeg
 from models.response_model import ApiResponse
-from models.series_model import CreateSeriesRequest, OutlineRequest, ConfirmSnapshotRequest, PublishNotesRequest, CoverRequest, ContinuityLedgersRequest
+from models.series_model import (
+    BindEpisodeTaskRequest,
+    ConfirmSnapshotRequest,
+    ContinuityLedgersRequest,
+    CoverRequest,
+    CreateSeriesRequest,
+    OutlineRequest,
+    PublishNotesRequest,
+)
 from services.series_service import series_service, BACKEND
 from services.publish_materials import write_notes, write_cover
 from services.snapshot_diff import compare_states
@@ -66,6 +74,11 @@ async def update_continuity_ledgers(series_id: str, payload: ContinuityLedgersRe
 @router.post('/{series_id}/confirm')
 async def confirm_outline(series_id: str):
     return await respond(series_service.confirm_outline(series_id))
+
+
+@router.post('/{series_id}/episodes/{episode_num}/bind-task')
+async def bind_episode_task(series_id: str, episode_num: int, payload: BindEpisodeTaskRequest):
+    return await respond(series_service.bind_episode_task(series_id, episode_num, payload.task_id))
 
 
 @router.post('/{series_id}/run')

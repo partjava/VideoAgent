@@ -1,12 +1,19 @@
 <template>
   <section class="model-grid" aria-label="Model configuration">
-    <article v-for="item in stages" :key="item.id" class="model-card">
-      <h3>{{ item.title }}</h3>
-      <p>{{ item.protocol }}</p>
-      <template v-if="profiles[item.id]">
-        <el-tag size="small" :type="profiles[item.id].active ? 'success' : 'info'">
+    <article
+      v-for="item in stages"
+      :key="item.id"
+      class="model-card"
+      :class="{ active: profiles[item.id]?.active }"
+    >
+      <div class="model-card-head">
+        <h3>{{ item.title }}</h3>
+        <el-tag v-if="profiles[item.id]" size="small" :type="profiles[item.id].active ? 'success' : 'info'" effect="light">
           {{ profiles[item.id].active ? '已启用' : '保存后启用' }}
         </el-tag>
+      </div>
+      <p>{{ item.protocol }}</p>
+      <template v-if="profiles[item.id]">
         <el-form label-position="top" @submit.prevent>
           <el-form-item label="API URL">
             <el-input
@@ -104,7 +111,7 @@ import { settingsApi } from '../api/settings'
 
 const stages = [
   { id: 'prompt', title: '提示词模型', protocol: '支持 OpenAI / DeepSeek / 硅基流动 / 通义千问兼容地址（自动适配 /v1/models）。' },
-  { id: 'image', title: '图片生成模型', protocol: '支持硅基流动（推荐 Qwen/Qwen-Image-Edit-2509 或 FLUX.1-Kontext-dev 支持参考图锁脸；Kolors / FLUX.1-dev 仅文生图）及 DashScope 原生接口。' },
+  { id: 'image', title: '图片生成模型', protocol: '支持硅基流动（推荐 Qwen/Qwen-Image-Edit-2509 + Qwen/Qwen-Image 自动配对：定妆三视图/尾帧参考编辑 + 满画幅实景首帧，亦支持 FLUX.1-Kontext-dev）及 DashScope 原生接口。' },
   { id: 'video', title: '视频生成模型', protocol: '支持硅基流动（MiniMax-H3 等）及 DashScope Wan 异步接口，自动按协议调用。' },
 ]
 const profiles = reactive({})
@@ -257,20 +264,53 @@ async function submit(id, action) {
 </script>
 
 <style scoped>
-.model-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr)); gap:16px; }
-.model-card { padding:20px; border:1px solid #dbe3ef; border-radius:14px; background:white; min-width:0; }
-.model-card h3 { margin:0 0 8px; }
-.model-card p { color:#475569; margin:0 0 12px; font-size:13px; min-height:38px; }
-.model-card form { margin-top:12px; }
-.key-status { color:#475569; font-size:12px; display:block; margin-top:4px; line-height:1.4; }
-.key-status-warn { color:#d97706; font-weight:500; }
-.option-hint { color:#64748b; font-size:12px; margin-left:4px; }
-.model-actions { display:flex; flex-wrap:wrap; gap:8px; }
-.model-actions .el-button { margin:0; }
-.model-feedback { margin-top:12px; }
-.candidate-chips { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:10px; }
-.candidate-chips small { color:#475569; font-size:12px; width:100%; }
-.candidate-chip { border:1px solid #cbd5e1; background:#f8fafc; color:#334155; font-size:12px; padding:3px 9px; border-radius:999px; cursor:pointer; }
-.candidate-chip.primary { border-color:#93c5fd; background:#eff6ff; color:#1d4ed8; }
-.candidate-chip.active { background:#2563eb; border-color:#2563eb; color:#ffffff; font-weight:600; }
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 18px;
+}
+.model-card {
+  padding: 20px;
+  border: 1px solid var(--va-border);
+  border-top: 3px solid var(--va-border-strong);
+  border-radius: var(--va-radius-lg);
+  background: var(--va-surface);
+  box-shadow: var(--va-shadow-sm);
+  min-width: 0;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.model-card.active {
+  border-top-color: var(--va-brand);
+}
+.model-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.model-card h3 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+.model-card p {
+  color: var(--va-ink-muted);
+  margin: 0 0 14px;
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  min-block-size: 3.1em;
+}
+.model-card form { margin-top: 8px; }
+.key-status { color: var(--va-ink-muted); font-size: 0.75rem; display: block; margin-top: 4px; line-height: 1.4; }
+.key-status-warn { color: #d97706; font-weight: 600; }
+.option-hint { color: var(--va-ink-muted); font-size: 0.75rem; margin-left: 4px; }
+.model-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.model-actions .el-button { margin: 0; }
+.model-feedback { margin-top: 12px; }
+.candidate-chips { display: flex; flex-wrap: wrap; flex-wrap: balance; align-items: center; gap: 6px; margin-top: 12px; }
+.candidate-chips small { color: var(--va-ink-muted); font-size: 0.75rem; width: 100%; }
+.candidate-chip { border: 1px solid var(--va-border-strong); background: var(--va-surface-subtle); color: var(--va-ink-secondary); font-size: 0.75rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; cursor: pointer; }
+.candidate-chip.primary { border-color: var(--va-brand-border); background: var(--va-brand-soft); color: var(--va-brand-hover); }
+.candidate-chip.active { background: var(--va-brand); border-color: var(--va-brand); color: #ffffff; }
 </style>

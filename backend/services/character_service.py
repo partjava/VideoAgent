@@ -7,6 +7,7 @@ from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
 import re
+import shutil
 from uuid import uuid4
 
 from PIL import Image
@@ -70,6 +71,25 @@ def validate_image(data: bytes) -> Image.Image:
             return image.convert("RGB")
     except (OSError, Image.DecompressionBombError) as exc:
         raise ValueError("Invalid reference image") from exc
+
+
+def crop_headshot_from_turnaround(raw_bytes: bytes) -> bytes:
+    """Crop the left portrait panel from a 16:9 4-view turnaround sheet as PNG bytes."""
+    validate_image(raw_bytes)
+    with Image.open(BytesIO(raw_bytes)) as img:
+        rgb = img.convert("RGB")
+        w, h = rgb.size
+        crop_w = int(w * 0.43)
+        crop_h = int(h * 0.84)
+        if w > h * 1.25 and crop_w >= 64 and crop_h >= 64:
+            panel = rgb.crop((0, 0, crop_w, crop_h))
+        else:
+            panel = rgb
+        out = BytesIO()
+        panel.save(out, format="PNG")
+    result = out.getvalue()
+    validate_image(result)
+    return result
 
 
 def local_asset(path: str) -> Path:
@@ -195,6 +215,29 @@ class CharacterService:
             await self._document(character_id)
             await mongodb.update_one("characters", {"_id": character_id}, {"archived": True})
         return {"character_id": character_id, "archived": True}
+
+    async def delete_permanent(self, character_id: str) -> dict:
+        if not re.fullmatch(r"char_[a-f0-9]{12}", character_id):
+            raise ValueError("Invalid character ID")
+        async with self._lock(character_id):
+            doc = await mongodb.find_one("characters", {"_id": character_id})
+            if not doc:
+                raise LookupError("Character not found")
+            latest = (doc.get("versions") or [{}])[-1]
+            if not doc.get("archived") and latest.get("confirmed"):
+                bound_series = await mongodb.find_one(
+                    "series_projects",
+                    {"archived": {"$ne": True}, "character_ids": character_id},
+                )
+                bound_task = await mongodb.find_one(
+                    "video_tasks",
+                    {"metadata.character_ids": character_id},
+                )
+                if bound_series or bound_task:
+                    raise ValueError("该已确认角色已被连载或视频任务绑定，请使用「归档」隐藏，避免破坏历史项目引用")
+            await mongodb.delete_one("characters", {"_id": character_id})
+            shutil.rmtree(BACKEND_DIR / "assets" / "characters" / character_id, ignore_errors=True)
+        return {"character_id": character_id, "deleted": True}
 
     async def restore(self, character_id):
         if not re.fullmatch(r"char_[a-f0-9]{12}", character_id):
@@ -482,6 +525,95 @@ class CharacterService:
                 validate_image(local_asset(path).read_bytes())
             profiles.append(deepcopy(profile))
         return profiles
+
+    async def sync_cast_cards_to_library(
+        self,
+        cards: list[dict],
+        *,
+        style: str = "短剧",
+        overwrite_existing: bool = False,
+    ) -> list[dict]:
+        from services.image.siliconflow_image_service import is_black_or_collapsed_image
+        from services.media_quality import resolve_media
+
+        if not cards:
+            return []
+        active_chars = await self.list(include_archived=False)
+        by_name: dict[str, dict] = {}
+        for ch in active_chars:
+            key = str(ch.get("name") or "").strip().lower()
+            if not key:
+                continue
+            prev = by_name.get(key)
+            prev_has_front = bool(prev and ((prev.get("reference_images") or {}).get("front") or prev.get("reference_path")))
+            cur_has_front = bool((ch.get("reference_images") or {}).get("front") or ch.get("reference_path"))
+            if prev is None or (not prev_has_front and cur_has_front):
+                by_name[key] = ch
+
+        summary: list[dict] = []
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            name = str(card.get("name") or "").strip()
+            path_str = str(card.get("path") or "").strip()
+            if not name or not path_str:
+                continue
+            img_path = resolve_media(path_str)
+            if not img_path.is_file():
+                continue
+            raw_bytes = img_path.read_bytes()
+            if is_black_or_collapsed_image(raw_bytes):
+                continue
+
+            sheet_b64 = base64.b64encode(raw_bytes).decode()
+            front_bytes = crop_headshot_from_turnaround(raw_bytes)
+            front_b64 = base64.b64encode(front_bytes).decode()
+
+            key = name.lower()
+            existing = by_name.get(key)
+            if existing:
+                cid = str(existing["character_id"])
+                has_front = bool((existing.get("reference_images") or {}).get("front") or existing.get("reference_path"))
+                if has_front and not overwrite_existing:
+                    card["saved_character_id"] = cid
+                    summary.append({"card_id": card.get("card_id"), "name": name, "character_id": cid, "action": "linked_existing"})
+                    continue
+                await self.reference(cid, front_b64, "front")
+                updated = await self.reference(cid, sheet_b64, "sheet")
+                by_name[key] = updated
+                action = "updated_existing" if has_front else "populated_existing"
+            else:
+                appearance = str(card.get("appearance") or "").strip()
+                gender_raw = str(card.get("gender") or "").lower()
+                is_female = gender_raw == "female" or any(tok in appearance for tok in ("女性", "女孩", "女主", "女，", "女,"))
+                tts_voice = "zh-CN-XiaoxiaoNeural" if is_female else "zh-CN-YunxiNeural"
+                face_dna = appearance
+                clothing = "剧集设定造型"
+                if "默认服装：" in appearance:
+                    head, tail = appearance.split("默认服装：", 1)
+                    face_dna = head.strip("；; ")
+                    clothing = tail.strip() or clothing
+                elif "；" in appearance or ";" in appearance:
+                    sep = "；" if "；" in appearance else ";"
+                    parts = [p.strip() for p in appearance.split(sep, 1)]
+                    if len(parts) == 2 and parts[0] and parts[1]:
+                        face_dna, clothing = parts[0], parts[1]
+                payload = CharacterFields(
+                    name=name[:100],
+                    face_dna=face_dna[:4000],
+                    signature_clothing=clothing[:2000],
+                    tts_voice=tts_voice,
+                )
+                created = await self.create(payload)
+                cid = str(created["character_id"])
+                await self.reference(cid, front_b64, "front")
+                saved = await self.reference(cid, sheet_b64, "sheet")
+                by_name[key] = saved
+                action = "created"
+
+            card["saved_character_id"] = cid
+            summary.append({"card_id": card.get("card_id"), "name": name, "character_id": cid, "action": action})
+        return summary
 
 
 character_service = CharacterService()

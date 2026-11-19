@@ -5,7 +5,7 @@
         <h2>生成操作额度</h2>
         <p>新生成的图片和视频计入额度，复用已有素材不占额度。</p>
       </div>
-      <el-button :disabled="loading || saving" @click="load">刷新记录</el-button>
+      <el-button :disabled="loading || saving" @click="load()">刷新记录</el-button>
     </div>
 
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
@@ -35,6 +35,8 @@
             inputmode="numeric"
             placeholder="留空表示不限"
             :disabled="saving"
+            @focus="editingLimit = true"
+            @blur="editingLimit = false"
           />
         </el-form-item>
         <el-button native-type="submit" type="primary" :loading="saving" :disabled="loading">保存额度</el-button>
@@ -67,20 +69,24 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
 import { usageApi } from '../api/usage'
 
 const props = defineProps({
   scopeType: { type: String, required: true },
   scopeId: { type: String, required: true },
+  refreshKey: { type: [String, Number], default: '' },
+  active: { type: Boolean, default: false },
 })
 
 const summary = ref(null)
 const limitText = ref('')
 const loading = ref(false)
 const saving = ref(false)
+const editingLimit = ref(false)
 const error = ref('')
 let request = 0
+let pollTimer = null
 
 const kindLabels = { image: '图片生成', video: '视频生成' }
 const statusLabels = {
@@ -96,23 +102,28 @@ function formatDate(value) {
   return value ? new Date(value).toLocaleString('zh-CN') : '—'
 }
 
-function applySummary(data) {
+function applySummary(data, preserveInput = false) {
   summary.value = data
-  limitText.value = data.limit == null ? '' : String(data.limit)
+  if (!preserveInput || !editingLimit.value) {
+    limitText.value = data.limit == null ? '' : String(data.limit)
+  }
 }
 
-async function load() {
+async function load(options = {}) {
+  const silent = options && options.silent === true
   if (!props.scopeId) return
   const id = ++request
-  loading.value = true
-  error.value = ''
+  if (!silent) {
+    loading.value = true
+    error.value = ''
+  }
   try {
     const data = await usageApi.get(props.scopeType, props.scopeId)
-    if (id === request) applySummary(data)
+    if (id === request) applySummary(data, silent)
   } catch (exception) {
-    if (id === request) error.value = exception.message
+    if (id === request && !silent) error.value = exception.message
   } finally {
-    if (id === request) loading.value = false
+    if (id === request && !silent) loading.value = false
   }
 }
 
@@ -136,11 +147,39 @@ async function saveLimit() {
   }
 }
 
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
 watch(() => [props.scopeType, props.scopeId], () => {
   summary.value = null
   saving.value = false
   load()
 }, { immediate: true })
+
+watch(() => props.refreshKey, (val, oldVal) => {
+  if (val !== oldVal && props.scopeId) {
+    load({ silent: true })
+  }
+})
+
+watch(() => props.active, (isActive, wasActive) => {
+  stopPolling()
+  if (isActive && props.scopeId) {
+    pollTimer = setInterval(() => {
+      load({ silent: true })
+    }, 3000)
+  } else if (wasActive && props.scopeId) {
+    load({ silent: true })
+  }
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  stopPolling()
+})
 </script>
 
 <style scoped>

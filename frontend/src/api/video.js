@@ -77,6 +77,12 @@ export const videoApi = {
   rerunCastCard(taskId, cardId, payload = {}) {
     return client.post(`/${taskId}/cast-card/${cardId}/rerun`, payload, { timeout: 180000 })
   },
+  saveCastCardsToLibrary(taskId, payload = {}) {
+    return client.post(`/${taskId}/cast-cards/save-to-library`, payload, { timeout: 120000 })
+  },
+  rerunFromStoryboard(taskId) {
+    return client.post(`/${taskId}/rerun-from-storyboard`)
+  },
   applyAudioTiming(taskId, sceneId, payload) {
     return client.post(`/${taskId}/scene/${sceneId}/audio-timing`, payload, { timeout: 300000 })
   },

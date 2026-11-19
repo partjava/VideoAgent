@@ -226,13 +226,14 @@ const handleDownloadSubtitle = () => {
 
 .download-btn {
   flex: 1;
-  height: 40px;
-  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  min-block-size: 40px;
+  background: linear-gradient(135deg, var(--va-brand) 0%, var(--va-brand-hover) 100%);
   border: none;
+  font-weight: 700;
 }
 
 .download-btn:hover {
-  background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
+  background: linear-gradient(135deg, var(--va-brand-hover) 0%, #1e40af 100%);
 }
 
 .subtitle-btn {

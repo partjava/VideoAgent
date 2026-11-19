@@ -225,9 +225,10 @@ class StoryboardAgent:
                 for scene in deduped:
                     scene.pop("_id", None)
                 try:
+                    _flex_mode = task.get("generation_mode") in {AUTO_DIRECTOR_MODE, STORYBOARD_FLOW_MODE} and not task.get("duration_locked")
                     validate_storyboard_scenes(
                         deduped,
-                        target_duration=task.get("duration") if isinstance(task.get("duration"), int) else None,
+                        target_duration=None if _flex_mode else (task.get("duration") if isinstance(task.get("duration"), int) else None),
                         enforce_voiceover_density=False,
                         whole=task.get("generation_mode") == "wan3_whole",
                         allow_silent=_is_flow,

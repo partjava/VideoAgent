@@ -96,7 +96,12 @@ class WanVideoService(BaseVideoService):
     def has_pending_render(self, task_id, scene_id, image_path, video_prompt=None,
                            duration=5, ratio="9:16", negative_prompt=None, last_frame_path=None):
         _, job = self._render_paths(task_id, scene_id, image_path, video_prompt, duration, ratio, negative_prompt, last_frame_path)
-        return job.is_file()
+        if not job.is_file():
+            return False
+        try:
+            return bool(json.loads(job.read_text(encoding="utf-8")).get("task_id"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
 
     def _upload_file(self, file_path: str) -> str:
         upload_url = f"{self.api_base}/api/v1/files"
@@ -219,9 +224,12 @@ class WanVideoService(BaseVideoService):
             job.parent.mkdir(parents=True, exist_ok=True)
             api_task_id = None
             if job.is_file():
-                api_task_id = json.loads(job.read_text(encoding="utf-8")).get("task_id")
+                try:
+                    api_task_id = json.loads(job.read_text(encoding="utf-8")).get("task_id")
+                except (OSError, ValueError, TypeError, AttributeError):
+                    api_task_id = None
                 if not api_task_id:
-                    raise RuntimeError("Previous Wan submission is unconfirmed. Check the provider console before retrying.")
+                    job.unlink(missing_ok=True)
             # Both API versions use the first frame to determine the aspect ratio.
             from tempfile import TemporaryDirectory
             from services.media_quality import write_aspect_frame
@@ -288,9 +296,6 @@ class WanVideoService(BaseVideoService):
 
             with httpx.Client(timeout=60.0) as client:
                 if not api_task_id:
-                    # Claim this exact render before POST. An ambiguous network failure must not cause a second POST.
-                    with job.open("x", encoding="utf-8") as handle:
-                        json.dump({"task_id": None}, handle)
                     res = client.post(submit_url, json=payload, headers=headers)
                     if 400 <= res.status_code < 500:
                         job.unlink(missing_ok=True)

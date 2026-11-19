@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
-from pathlib import Path
 from hashlib import sha256
+from pathlib import Path
+import shutil
 from uuid import uuid4
 import anyio
 from fastapi import APIRouter, BackgroundTasks
@@ -385,10 +386,11 @@ async def rerun_cast_card(task_id: str, card_id: str, payload: CastCardRerunRequ
         if not isinstance(res, dict) or res.get("status") != "success" or not res.get("asset_path"):
             raise ValueError("Cast card generation did not return an asset")
         new_path = str(res["asset_path"])
+        now = datetime.now(UTC)
         card["path"] = new_path
         card["prompt"] = card_prompt
+        card["updated_at"] = now.isoformat()
         cards[target_idx] = card
-        now = datetime.now(UTC)
         asset = Asset(
             asset_id=f"asset_{task_id}_{card_id}",
             task_id=task_id,
@@ -407,6 +409,126 @@ async def rerun_cast_card(task_id: str, card_id: str, payload: CastCardRerunRequ
         return error_response(str(exc), 409)
     except Exception as exc:
         return error_response(f"Cast card rerun failed: {exc}", 500)
+
+
+class SaveCastCardsRequest(BaseModel):
+    card_id: str | None = Field(default=None, max_length=64)
+    overwrite_existing: bool = False
+
+
+@router.post("/{task_id}/cast-cards/save-to-library", response_model=ApiResponse)
+async def save_cast_cards_to_library(
+    task_id: str,
+    payload: SaveCastCardsRequest = SaveCastCardsRequest(),
+) -> ApiResponse | JSONResponse:
+    """将剧组自由流生成的 4 视图人物设定卡一键保存（或同步）到角色资产库。"""
+    from services.character_service import character_service
+
+    try:
+        task = await task_service.get_task(task_id)
+        if not task:
+            return error_response("Task not found", 404)
+        meta = dict(task.get("metadata") or {})
+        cards = [dict(c) for c in (meta.get("implicit_cast_cards") or []) if isinstance(c, dict)]
+        if not cards:
+            return error_response("当前任务暂无自动生成的角色设定卡", 400)
+        targets = (
+            [c for c in cards if c.get("card_id") == payload.card_id]
+            if payload.card_id
+            else cards
+        )
+        if not targets:
+            return error_response("Cast card not found", 404)
+        saved = await character_service.sync_cast_cards_to_library(
+            targets,
+            style=str(task.get("style") or "短剧"),
+            overwrite_existing=bool(payload.overwrite_existing),
+        )
+        by_cid = {c.get("card_id"): c for c in targets}
+        updated_cards = [by_cid.get(c.get("card_id"), c) for c in cards]
+        await task_service.update_task_fields(
+            task_id,
+            {"metadata.implicit_cast_cards": updated_cards},
+        )
+        return ApiResponse(
+            status="success",
+            data={"saved": saved, "implicit_cast_cards": updated_cards},
+        )
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+    except Exception as exc:
+        return error_response(f"保存角色设定卡失败: {exc}", 500)
+
+
+@router.post("/{task_id}/rerun-from-storyboard", response_model=ApiResponse)
+async def rerun_from_storyboard(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+) -> ApiResponse | JSONResponse:
+    """保留当前创意方案与精修后剧本，清理旧分镜/素材后从分镜设计（Step 03）重新推进全流程。"""
+    try:
+        task = await task_service.get_task(task_id)
+        if not task:
+            return error_response("Task not found", 404)
+        if (task.get("metadata") or {}).get("series_context") or task.get("series_id"):
+            return error_response("连载单集请在连载工作台重新生成本集，以维护跨集状态", 409)
+        if task_id in _running_pipelines:
+            return error_response("任务正在后台生成中，请勿重复启动", 409)
+
+        now = datetime.now(UTC)
+        await mongodb.delete_one("voices", {"task_id": task_id})
+        await mongodb.delete_one("voices", {"_id": f"voice_{task_id}"})
+        for col in ("assets", "scenes"):
+            docs = await mongodb.find_many(col, {"task_id": task_id}, limit=500)
+            for doc in docs:
+                if doc.get("_id") is not None:
+                    await mongodb.delete_one(col, {"_id": doc["_id"]})
+        await mongodb.delete_one("render_outputs", {"task_id": task_id})
+
+        backend_dir = Path(__file__).resolve().parents[1]
+        shutil.rmtree(backend_dir / "assets" / task_id, ignore_errors=True)
+        shutil.rmtree(backend_dir / "outputs" / task_id, ignore_errors=True)
+
+        modified_script = await mongodb.update_one(
+            "scripts",
+            {"task_id": task_id},
+            {"segments": [], "updated_at": now},
+        )
+        if not modified_script:
+            await mongodb.update_one(
+                "scripts",
+                {"_id": f"script_{task_id}"},
+                {"segments": [], "updated_at": now},
+            )
+
+        await task_service.update_task_fields(
+            task_id,
+            {
+                "status": VideoTaskStatus.STORYBOARDING.value,
+                "progress": 28,
+                "current_agent": None,
+                "video_path": None,
+                "subtitle_path": None,
+                "metadata.stage_states": {
+                    "TaskPlannerAgent": "success",
+                    "ScriptAgent": "success",
+                },
+                "metadata.last_error": None,
+                "metadata.implicit_cast_cards": [],
+                "metadata.quality_report": None,
+                "metadata.video_path": None,
+                "metadata.subtitle_path": None,
+                "metadata.cover_path": None,
+                "metadata.heal_attempts_used": 0,
+            },
+        )
+        _running_pipelines.add(task_id)
+        background_tasks.add_task(run_pipeline_wrapper, task_id)
+        return ApiResponse(status="success", data={"message": "已按最新剧本重新拆镜并继续生成"})
+    except PyMongoError:
+        return error_response("MongoDB unavailable", 503)
+    except Exception as exc:
+        return error_response(f"从分镜重跑失败: {exc}", 500)
 
 
 @router.post("/{task_id}/scene/{scene_id}/rerun", response_model=ApiResponse)
@@ -538,25 +660,22 @@ async def rerun_scene_asset(
 
         # 3. 重新生成图片底图
         if payload.rerun_type in ("image", "all"):
-            from agents.image_agent import _match_cast_card_paths
+            from agents.image_agent import resolve_scene_image_inputs
             from services.provider_factory import get_image_service
             image_prompt = payload.prompt or scene.get("image_prompt")
             if image_prompt:
                 image_service = get_image_service()
-                max_refs = int(getattr(image_service, "max_reference_images", 2) or 0)
-                choices = reference_choices_for_scene(task, scene, max_refs=min(2, max_refs) if max_refs > 0 else 2)
-                ref_paths = [item["path"] for item in choices]
-                implicit_cards = (task.get("metadata") or {}).get("implicit_cast_cards") or []
-                if not ref_paths and implicit_cards and getattr(image_service, "supports_reference_images", False) and max_refs >= 1:
-                    ref_paths = [
-                        p for p in _match_cast_card_paths(scene, implicit_cards, max_refs)
-                        if resolve_media(p).is_file()
-                    ]
-                    if ref_paths:
-                        image_prompt += "\n[角色外貌设定参考] 仅继承参考设定图中对应角色的五官脸型、发型与基础体态特征；彻底忽略设定图浅灰背景及三视图排版，严格按本镜新景别、构图角度、指定时代服装、独立场景背景与阶段光影色温绘制。"
-                reference_options = {"reference_images": ref_paths} if ref_paths else {}
-                if choices and not getattr(image_service, "supports_reference_images", False):
+                if not getattr(image_service, "supports_reference_images", False) and reference_choices_for_scene(task, scene, max_refs=2):
                     return error_response("当前图片模型不支持角色参考图，请更换模型", 422)
+                implicit_cards = (task.get("metadata") or {}).get("implicit_cast_cards") or []
+                resolved_prompt, ref_paths, choices = resolve_scene_image_inputs(
+                    task,
+                    scene,
+                    image_prompt,
+                    image_service,
+                    implicit_cast_cards=implicit_cards,
+                )
+                reference_options = {"reference_images": ref_paths} if ref_paths else {}
                 img_res = await dispatch_generation(
                     {"task_id": task_id, **(task or {})},
                     "image",
@@ -564,7 +683,7 @@ async def rerun_scene_asset(
                     lambda: image_service.generate_image(
                         task_id=task_id,
                         scene_id=render_id,
-                        image_prompt=lock_visual_style(image_prompt, task.get("style")),
+                        image_prompt=lock_visual_style(resolved_prompt, task.get("style")),
                         negative_prompt=(PHOTO_EXCLUSIONS + "，" if task.get("style") == "短剧" else "")
                         + (scene.get("image_negative_prompt") or scene.get("negative_prompt") or ""),
                         ratio=task.get("ratio", "9:16"),
@@ -574,8 +693,10 @@ async def rerun_scene_asset(
                 if img_res.get("status") == "success" and img_res.get("asset_path"):
                     updated_fields["image_path"] = img_res["asset_path"]
                     updated_fields["reference_choices"] = choices
+                    updated_fields["image_version"] = uuid4().hex[:8]
                     scene["image_path"] = img_res["asset_path"]
                     scene["reference_choices"] = choices
+                    scene["image_version"] = updated_fields["image_version"]
                     await save_asset("image", img_res["asset_path"], img_res.get("source") or "image_provider")
                 else:
                     raise ValueError("Image rerun did not return an asset")
@@ -666,7 +787,7 @@ async def rerun_scene_asset(
             await save_asset("video_clip", video_path, result.get("source") or "video_provider",
                              submitted_video_prompt=submitted_prompt,
                              first_frame_digest=first_digest, render_signature=pending_key, provider_task_id=result.get("provider_task_id"))
-            updated_fields.update(video_path=video_path, last_frame_path=tail, continuity_input_path=first,
+            updated_fields.update(video_path=video_path, video_version=uuid4().hex[:8], last_frame_path=tail, continuity_input_path=first,
                                   submitted_video_prompt=submitted_prompt,
                                   observed_handoff=observed, need_dynamic_video=True, stale_tail=False,
                                   status="video_done", pending_video_rerun=None)
@@ -682,9 +803,9 @@ async def rerun_scene_asset(
             if successor:
                 await mongodb.update_one("scenes", {"_id": successor["_id"]}, {"stale_tail": True})
 
-        updated_fields["updated_at"] = now
+        updated_fields["updated_at"] = datetime.now(UTC)
         await mongodb.update_one("scenes", {"_id": f"{task_id}_{scene_id}"}, updated_fields)
-        if in_shoot_review or payload.rerun_type == "end_frame" or (task.get("status") == "failed" and payload.rerun_type == "voice"):
+        if in_shoot_review or payload.rerun_type == "end_frame" or (task.get("status") == "failed" and payload.rerun_type in {"voice", "image"}):
             scene_data = {**scene, **updated_fields}
             if "_id" in scene_data:
                 scene_data["_id"] = str(scene_data["_id"])

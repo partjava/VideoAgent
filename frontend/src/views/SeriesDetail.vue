@@ -11,15 +11,18 @@
         class="notice"
       />
       <template v-if="project">
-        <div class="heading">
+        <div class="heading va-workspace-header">
           <div>
+            <span class="va-eyebrow">SERIES WORKBENCH · 连载工作台</span>
             <h1>{{ project.title }}</h1>
-            <p>
-              {{ project.total_episodes }} 集 · 每集
-              {{ durationText(project) }} · {{ modeText(project.generation_mode) }} · {{ project.style }} ·
-              {{ project.ratio }}
-              <template v-if="project.pre_shoot_review"> · 已开启每集开拍前预审</template>
-            </p>
+            <div class="spec-pills">
+              <span>{{ project.total_episodes }} 集</span>
+              <span>每集 {{ durationText(project) }}</span>
+              <span>{{ modeText(project.generation_mode) }}</span>
+              <span>{{ project.style }}</span>
+              <span>{{ project.ratio }}</span>
+              <span v-if="project.pre_shoot_review" class="accent">已开启每集开拍前预审</span>
+            </div>
           </div>
           <el-tag size="large" :type="running ? 'primary' : 'info'">{{
             statusText(project.status)
@@ -264,8 +267,17 @@
                     seriesApi.acceptDependency(projectId, episode.episode_num),
                   )
                 "
-                >接受前集更新</el-button
-              ><el-button
+                >接受前集更新</el-button>
+              <el-button
+                v-if="!episode.task_id || episode.status === 'failed'"
+                type="primary"
+                plain
+                :disabled="busy || running"
+                @click="openBindTaskDialog(episode)"
+              >
+                🔗 关联已生成单集
+              </el-button>
+              <el-button
                 v-if="episode.task_id || episode.status === 'failed'"
                 :disabled="busy || running"
                 @click="regenerate(episode)"
@@ -341,8 +353,43 @@
           v-if="projectId"
           scope-type="series"
           :scope-id="String(projectId)"
+          :refresh-key="`${project?.status || ''}-${project?.updated_at || ''}`"
+          :active="running"
         />
       </template>
+
+      <el-dialog
+        v-model="bindEpisodeDialog"
+        :title="`关联已生成单集到第 ${bindTargetEpisode?.episode_num || 1} 集`"
+        width="min(560px, 94vw)"
+      >
+        <p class="hint" style="margin-top: 0">
+          可将已在单集任务中生成好的视频或分镜任务直接并入本集，并自动提取本集结尾剧情延续状态。
+        </p>
+        <el-select
+          v-model="selectedBindTaskId"
+          placeholder="请选择一个独立单集任务"
+          style="width: 100%"
+        >
+          <el-option
+            v-for="t in bindableTasks"
+            :key="t.task_id"
+            :label="`${t.status === 'success' ? '【已成片】' : '【制作中】'}${(t.topic || t.user_input || t.task_id).slice(0, 38)}（${t.task_id}）`"
+            :value="t.task_id"
+          />
+        </el-select>
+        <template #footer>
+          <el-button @click="bindEpisodeDialog = false">取消</el-button>
+          <el-button
+            type="primary"
+            :loading="busy"
+            :disabled="!selectedBindTaskId"
+            @click="confirmBindEpisodeTask"
+          >
+            确认关联到本集
+          </el-button>
+        </template>
+      </el-dialog>
 
       <el-dialog
         v-model="ledgerDialog"
@@ -492,6 +539,7 @@ import BasicLayout from "../layouts/BasicLayout.vue";
 import EpisodeMaterials from "../components/EpisodeMaterials.vue";
 import GenerationUsage from "../components/GenerationUsage.vue";
 import { seriesApi } from "../api/series";
+import { videoApi } from "../api/video";
 import { statusText } from "../utils/seriesStatus";
 import { durationText, modeText } from "../utils/seriesDuration";
 const route = useRoute(),
@@ -511,7 +559,11 @@ const project = ref(null),
   diffData = ref(null),
   diffEpisode = ref(null),
   ledgerDialog = ref(false),
-  ledgerJson = ref("");
+  ledgerJson = ref(""),
+  bindEpisodeDialog = ref(false),
+  bindTargetEpisode = ref(null),
+  bindableTasks = ref([]),
+  selectedBindTaskId = ref("");
 let timer,
   fetching = false,
   disposed = false;
@@ -636,6 +688,36 @@ async function action(fn) {
 async function approveEpisodeShoot(episode) {
   if (!episode?.task_id) return;
   await action(() => seriesApi.approveShoot(projectId, episode.task_id));
+}
+async function openBindTaskDialog(episode) {
+  bindTargetEpisode.value = episode;
+  selectedBindTaskId.value = "";
+  try {
+    const data = await videoApi.listTasks();
+    const list = Array.isArray(data) ? data : data.tasks || [];
+    bindableTasks.value = list.filter((t) => t && t.task_id && !t.series_id);
+    if (bindableTasks.value.length) {
+      const cleanTitle = String(project.value?.title || "").replace(/[《》\s]/g, "");
+      const matched = cleanTitle
+        ? bindableTasks.value.find((t) =>
+            String(`${t.topic || ""} ${t.user_input || ""}`).includes(cleanTitle),
+          )
+        : null;
+      selectedBindTaskId.value = (matched || bindableTasks.value[0]).task_id;
+    }
+  } catch {
+    bindableTasks.value = [];
+  }
+  bindEpisodeDialog.value = true;
+}
+async function confirmBindEpisodeTask() {
+  if (!bindTargetEpisode.value || !selectedBindTaskId.value) return;
+  const epNum = bindTargetEpisode.value.episode_num;
+  const taskId = selectedBindTaskId.value;
+  await action(async () => {
+    await seriesApi.bindEpisodeTask(projectId, epNum, taskId);
+    bindEpisodeDialog.value = false;
+  });
 }
 function openLedgerEditor() {
   ledgerJson.value = JSON.stringify(
@@ -787,7 +869,28 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 .heading {
-  margin: 20px 0;
+  margin: 12px 0 20px;
+}
+.spec-pills {
+  display: flex;
+  flex-wrap: wrap;
+  flex-wrap: balance;
+  gap: 6px;
+  margin-top: 10px;
+}
+.spec-pills span {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--va-surface-subtle);
+  border: 1px solid var(--va-border);
+  color: var(--va-ink-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.spec-pills span.accent {
+  background: var(--va-brand-soft);
+  border-color: var(--va-brand-border);
+  color: var(--va-brand-hover);
 }
 h1 {
   font-size: 28px;

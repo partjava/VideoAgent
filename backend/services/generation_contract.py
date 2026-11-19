@@ -96,7 +96,7 @@ def _validate_variable_scenes(scenes, target_duration=None, bounds: tuple[int, i
             raise ValueError(
                 f"{label} clip {index + 1} duration must be an integer between {min_sec} and {max_sec} seconds"
             )
-        if scene.get("need_dynamic_video") is not True:
+        if scene.get("need_dynamic_video") is not True and scene.get("status") != "static_fallback":
             raise ValueError(f"{label} clip {index + 1} must be dynamic")
         if scene.get("transition_type") not in {None, "cut", "continue_action", "scene_change"}:
             raise ValueError(f"{label} clip {index + 1} has invalid transition_type")

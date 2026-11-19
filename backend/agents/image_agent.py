@@ -5,9 +5,20 @@ from services.visual_style import lock_visual_style, PHOTO_EXCLUSIONS
 from services.character_binding import frozen_characters, reference_choices_for_scene
 from services.generation_dispatch import dispatch_generation
 from services.generation_usage import GenerationLimitExceeded, record_reuse
+from services.image.siliconflow_image_service import is_black_or_collapsed_image
 from uuid import uuid4
 
 import anyio
+
+
+def _is_usable_image_file(path_obj: Path) -> bool:
+    """Return True if path exists cleanly on disk and is not a collapsed pure-black frame."""
+    if not path_obj.is_file() or path_obj.stat().st_size <= 1024:
+        return False
+    try:
+        return not is_black_or_collapsed_image(path_obj.read_bytes())
+    except OSError:
+        return False
 
 
 def _build_implicit_turnaround_prompt(char_info: dict, style: str | None) -> str:
@@ -56,6 +67,52 @@ def _match_cast_card_paths(scene: dict, cast_cards: list[dict], max_refs: int) -
         if not explicit_other and any(k in text_pool for k in ("主角", "男主", "女主", "他", "她", "少年", "女孩", "男孩")):
             matched = [cast_cards[0]["path"]]
     return matched[: min(2, max_refs)]
+
+
+def resolve_scene_image_inputs(
+    task: dict,
+    scene: dict,
+    image_prompt: str,
+    image_service: object,
+    *,
+    implicit_cast_cards: list[dict] | None = None,
+    anchor_path: str | None = None,
+) -> tuple[str, list[str], list[dict]]:
+    """Resolve safe reference images and prompt directives for generating or rerunning a scene keyframe."""
+    from services.media_quality import resolve_media
+
+    supports_refs = bool(getattr(image_service, "supports_reference_images", False))
+    max_refs = int(getattr(image_service, "max_reference_images", 0) or 0) if supports_refs else 0
+    choices = (
+        reference_choices_for_scene(task or {}, scene, max_refs=min(2, max_refs))
+        if max_refs > 0
+        else []
+    )
+    ref_paths = [item["path"] for item in choices]
+    skip_studio_cast_edit = bool(getattr(image_service, "prefers_t2i_for_studio_cast_sheets", False))
+    # Edit models (e.g. Qwen/Qwen-Image-Edit*) paint black bars or collapse when composing >=2 studio portraits
+    # into a brand-new multi-character scene; keep choices metadata but route directly to full-bleed T2I.
+    if skip_studio_cast_edit and len(ref_paths) >= 2:
+        ref_paths = []
+
+    env_anchor = str(scene.get("scene_anchor_path") or "").strip()
+    if env_anchor and len(ref_paths) < max_refs:
+        if resolve_media(env_anchor).is_file() and env_anchor not in ref_paths:
+            ref_paths.append(env_anchor)
+            image_prompt += "\n[环境参考锚定] 仅继承最后一张场景图的空间装修、材质与主光源方向，严格按本镜机位构图重排。"
+    elif not ref_paths and not choices and implicit_cast_cards and max_refs >= 1 and not skip_studio_cast_edit:
+        matched = [
+            p for p in _match_cast_card_paths(scene, implicit_cast_cards, max_refs)
+            if resolve_media(p).is_file()
+        ]
+        if matched:
+            ref_paths = matched
+            image_prompt += "\n[角色外貌定妆参考] 严格保持参考图人物的五官、发型、脸型与辨识特征一致，将人物置入全新实景电影镜头中，按本镜完整场景、构图景别、服装与戏剧光影重新拍摄。"
+    elif not ref_paths and not choices and anchor_path and max_refs >= 1:
+        if resolve_media(anchor_path).is_file():
+            ref_paths = [anchor_path]
+            image_prompt += "\n[同片场造型与环境锚定] 严格保持参考图1中人物五官、发型、服装款式与房间装修色调一致；仅继承人物造型与片场光色，人物姿态、走位距离、表情与机位景别必须完全按本镜新分镜重新构图。"
+    return image_prompt, ref_paths, choices
 
 
 def build_end_frame_prompt(scene: dict, custom_prompt: str | None = None) -> str:
@@ -139,12 +196,18 @@ class ImageAgent:
 
                 disk_img = backend_dir / "assets" / task_id / "images" / f"{scene_id}.png"
                 existing_path = scene.get("image_path")
-                has_valid_img = (existing_path and (backend_dir / str(existing_path).replace("backend/", "")).is_file()) or (disk_img.is_file() and disk_img.stat().st_size > 1024)
+                existing_file = (
+                    (backend_dir / str(existing_path).replace("backend/", ""))
+                    if existing_path
+                    else None
+                )
+                has_valid_img = (
+                    (existing_file is not None and _is_usable_image_file(existing_file))
+                    or _is_usable_image_file(disk_img)
+                )
 
                 if has_valid_img:
                     rel_path = f"backend/assets/{task_id}/images/{scene_id}.png"
-                    if scene.get("status") == "static_fallback":
-                        continue
                     existing_asset = await mongodb.find_one(
                         ASSETS_COLLECTION,
                         {"task_id": task_id, "scene_id": scene_id, "asset_type": "image"}
@@ -173,10 +236,20 @@ class ImageAgent:
                         if bool(getattr(image_service, "supports_reference_images", False))
                         else []
                     )
+                    preserved_status = "video_done" if scene.get("video_path") else "image_done"
+                    reuse_fields: dict[str, object] = {
+                        "image_path": rel_path,
+                        "reference_choices": choices,
+                        "status": preserved_status,
+                    }
+                    if scene.get("status") == "static_fallback" and not scene.get("video_path"):
+                        reuse_fields["need_dynamic_video"] = True
+                    if scene.get("image_path") != rel_path or not scene.get("updated_at"):
+                        reuse_fields["updated_at"] = now
                     await mongodb.update_one(
                         SCENES_COLLECTION,
                         {"_id": f"{task_id}_{scene_id}"},
-                        {"image_path": rel_path, "reference_choices": choices, "status": "image_done", "updated_at": now},
+                        reuse_fields,
                     )
                     assets.append(existing_asset)
                     await record_reuse(task or {"task_id": task_id}, "image", scene_id)
@@ -246,7 +319,7 @@ class ImageAgent:
                     expected_rel = f"backend/assets/{task_id}/images/{card_id}.png"
                     disk_card = resolve_media(expected_rel)
                     card_prompt = _build_implicit_turnaround_prompt(ch, (task or {}).get("style"))
-                    if disk_card.is_file() and disk_card.stat().st_size > 1024:
+                    if _is_usable_image_file(disk_card):
                         card_path = expected_rel
                     else:
                         try:
@@ -271,6 +344,7 @@ class ImageAgent:
                         except Exception as exc:
                             print(f"[ImageAgent] Implicit cast card skipped safely for {ch['name']}: {exc}", flush=True)
                             return None
+                    card_now = datetime.now(UTC)
                     card_asset = Asset(
                         asset_id=f"asset_{task_id}_{card_id}",
                         task_id=task_id,
@@ -279,8 +353,8 @@ class ImageAgent:
                         path=card_path,
                         source=str(image_service.__class__.__name__),
                         status="success",
-                        created_at=now,
-                        updated_at=now,
+                        created_at=card_now,
+                        updated_at=card_now,
                     )
                     await mongodb.replace_one(
                         ASSETS_COLLECTION,
@@ -295,6 +369,7 @@ class ImageAgent:
                         "appearance": str(ch.get("appearance") or ch.get("face_dna") or "").strip(),
                         "path": card_path,
                         "prompt": card_prompt,
+                        "updated_at": card_now.isoformat(),
                     }
 
                 if card_targets:
@@ -308,6 +383,15 @@ class ImageAgent:
                         if isinstance(cr, dict) and cr.get("path"):
                             implicit_cast_cards.append(cr)
                     if implicit_cast_cards:
+                        try:
+                            from services.character_service import character_service
+
+                            await character_service.sync_cast_cards_to_library(
+                                implicit_cast_cards,
+                                style=str((task or {}).get("style") or "短剧"),
+                            )
+                        except Exception as sync_exc:
+                            print(f"[ImageAgent] Cast card auto-sync skipped safely: {sync_exc}", flush=True)
                         await mongodb.update_one(
                             "video_tasks",
                             {"_id": task_id},
@@ -331,34 +415,14 @@ class ImageAgent:
                 )
                 if (task or {}).get("style") == "短剧":
                     negative_prompt = PHOTO_EXCLUSIONS + "，" + (negative_prompt or "")
-                supports_refs = bool(getattr(image_service, "supports_reference_images", False))
-                max_refs = int(getattr(image_service, "max_reference_images", 0) or 0) if supports_refs else 0
-                choices = (
-                    reference_choices_for_scene(task or {}, scene, max_refs=min(2, max_refs))
-                    if max_refs > 0
-                    else []
+                image_prompt, ref_paths, choices = resolve_scene_image_inputs(
+                    task or {},
+                    scene,
+                    image_prompt,
+                    image_service,
+                    implicit_cast_cards=implicit_cast_cards,
+                    anchor_path=anchor_path,
                 )
-                ref_paths = [item["path"] for item in choices]
-                env_anchor = str(scene.get("scene_anchor_path") or "").strip()
-                if env_anchor and len(ref_paths) < max_refs:
-                    from services.media_quality import resolve_media
-                    if resolve_media(env_anchor).is_file() and env_anchor not in ref_paths:
-                        ref_paths.append(env_anchor)
-                        image_prompt += "\n[环境参考锚定] 仅继承最后一张场景图的空间装修、材质与主光源方向，严格按本镜机位构图重排。"
-                elif not ref_paths and implicit_cast_cards and max_refs >= 1:
-                    from services.media_quality import resolve_media
-                    matched = [
-                        p for p in _match_cast_card_paths(scene, implicit_cast_cards, max_refs)
-                        if resolve_media(p).is_file()
-                    ]
-                    if matched:
-                        ref_paths = matched
-                        image_prompt += "\n[角色外貌设定参考] 仅继承参考设定图中对应角色的五官脸型、发型与基础体态特征；彻底忽略设定图浅灰背景及三视图排版，严格按本镜新景别、构图角度、指定时代服装、独立场景背景与阶段光影色温绘制。"
-                elif not ref_paths and anchor_path and max_refs >= 1:
-                    from services.media_quality import resolve_media
-                    if resolve_media(anchor_path).is_file():
-                        ref_paths = [anchor_path]
-                        image_prompt += "\n[同片场造型与环境锚定] 严格保持参考图1中人物五官、发型、服装款式与房间装修色调一致；仅继承人物造型与片场光色，人物姿态、走位距离、表情与机位景别必须完全按本镜新分镜重新构图。"
                 reference_options = {"reference_images": ref_paths} if ref_paths else {}
                 try:
                     result = await dispatch_generation(task or {"task_id": task_id}, "image", scene_id,
@@ -389,6 +453,7 @@ class ImageAgent:
                 if not image_result or image_result.get("status") != "success" or not image_result.get("asset_path"):
                     return scene_id
 
+                saved_at = datetime.now(UTC)
                 asset = Asset(
                     asset_id=f"asset_{uuid4().hex[:12]}",
                     task_id=task_id,
@@ -397,8 +462,8 @@ class ImageAgent:
                     path=str(image_result["asset_path"]),
                     source=str(image_result.get("source", "qwen")),
                     status=str(image_result.get("status", "success")),
-                    created_at=now,
-                    updated_at=now,
+                    created_at=saved_at,
+                    updated_at=saved_at,
                 )
                 await mongodb.replace_one(
                     ASSETS_COLLECTION,
@@ -409,8 +474,9 @@ class ImageAgent:
                 scene_update = {
                     "image_path": asset.path,
                     "reference_choices": image_result.get("reference_choices") or [],
+                    "image_version": uuid4().hex[:8],
                     "status": "image_done",
-                    "updated_at": now,
+                    "updated_at": saved_at,
                 }
                 if scene.get("need_end_frame") is True and getattr(image_service, "supports_reference_images", False):
                     end_scene_id = f"{scene_id}_end"
@@ -432,6 +498,7 @@ class ImageAgent:
                             )
                         if isinstance(end_res, dict) and end_res.get("status") == "success" and end_res.get("asset_path"):
                             scene_update["last_frame_target_path"] = str(end_res["asset_path"])
+                            scene_update["updated_at"] = datetime.now(UTC)
                     except GenerationLimitExceeded:
                         raise
                     except Exception as end_exc:

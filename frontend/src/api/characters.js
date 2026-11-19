@@ -20,5 +20,6 @@ export const charactersApi = {
   voicePreview: (id, text) =>
     client.post(`${path(id)}/voice-preview`, { text }),
   archive: (id) => client.delete(path(id)),
+  removePermanent: (id) => client.delete(path(id), { params: { permanent: true } }),
   restore: (id) => client.post(`${path(id)}/restore`),
 };

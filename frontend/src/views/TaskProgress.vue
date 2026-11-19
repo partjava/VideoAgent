@@ -1,13 +1,15 @@
 <template>
   <component :is="embedded ? 'div' : BasicLayout">
-    <main class="studio">
+    <div class="studio">
       <section class="studio-hero">
         <div>
           <div class="eyebrow"><span class="signal" :class="status"></span> VIDEO STUDIO <span class="hero-divider"></span> {{ statusLabel }}</div>
           <h1>{{ task?.topic || '视频生成工作台' }}</h1>
           <p>{{ task?.user_input || '从创意、分镜到成片，跟随每一步制作进度。' }}</p>
           <div class="tags">
-            <span v-if="task?.duration">{{ task.duration }} 秒</span>
+            <span v-if="task?.duration_min && task?.duration_max">目标 {{ task.duration_min }}–{{ task.duration_max }} 秒</span>
+            <span v-else-if="task?.duration">{{ task.duration }} 秒</span>
+            <span v-if="scenes.length && actualScenesDuration > 0">当前分镜 {{ actualScenesDuration }} 秒</span>
             <span v-if="task?.ratio">{{ task.ratio }}</span>
             <span v-if="task?.style">{{ task.style }}</span>
             <span>{{ scenes.length }} 个镜头</span>
@@ -72,7 +74,7 @@
             <h2>制作流程</h2>
             <p>选择步骤查看它的作用与产物。</p>
           </div>
-          <ol class="steps">
+          <ol class="steps va-scroll">
             <li v-for="(step, index) in steps" :key="step.key">
               <button type="button" :class="[stepState(step), { selected: active.key === step.key }]" :aria-pressed="active.key === step.key" aria-controls="stage-panel" @click="selectStep(step.key)">
                 <span class="step-index">{{ String(index + 1).padStart(2, '0') }}</span>
@@ -104,24 +106,52 @@
               <div class="script-head-row">
                 <h3>{{ script.title || '视频剧本' }}</h3>
                 <div class="script-doctor-btns">
-                  <button type="button" class="copy-prompt" :disabled="reviewingScript" @click="runTaskScriptReview">
+                  <button
+                    type="button"
+                    class="copy-prompt"
+                    :disabled="reviewingScript || isPipelineRunning"
+                    :title="isPipelineRunning ? '流程运行中暂不可修改；暂停、失败或完成后可使用' : '用 AI 重新对当前剧本做五维诊断'"
+                    @click="runTaskScriptReview"
+                  >
                     {{ reviewingScript ? '正在审稿…' : '🔍 AI 剧本审稿' }}
                   </button>
-                  <button type="button" class="locate-btn" :disabled="doctoringScript" @click="runTaskScriptDoctor">
+                  <button
+                    type="button"
+                    class="locate-btn"
+                    :disabled="doctoringScript || isPipelineRunning"
+                    :title="isPipelineRunning ? '流程运行中暂不可改稿；暂停、失败或完成后可使用' : '重写去 AI 味并保存新版剧本（可从分镜重跑生效）'"
+                    @click="runTaskScriptDoctor"
+                  >
                     {{ doctoringScript ? '正在精修…' : '⚡ 一键去AI味精修' }}
+                  </button>
+                  <button
+                    v-if="scriptDoctoredPendingRerun && !isSeriesTask && !isPipelineRunning"
+                    type="button"
+                    class="trial-shot-btn"
+                    :disabled="rerunningFromStoryboard"
+                    @click="applyPolishedAndRerun"
+                  >
+                    {{ rerunningFromStoryboard ? '正在从分镜重跑…' : '🔄 应用精修剧本并从分镜重跑' }}
                   </button>
                 </div>
               </div>
-              <p class="script">{{ script.content }}</p>
+              <p class="script-tools-hint">
+                {{ isPipelineRunning
+                  ? '流程推进中暂不可人工改稿；如需重审或精修，请在预审暂停、中断或完成后操作。'
+                  : '说明：右上方按钮用于人工复审与去 AI 味精修；精修保存后，可点击「应用精修剧本并从分镜重跑」让新剧本生效到后续镜头。' }}
+              </p>
+              <p class="script va-scroll">{{ script.content }}</p>
               <div v-if="scriptReviewReport" class="script-review-box">
                 <div class="script-review-summary">
                   <strong>⚖️ 审稿评级：{{ scriptReviewReport.grade }} 级（{{ scriptReviewReport.overall_score }} 分）</strong>
-                  <span v-if="task?.metadata?.story_judge?.rewritten">
+                  <span v-if="!customScriptReview && task?.metadata?.story_judge?.rewritten">
                     已自动打回精修重写（初稿 {{ task.metadata.story_judge.before_score }} → {{ task.metadata.story_judge.after_score }} 分）
                   </span>
-                  <span v-else>检出 {{ scriptReviewReport.issue_count }} 项可优化问题</span>
+                  <span v-else>
+                    {{ customScriptReview ? '人工复审/精修结果 · ' : '' }}检出 {{ scriptReviewReport.issue_count || 0 }} 项可优化问题
+                  </span>
                 </div>
-                <ul v-if="task?.metadata?.story_judge?.changes_made?.length" class="beats">
+                <ul v-if="!customScriptReview && task?.metadata?.story_judge?.changes_made?.length" class="beats">
                   <li v-for="(chg, cidx) in task.metadata.story_judge.changes_made" :key="'sj-' + cidx">✓ {{ chg }}</li>
                 </ul>
                 <ul v-if="scriptReviewReport.issues?.length" class="beats issue-list">
@@ -200,7 +230,7 @@
             </div>
             <div v-else-if="['EditorAgent', 'ExportAgent'].includes(active.key) && finalVideo" class="stage-output">
               <video ref="finalVideoRef" class="final-video" :src="finalVideo" controls preload="metadata" playsinline></video>
-              <div class="links"><a :href="finalVideo" download>下载成片</a><a v-if="task?.metadata?.cover_path" :href="mediaUrl(task.metadata.cover_path)" download>下载封面</a><a v-if="subtitleFile" :href="subtitleFile" download>下载字幕</a></div>
+              <div class="links"><a :href="finalVideo" download>下载成片</a><a v-if="task?.metadata?.cover_path" :href="mediaUrl(task.metadata.cover_path, task?.updated_at || mediaRev)" download>下载封面</a><a v-if="subtitleFile" :href="subtitleFile" download>下载字幕</a></div>
             </div>
             <div v-else class="stage-output summary">
               <span class="signal" :class="stepState(active)"></span>
@@ -211,30 +241,63 @@
           </section>
 
           <section v-if="implicitCastCards.length" class="panel cast-cards-panel" aria-label="自动生成角色设定卡">
-            <div class="section-heading">
+            <div class="section-heading cast-cards-heading">
               <div>
                 <span class="eyebrow">CAST TURNAROUND ANCHORS · 角色设定卡</span>
                 <h2>自动生成的 4 视图人物锚点</h2>
                 <p>剧组自由流会先在浅灰无阴影影棚背景绘制标准正脸特写 + 三视图，后续全部镜头按出镜角色提取五官与体态特征，不锁定实景角度。</p>
               </div>
+              <div class="cast-cards-actions">
+                <button
+                  type="button"
+                  class="locate-btn"
+                  :disabled="savingAllCast"
+                  @click="saveAllCastCards()"
+                >
+                  {{ savingAllCast ? '正在保存到角色库…' : '💾 一键全部存入角色资产库' }}
+                </button>
+                <RouterLink v-if="!embedded" to="/characters" class="copy-prompt" style="text-decoration: none">
+                  去角色资产库查看 →
+                </RouterLink>
+              </div>
             </div>
+            <p v-if="castSaveFeedback" class="cast-save-feedback" role="status">{{ castSaveFeedback }}</p>
             <div class="cast-cards-grid">
               <div v-for="card in implicitCastCards" :key="card.card_id" class="cast-card-item">
-                <img :src="mediaUrl(card.path)" :alt="card.name" loading="lazy" />
+                <button
+                  type="button"
+                  class="cast-thumb-trigger"
+                  :aria-label="`放大查看 ${card.name} 设定卡`"
+                  @click="openLightbox(mediaUrl(card.path, card.updated_at || task?.updated_at || mediaRev), `${card.name} · 4 视图人物设定卡`)"
+                >
+                  <img :src="mediaUrl(card.path, card.updated_at || task?.updated_at || mediaRev)" :alt="card.name" loading="lazy" />
+                </button>
                 <div class="cast-card-meta">
                   <div>
                     <strong>{{ card.name }}</strong>
                     <small v-if="card.appearance"> · {{ card.appearance }}</small>
                   </div>
-                  <button
-                    v-if="['awaiting_shoot_review', 'failed', 'success'].includes(status)"
-                    type="button"
-                    class="copy-prompt"
-                    :disabled="!!cardRerunId || !!activeTrial"
-                    @click="rerunCastCard(card)"
-                  >
-                    {{ cardRerunId === card.card_id ? '正在重绘设定卡…' : '重绘设定卡' }}
-                  </button>
+                  <div class="cast-card-btns">
+                    <span v-if="card.saved_character_id" class="badge success">已同步角色库</span>
+                    <button
+                      v-else
+                      type="button"
+                      class="locate-btn"
+                      :disabled="savingCardId === card.card_id || savingAllCast"
+                      @click="saveSingleCastCard(card)"
+                    >
+                      {{ savingCardId === card.card_id ? '保存中…' : '存入角色库' }}
+                    </button>
+                    <button
+                      v-if="['awaiting_shoot_review', 'failed', 'success'].includes(status)"
+                      type="button"
+                      class="copy-prompt"
+                      :disabled="!!cardRerunId || !!activeTrial"
+                      @click="rerunCastCard(card)"
+                    >
+                      {{ cardRerunId === card.card_id ? '正在重绘设定卡…' : '重绘设定卡' }}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -243,7 +306,10 @@
           <section class="panel timeline" aria-labelledby="timeline-title">
             <div class="section-heading timeline-heading">
               <div><span class="eyebrow">SHOT TIMELINE</span><h2 id="timeline-title">分镜时间线</h2></div>
-              <span class="badge neutral">{{ readyCount }} / {{ scenes.length }} 镜头就绪</span>
+              <div class="timeline-heading-actions">
+                <button type="button" class="copy-prompt timeline-refresh-btn" @click="forceRefreshMedia">↻ 刷新画面</button>
+                <span class="badge neutral">{{ readyCount }} / {{ scenes.length }} 镜头就绪</span>
+              </div>
             </div>
             <div v-if="!scenes.length" class="empty">分镜生成后会出现在这里。首帧、配音和片段就绪后会自动更新。</div>
             <template v-for="(scene, i) in scenes" :key="scene.scene_id">
@@ -255,10 +321,39 @@
                 class="shot"
                 :class="{ 'shot-highlighted': highlightedSceneId === scene.scene_id }"
               >
-                <div class="shot-media" :class="{ 'focused-media': (selected === 'ImageAgent' && firstFrame(scene)) || (selected === 'VideoAgent' && scene.video_path) }">
-                  <img v-if="selected === 'ImageAgent' && firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
-                  <video v-else-if="scene.video_path" :src="mediaUrl(scene.video_path)" controls preload="metadata" playsinline></video>
-                  <img v-else-if="firstFrame(scene)" :src="mediaUrl(firstFrame(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+                <div
+                  class="shot-media"
+                  :class="{
+                    'is-portrait': task?.ratio === '9:16',
+                    'focused-media': (selected === 'ImageAgent' && firstFrame(scene)) || (selected === 'VideoAgent' && scene.video_path),
+                  }"
+                >
+                  <button
+                    v-if="selected === 'ImageAgent' && firstFrame(scene)"
+                    type="button"
+                    class="thumb-trigger"
+                    :aria-label="`放大查看镜头 ${String(i + 1).padStart(2, '0')} 首帧`"
+                    @click="openLightbox(mediaUrl(firstFrame(scene), sceneMediaVer(scene)), `镜头 ${String(i + 1).padStart(2, '0')} 首帧`)"
+                  >
+                    <img :src="mediaUrl(firstFrame(scene), sceneMediaVer(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+                  </button>
+                  <video
+                    v-else-if="scene.video_path"
+                    :src="mediaUrl(scene.video_path, videoMediaVer(scene))"
+                    :poster="firstFrame(scene) ? mediaUrl(firstFrame(scene), sceneMediaVer(scene)) : undefined"
+                    controls
+                    preload="metadata"
+                    playsinline
+                  ></video>
+                  <button
+                    v-else-if="firstFrame(scene)"
+                    type="button"
+                    class="thumb-trigger"
+                    :aria-label="`放大查看镜头 ${String(i + 1).padStart(2, '0')} 首帧`"
+                    @click="openLightbox(mediaUrl(firstFrame(scene), sceneMediaVer(scene)), `镜头 ${String(i + 1).padStart(2, '0')} 首帧`)"
+                  >
+                    <img :src="mediaUrl(firstFrame(scene), sceneMediaVer(scene))" :alt="'镜头 ' + (i + 1) + ' 的首帧'" loading="lazy">
+                  </button>
                   <div v-else class="frame-placeholder"><span>◫</span><small>等待画面</small></div>
                 </div>
                 <div class="shot-body">
@@ -278,7 +373,7 @@
                   <p v-if="scene.audio_text"><strong>实际配音稿</strong> {{ scene.audio_text }}</p>
                   <div v-for="(line, index) in scene.dialogue_audio || []" :key="index" class="voice-output">
                     <p><strong>{{ line.speaker }}</strong> · {{ seconds(line.start) }}–{{ seconds(line.end) }} 秒 · {{ line.text }}</p>
-                    <audio :src="mediaUrl(line.path)" controls preload="none"></audio>
+                    <audio :src="mediaUrl(line.path, sceneMediaVer(scene))" controls preload="none"></audio>
                   </div>
                   <template v-if="status === 'failed' && stepState(steps.find(step => step.key === 'VoiceAgent')) === 'failed' && !scene.audio_path && !scene.dialogue_audio?.length && scene.voiceover">
                     <label v-if="!scene.dialogue_lines?.length">配音重试稿
@@ -318,9 +413,9 @@
                     </span>
                   </div>
 
-                  <div v-if="status === 'awaiting_shoot_review'" class="pre-shoot-shot-tools">
+                  <div v-if="status === 'awaiting_shoot_review' || status === 'failed'" class="pre-shoot-shot-tools">
                     <button
-                      v-if="scene.need_dynamic_video !== false"
+                      v-if="status === 'awaiting_shoot_review' && scene.need_dynamic_video !== false"
                       type="button"
                       class="trial-shot-btn"
                       :disabled="!!activeTrial || trialSubmitting === scene.scene_id || !canTrialShot(scene, i)"
@@ -351,7 +446,7 @@
                       {{ endFrameRerunId === scene.scene_id ? '正在生成尾帧…' : scene.last_frame_target_path ? '重绘尾帧控制图' : '生成尾帧（双图锁终点）' }}
                     </button>
                     <button
-                      v-if="scene.voiceover"
+                      v-if="scene.voiceover && status === 'awaiting_shoot_review'"
                       type="button"
                       class="copy-prompt"
                       :disabled="!!voiceRetry || !!activeTrial"
@@ -361,15 +456,22 @@
                     </button>
                     <div v-if="scene.last_frame_target_path" class="end-frame-preview">
                       <span>尾帧锁定：</span>
-                      <img :src="mediaUrl(scene.last_frame_target_path)" :alt="'镜头 ' + (i + 1) + ' 尾帧控制图'" loading="lazy" />
+                      <button
+                        type="button"
+                        class="end-frame-trigger"
+                        :aria-label="`放大查看镜头 ${String(i + 1).padStart(2, '0')} 尾帧控制图`"
+                        @click="openLightbox(mediaUrl(scene.last_frame_target_path, sceneMediaVer(scene)), `镜头 ${String(i + 1).padStart(2, '0')} 尾帧控制图`)"
+                      >
+                        <img :src="mediaUrl(scene.last_frame_target_path, sceneMediaVer(scene))" :alt="'镜头 ' + (i + 1) + ' 尾帧控制图'" loading="lazy" />
+                      </button>
                     </div>
-                    <small v-if="!canTrialShot(scene, i)" class="trial-hint">
+                    <small v-if="status === 'awaiting_shoot_review' && !canTrialShot(scene, i)" class="trial-hint">
                       此镜头承接上一镜头尾帧，请先试拍上一镜头
                     </small>
                   </div>
 
                   <div v-if="scene.audio_path" class="voice-output" :class="{ 'selected-output': selected === 'VoiceAgent' }">
-                    <audio :src="mediaUrl(scene.audio_path)" :aria-label="'镜头 ' + (i + 1) + ' 配音'" controls preload="none"></audio>
+                    <audio :src="mediaUrl(scene.audio_path, sceneMediaVer(scene))" :aria-label="'镜头 ' + (i + 1) + ' 配音'" controls preload="none"></audio>
                     <p v-if="scene.audio_duration > 0">
                       画面 {{ seconds(scene.duration) }} 秒 · 旁白起点 {{ seconds(scene.voice_start || 0) }} 秒
                       · 原始读时 {{ seconds(scene.audio_duration) }} 秒
@@ -420,16 +522,39 @@
             </template>
           </section>
 
-          <GenerationUsage v-if="taskId" scope-type="task" :scope-id="taskId" />
+          <GenerationUsage
+            v-if="taskId"
+            scope-type="task"
+            :scope-id="taskId"
+            :refresh-key="`${status}-${progress}-${readyCount}-${task?.updated_at || ''}`"
+            :active="isPipelineRunning"
+          />
         </div>
       </div>
-    </main>
+    </div>
+
+    <dialog
+      ref="lightboxRef"
+      class="media-lightbox"
+      closedby="any"
+      aria-labelledby="lightbox-title"
+      @close="onLightboxClose"
+    >
+      <div class="lightbox-head">
+        <h3 id="lightbox-title">{{ lightboxItem?.title || '画面大图预览' }}</h3>
+        <form method="dialog">
+          <button type="submit" value="close" class="copy-prompt lightbox-close-btn" autofocus>关闭</button>
+        </form>
+      </div>
+      <img v-if="lightboxItem?.src" class="lightbox-img" :src="lightboxItem.src" :alt="lightboxItem.title || '画面大图预览'" />
+    </dialog>
   </component>
 </template>
 
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import BasicLayout from '../layouts/BasicLayout.vue'
 import GenerationUsage from '../components/GenerationUsage.vue'
 import { videoApi } from '../api/video'
@@ -466,10 +591,51 @@ const highlightedSceneId = ref('')
 const finalVideoRef = ref(null)
 const reviewingScript = ref(false)
 const doctoringScript = ref(false)
+const rerunningFromStoryboard = ref(false)
+const scriptDoctoredPendingRerun = ref(false)
 const customScriptReview = ref(null)
+const savingAllCast = ref(false)
+const savingCardId = ref(null)
+const castSaveFeedback = ref('')
+const mediaRev = ref(Date.now())
+const manualMediaBust = ref(0)
+const lightboxRef = ref(null)
+const lightboxItem = ref(null)
+
+function openLightbox(src, title) {
+  if (!src) return
+  lightboxItem.value = { src, title: title || '画面大图预览' }
+  nextTick(() => {
+    if (lightboxRef.value && !lightboxRef.value.open) {
+      lightboxRef.value.showModal()
+    }
+  })
+}
+
+function onLightboxClose() {
+  if (lightboxRef.value) {
+    lightboxRef.value.returnValue = ''
+  }
+  lightboxItem.value = null
+}
+
+function forceRefreshMedia() {
+  manualMediaBust.value = Date.now()
+  mediaRev.value = manualMediaBust.value
+  refreshNow()
+}
 
 const scriptReviewReport = computed(
   () => customScriptReview.value || task.value?.metadata?.script_review_38 || null
+)
+const isPipelineRunning = computed(
+  () => !['failed', 'success', 'awaiting_shoot_review', 'created'].includes(status.value)
+)
+const isSeriesTask = computed(
+  () => Boolean(task.value?.series_id || task.value?.metadata?.series_context)
+)
+const actualScenesDuration = computed(
+  () => scenes.value.reduce((acc, s) => acc + (Number(s.duration) || 0), 0)
 )
 
 const transitionModeLabel = (mode) =>
@@ -482,7 +648,7 @@ const transitionModeLabel = (mode) =>
   })[mode] || mode
 
 async function runTaskScriptReview() {
-  if (!script.value?.content) return
+  if (!script.value?.content || isPipelineRunning.value) return
   reviewingScript.value = true
   try {
     customScriptReview.value = await craftApi.reviewScript({
@@ -498,25 +664,107 @@ async function runTaskScriptReview() {
 }
 
 async function runTaskScriptDoctor() {
-  if (!script.value?.content) return
+  if (!script.value?.content || isPipelineRunning.value) return
   doctoringScript.value = true
   try {
     const res = await craftApi.doctorScript({
       script_text: script.value.content,
       title: script.value.title || '',
       task_id: taskId.value,
+      duration: Number(task.value?.duration) || 60,
       save_to_task: true,
     })
     if (res.polished_script && script.value) {
       script.value = { ...script.value, content: res.polished_script }
+      scriptDoctoredPendingRerun.value = true
     }
     if (res.after_review) {
       customScriptReview.value = res.after_review
     }
+    ElMessage.success(
+      isSeriesTask.value
+        ? '精修剧本已保存（如需按新剧本重新拍片，请回到连载工作台重生成本集）'
+        : '精修剧本已保存！点击「应用精修剧本并从分镜重跑」即可按新剧本重拆镜头'
+    )
   } catch (e) {
     connectionIssue.value = e.message || '剧本医生精修失败'
   } finally {
     doctoringScript.value = false
+  }
+}
+
+async function applyPolishedAndRerun() {
+  try {
+    await ElMessageBox.confirm(
+      '将保留当前创意方案与刚精修好的剧本，清理旧分镜和首帧/配音，从 Step 03 分镜设计开始重新制作。确认继续？',
+      '应用精修剧本重跑',
+      { type: 'warning', confirmButtonText: '确认重跑', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  rerunningFromStoryboard.value = true
+  connectionIssue.value = ''
+  try {
+    await videoApi.rerunFromStoryboard(taskId.value)
+    scriptDoctoredPendingRerun.value = false
+    manualMediaBust.value = Date.now()
+    mediaRev.value = manualMediaBust.value
+    if (task.value) {
+      task.value = { ...task.value, status: 'storyboarding', progress: 28 }
+    }
+    selected.value = ''
+    ElMessage.success('已按精修剧本重新拆镜并启动生成')
+    refreshNow()
+  } catch (e) {
+    connectionIssue.value = e.message || '从分镜重跑失败'
+  } finally {
+    rerunningFromStoryboard.value = false
+  }
+}
+
+async function saveAllCastCards() {
+  if (!taskId.value || !implicitCastCards.value.length) return
+  savingAllCast.value = true
+  castSaveFeedback.value = ''
+  try {
+    const res = await videoApi.saveCastCardsToLibrary(taskId.value, {})
+    if (res?.implicit_cast_cards && task.value) {
+      task.value = {
+        ...task.value,
+        metadata: { ...(task.value.metadata || {}), implicit_cast_cards: res.implicit_cast_cards },
+      }
+    }
+    const count = (res?.saved || []).length
+    castSaveFeedback.value = count > 0
+      ? `✅ 已将 ${count} 位角色设定卡（含裁切正面肖像 + 四视图）存入「角色资产库」`
+      : '未能找到可入库的设定卡图片'
+    ElMessage.success(castSaveFeedback.value)
+  } catch (e) {
+    castSaveFeedback.value = e.message || '存入角色资产库失败'
+    ElMessage.error(castSaveFeedback.value)
+  } finally {
+    savingAllCast.value = false
+  }
+}
+
+async function saveSingleCastCard(card) {
+  if (!taskId.value || !card?.card_id) return
+  savingCardId.value = card.card_id
+  castSaveFeedback.value = ''
+  try {
+    const res = await videoApi.saveCastCardsToLibrary(taskId.value, { card_id: card.card_id })
+    if (res?.implicit_cast_cards && task.value) {
+      task.value = {
+        ...task.value,
+        metadata: { ...(task.value.metadata || {}), implicit_cast_cards: res.implicit_cast_cards },
+      }
+    }
+    ElMessage.success(`已将「${card.name}」存入角色资产库`)
+  } catch (e) {
+    ElMessage.error(e.message || '存入角色资产库失败')
+  } finally {
+    savingCardId.value = null
   }
 }
 
@@ -531,6 +779,8 @@ async function retryVoice(scene) {
       rerun_type: 'voice',
       ...(scene.dialogue_lines?.length ? {} : { voiceover: scene.voiceover }),
     })
+    manualMediaBust.value = Date.now()
+    mediaRev.value = manualMediaBust.value
     scenes.value = await videoApi.getStoryboard(taskId.value)
     voiceFeedback.value = { sceneId: scene.scene_id, text: '配音已保存，可以继续。' }
   } catch (error) {
@@ -548,6 +798,8 @@ async function rerunShotImage(scene) {
       rerun_type: 'image',
       prompt: scene.image_prompt,
     })
+    manualMediaBust.value = Date.now()
+    mediaRev.value = manualMediaBust.value
     scenes.value = await videoApi.getStoryboard(taskId.value)
     voiceFeedback.value = { sceneId: scene.scene_id, text: '首帧已重新生成。' }
   } catch (error) {
@@ -565,6 +817,8 @@ async function rerunShotEndFrame(scene) {
       rerun_type: 'end_frame',
       prompt: scene.end_state || scene.last_frame_for_transition || scene.visual_description,
     })
+    manualMediaBust.value = Date.now()
+    mediaRev.value = manualMediaBust.value
     scenes.value = await videoApi.getStoryboard(taskId.value)
     voiceFeedback.value = { sceneId: scene.scene_id, text: '尾帧控制图已生成，后续生成或重拍视频将锁定起止双帧。' }
   } catch (error) {
@@ -585,6 +839,8 @@ async function rerunCastCard(card) {
         metadata: { ...(task.value.metadata || {}), implicit_cast_cards: res.implicit_cast_cards },
       }
     }
+    manualMediaBust.value = Date.now()
+    mediaRev.value = manualMediaBust.value
     refreshNow()
   } catch (error) {
     connectionIssue.value = error.message || '重绘设定卡失败'
@@ -743,9 +999,22 @@ const statusLabel = computed(() => ({
 }[status.value] || '正在制作'))
 const progress = computed(() => Math.max(0, Math.min(100, Number(task.value?.progress) || 0)))
 const failure = computed(() => status.value === 'failed' ? task.value?.metadata?.last_error || '生成中断，可以从当前进度继续。' : '')
-const mediaUrl = path => path ? '/' + path.replace(/^backend\//, '').replace(/^\/+/, '') : ''
-const finalVideo = computed(() => mediaUrl(task.value?.metadata?.video_path || task.value?.video_path))
-const subtitleFile = computed(() => mediaUrl(task.value?.metadata?.subtitle_path || task.value?.subtitle_path))
+const mediaUrl = (path, version = '') => {
+  if (!path) return ''
+  const base = '/' + String(path).replace(/^backend\//, '').replace(/^\/+/, '')
+  const ver = version === 0 || version ? String(version).trim() : ''
+  return ver ? `${base}${base.includes('?') ? '&' : '?'}v=${encodeURIComponent(ver)}` : base
+}
+const sceneMediaVer = scene => {
+  const base = scene?.image_version || scene?.updated_at || ''
+  return manualMediaBust.value ? (base ? `${base}-${manualMediaBust.value}` : String(manualMediaBust.value)) : base
+}
+const videoMediaVer = scene => {
+  const base = scene?.video_version || ''
+  return manualMediaBust.value ? (base ? `${base}-${manualMediaBust.value}` : String(manualMediaBust.value)) : base
+}
+const finalVideo = computed(() => mediaUrl(task.value?.metadata?.video_path || task.value?.video_path, task.value?.updated_at || mediaRev.value))
+const subtitleFile = computed(() => mediaUrl(task.value?.metadata?.subtitle_path || task.value?.subtitle_path, task.value?.updated_at || mediaRev.value))
 const shotTimes = computed(() => {
   let elapsed = 0
   const timestamp = seconds => String(Math.floor(seconds / 60)).padStart(2, '0') + ':' + String(seconds % 60).padStart(2, '0')
@@ -805,6 +1074,9 @@ watch(taskId, (id, _, onCleanup) => {
   script.value = null
   selected.value = ''
   connectionIssue.value = ''
+  customScriptReview.value = null
+  scriptDoctoredPendingRerun.value = false
+  castSaveFeedback.value = ''
 
   async function refresh() {
     if (!id || disposed || refreshing) return
@@ -817,7 +1089,11 @@ watch(taskId, (id, _, onCleanup) => {
       ])
       if (disposed) return
       if (detail.status === 'fulfilled') {
+        const prevUpdated = task.value?.updated_at
         task.value = detail.value
+        if (detail.value?.updated_at && detail.value.updated_at !== prevUpdated) {
+          mediaRev.value = Date.now()
+        }
         connectionIssue.value = ''
       } else {
         connectionIssue.value = '暂时无法读取进度，页面会自动重试。'
@@ -853,6 +1129,7 @@ async function resume() {
   try {
     await videoApi.runPipeline(id, true)
     if (taskId.value === id) {
+      mediaRev.value = Date.now()
       task.value = { ...task.value, status: 'starting' }
       selected.value = ''
       refreshNow()
@@ -866,8 +1143,8 @@ async function resume() {
 </script>
 
 <style scoped>
-.studio { --ink: #192131; --muted: #647184; --line: #e2e8f0; --accent: #baf873; max-width: 1480px; margin: auto; color: var(--ink); }
-.studio-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(165px, 235px); gap: 32px; align-items: center; padding: clamp(24px, 4vw, 52px); margin-bottom: 24px; border-radius: 24px; color: #f6f8ff; background: radial-gradient(ellipse at 94% 10%, #38506a 0%, transparent 55%), linear-gradient(125deg, #101b30, #20304b); box-shadow: 0 15px 32px #192c4722; overflow: hidden; }
+.studio { --ink: var(--va-ink); --muted: var(--va-ink-muted); --line: var(--va-border); --accent: var(--va-studio-accent); max-width: 1480px; margin: auto; color: var(--ink); }
+.studio-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(165px, 240px); gap: 32px; align-items: center; padding: clamp(24px, 3.6vw, 44px); margin-bottom: 22px; border-radius: var(--va-radius-xl); border: 1px solid rgba(148, 163, 184, 0.16); color: #f8fafc; background: radial-gradient(ellipse at 92% 12%, rgba(59, 130, 246, 0.3) 0%, transparent 56%), linear-gradient(128deg, #0d1526 0%, #16233b 55%, #1d2f4e 100%); box-shadow: var(--va-shadow-lg); overflow: hidden; }
 .eyebrow { display: inline-flex; gap: 9px; align-items: center; font-size: 11px; font-weight: 750; letter-spacing: .15em; color: #4b627b; }
 .studio-hero .eyebrow { color: #b8c7db; }
 .signal { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: #94a3b8; }
@@ -920,15 +1197,16 @@ h1, h2, h3, p { margin: 0; }
 .steps { list-style: none; padding: 0 10px 12px; margin: 0; }
 .steps button { display: grid; grid-template-columns: 30px 1fr auto; width: 100%; gap: 9px; align-items: center; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 9px; color: var(--ink); font: inherit; cursor: pointer; }
 .steps button:hover { background: #f2f6fb; }
-.steps .selected { background: #eaf1fc; border-color: #d7e5fa; }
+.steps .selected { background: var(--va-brand-soft); border-color: var(--va-brand-border); }
 .stage, .shot { scroll-margin-top: 16px; }
-.stage-selected { border-color: #818cf8; box-shadow: 0 0 0 2px #e0e7ff; }
-.stage-selected #stage-title { color: #312e81; font-weight: 800; }
-.stage-selected .stage-header p { font-weight: 650; }
-.shot-body .selected-output { background: #eef2ff; color: #312e81; border-radius: 6px; padding: 8px 10px; font-weight: 650; }
-.shot-media.focused-media { outline: 3px solid #818cf8; outline-offset: 3px; }
+.stage-selected { border-color: var(--va-brand-border); box-shadow: 0 0 0 2px #dbeafe; }
+.stage-selected #stage-title { color: var(--va-brand-hover); font-weight: 800; }
+.stage-selected .stage-header p { font-weight: 600; }
+.shot-body .selected-output { background: var(--va-brand-soft); color: #1e3a8a; border-radius: 8px; padding: 8px 10px; font-weight: 600; }
+.shot-media.focused-media { outline: 3px solid var(--va-brand); outline-offset: 3px; }
 .voice-output { margin-top: 8px; }
-.copy-prompt { margin: 8px 8px 0 0; padding: 5px 9px; border: 1px solid #a5b4fc; border-radius: 6px; background: white; color: #3730a3; cursor: pointer; font-size: 12px; }
+.copy-prompt { margin: 8px 8px 0 0; padding: 5px 10px; border: 1px solid var(--va-border-strong); border-radius: 7px; background: white; color: var(--va-ink-secondary); cursor: pointer; font-size: 12px; font-weight: 600; transition: border-color 0.15s ease, color 0.15s ease; }
+.copy-prompt:hover:not(:disabled) { border-color: var(--va-brand); color: var(--va-brand); background: var(--va-brand-soft); }
 .prompt-version pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-weight: 400; }
 .step-index { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 7px; background: #edf1f6; font-size: 11px; font-weight: 750; color: #58677d; }
 .steps .success .step-index { background: #e5f5eb; color: #276342; }
@@ -952,11 +1230,17 @@ h1, h2, h3, p { margin: 0; }
 .badge.ref-badge { background: #f3e8ff; color: #6b21a8; }
 .notice { padding: 14px 17px; border-radius: 10px; margin-bottom: 18px; overflow-wrap: anywhere; }
 .timeline { margin-top: 18px; }
+.timeline-heading-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.timeline-refresh-btn { margin: 0; }
 .empty { padding: 24px; color: var(--muted); border-top: 1px dashed var(--line); }
 .shot { display: grid; grid-template-columns: minmax(125px, 185px) minmax(0, 1fr); gap: 16px; padding: 16px 23px; border-top: 1px solid var(--line); transition: background-color 0.25s ease; }
 .shot.shot-highlighted { background: #fefce8; box-shadow: inset 4px 0 0 #eab308; }
 .shot-media { align-self: start; display: grid; place-items: center; aspect-ratio: 4 / 3; background: #17253b; border-radius: 9px; overflow: hidden; }
+.shot-media.is-portrait { aspect-ratio: 9 / 16; width: 132px; justify-self: center; }
 .shot-media video, .shot-media img { display: block; width: 100%; height: 100%; max-height: 184px; object-fit: contain; }
+.shot-media.is-portrait video, .shot-media.is-portrait img { max-height: 235px; object-fit: cover; }
+.thumb-trigger { display: block; width: 100%; height: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.cast-thumb-trigger { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
 .frame-placeholder { display: grid; place-items: center; gap: 7px; color: #afbed3; }
 .frame-placeholder span { font-size: 26px; }
 .shot-title { display: flex; gap: 12px; align-items: center; margin-bottom: 7px; }
@@ -976,7 +1260,7 @@ h1, h2, h3, p { margin: 0; }
 .links a, .summary a { color: #234f84; font-weight: 700; }
 button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid #326eb1; outline-offset: 3px; }
 @media (max-width: 980px) { .studio-grid { grid-template-columns: 1fr; } .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); } }
-@media (max-width: 620px) { .studio-hero, .shot { grid-template-columns: 1fr; gap: 14px; } .hero-progress { padding-left: 0; border-left: none; } .shot-media { aspect-ratio: 16 / 9; } .section-heading, .stage-header, .shot { padding-left: 14px; padding-right: 14px; } .stage-output { margin-left: 14px; margin-right: 14px; } }
+@media (max-width: 620px) { .studio-hero, .shot { grid-template-columns: 1fr; gap: 14px; } .hero-progress { padding-left: 0; border-left: none; } .shot-media { aspect-ratio: 16 / 9; } .shot-media.is-portrait { aspect-ratio: 9 / 16; width: min(190px, 100%); } .section-heading, .stage-header, .shot { padding-left: 14px; padding-right: 14px; } .stage-output { margin-left: 14px; margin-right: 14px; } }
 @media (max-width: 620px) {
   .steps { display: flex; overflow-x: auto; scroll-snap-type: x proximity; gap: 5px; }
   .steps li { flex: 0 0 auto; scroll-snap-align: start; }
@@ -984,18 +1268,55 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
   .step-status { grid-column: 2; }
 }
 @media (prefers-reduced-motion: reduce) { .meter div { transition: none; } }
-.story-section-label { margin:14px 20px 0; padding:9px 12px; border-radius:8px; background:#eef2ff; color:#3730a3; font-weight:650; font-size:13px; }
-.script-head-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
-.script-doctor-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.story-section-label { margin:14px 20px 0; padding:9px 12px; border-radius:8px; background:var(--va-brand-soft); color:var(--va-brand-hover); font-weight:650; font-size:13px; }
+.script-head-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.script-doctor-btns { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.script-doctor-btns button:disabled { opacity: 0.55; cursor: not-allowed; }
+.script-tools-hint { font-size: 12px; color: var(--muted); margin: 0 0 10px !important; }
 .script-review-box { margin-top: 12px; padding: 12px 14px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; }
 .script-review-summary { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; color: #92400e; }
 .blocking-line { margin: 4px 0 6px; padding: 4px 8px; background: #eff6ff; border-left: 3px solid #3b82f6; border-radius: 4px; color: #1e3a8a !important; font-size: 12px !important; }
 .cast-cards-panel { margin-top: 18px; }
+.cast-cards-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.cast-cards-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cast-save-feedback { margin: 0 23px 12px; padding: 8px 12px; border-radius: 8px; background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; font-size: 13px; }
 .cast-cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; padding: 0 23px 20px; }
 .cast-card-item { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #f8fafc; }
 .cast-card-item img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #efefef; }
-.cast-card-meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 12px; font-size: 13px; }
+.cast-card-meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 12px; font-size: 13px; flex-wrap: wrap; }
+.cast-card-btns { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .cast-card-meta small { color: var(--muted); }
 .end-frame-preview { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.end-frame-trigger { padding: 0; border: 0; background: transparent; cursor: zoom-in; line-height: 0; }
 .end-frame-preview img { width: 48px; height: 28px; object-fit: cover; border-radius: 4px; border: 1px solid #cbd5e1; }
+.media-lightbox {
+  margin: auto;
+  max-width: min(92vw, 960px);
+  max-height: 90dvh;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 16px;
+  background: #0f172a;
+  color: #f8fafc;
+  box-shadow: 0 24px 64px rgba(2, 6, 23, 0.55);
+}
+.media-lightbox:modal { overscroll-behavior: contain; }
+.media-lightbox::backdrop {
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(4px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+.lightbox-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.lightbox-head h3 { font-size: 15px; color: #f8fafc; }
+.lightbox-close-btn { margin: 0; }
+.lightbox-img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(90dvh - 84px);
+  margin: auto;
+  border-radius: 10px;
+  object-fit: contain;
+  background: #020617;
+}
 </style>

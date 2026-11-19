@@ -90,7 +90,7 @@ class SeriesService:
         from services.character_service import character_service
         characters = await character_service.get_confirmed_profiles(payload.character_ids)
         sid = 'series_' + uuid4().hex[:16]
-        dump = payload.model_dump(exclude={'initial_episodes'})
+        dump = payload.model_dump(exclude={'initial_episodes', 'first_episode_task_id'})
         project = {'_id': sid, 'series_id': sid, **dump, 'characters': copy.deepcopy(characters),
                    'status': 'draft', 'outline_revision': 1, 'outline_confirmed': False,
                    'stop_requested': False, 'created_at': now(), 'updated_at': now(), 'episodes': []}
@@ -103,7 +103,14 @@ class SeriesService:
                 normalized = normalize_outline(payload.initial_episodes, payload.total_episodes)
                 for old, new in zip(project['episodes'], normalized):
                     old.update(new, status='pending')
+                project['outline_confirmed'] = True
+                project['status'] = 'ready'
             except ValueError:
+                pass
+        if payload.first_episode_task_id:
+            try:
+                await self._attach_task_to_episode(project, 1, payload.first_episode_task_id)
+            except (LookupError, ValueError):
                 pass
         await mongodb.insert_one(PROJECTS, project)
         if payload.generation_limit is not None:
@@ -111,6 +118,146 @@ class SeriesService:
 
             await set_limit('series', sid, payload.generation_limit)
         return public(project)
+
+    async def _build_and_store_episode_snapshot(self, project: dict, episode: dict, *, allow_vision: bool = True) -> dict:
+        sid = project['series_id']
+        scenes = await mongodb.find_many(
+            'scenes',
+            {'task_id': episode['task_id']},
+            limit=200,
+            sort_field='scene_index',
+            sort_direction=1,
+        )
+        last = scenes[-1] if scenes else {}
+        frame_path = None
+        if last.get('last_frame_path'):
+            raw = Path(last['last_frame_path'])
+            candidate = (raw if raw.is_absolute() else BACKEND.parent / raw).resolve()
+            if candidate.is_file() and any(
+                candidate.is_relative_to((BACKEND / directory / episode['task_id']).resolve())
+                for directory in ['assets', 'outputs']
+            ):
+                frame_path = candidate.relative_to(BACKEND.parent).as_posix()
+        if not frame_path:
+            final = BACKEND / 'outputs' / episode['task_id'] / 'final.mp4'
+            if final.is_file():
+                from services.media_quality import extract_tail
+
+                destination = final.with_name(f'ending-{episode["revision"]}.png')
+                try:
+                    await asyncio.to_thread(extract_tail, final, destination)
+                    if destination.is_file():
+                        frame_path = destination.relative_to(BACKEND.parent).as_posix()
+                except (OSError, RuntimeError, ValueError):
+                    pass
+        planned = {
+            'ending_hook': episode.get('ending_hook') or '',
+            'core_event': episode.get('core_event') or '',
+            'actual_duration': sum(int(s.get('duration') or 0) for s in scenes),
+            'last_scene_start_state': last.get('start_state'),
+            'last_scene_end_state': last.get('effective_end_state', last.get('end_state')),
+            'last_scene_blocking': last.get('blocking'),
+            'ending_dialogue': last.get('voiceover'),
+            'note': '根据大纲和分镜形成的计划状态，尚未进行实际画面观察；请人工补充确认。',
+        }
+        snapshot_id = 'snapshot_' + uuid4().hex[:16]
+        snapshot = {
+            '_id': snapshot_id,
+            'snapshot_id': snapshot_id,
+            'series_id': sid,
+            'episode_num': episode['episode_num'],
+            'revision': episode['revision'],
+            'source_task_id': episode['task_id'],
+            'source_kind': 'planned',
+            'status': 'draft',
+            'planned_state': planned,
+            'observed_state': None,
+            'source_frame_path': frame_path,
+            'state': planned,
+            'created_at': now(),
+        }
+        if allow_vision:
+            from services.video_vision import review_enabled, observe_episode_ending, ending_is_verified
+
+            if last.get('video_path') and review_enabled():
+                try:
+                    observation = await asyncio.to_thread(
+                        observe_episode_ending, last['video_path'], float(last['duration']), planned
+                    )
+                    snapshot[' _verified'] = ending_is_verified(planned, observation)
+                    snapshot.update(
+                        source_kind='observed',
+                        observed_state=observation.get('observed_state'),
+                        observation=observation,
+                    )
+                except Exception:
+                    snapshot['observation_error'] = '画面观察未完成，请人工对照成片确认。'
+        verified = bool(snapshot.pop(' _verified', False))
+        await mongodb.insert_one(SNAPSHOTS, snapshot)
+        return {**snapshot, '_verified': verified}
+
+    async def _attach_task_to_episode(self, project: dict, episode_num: int, task_id: str) -> None:
+        if not 1 <= episode_num <= len(project['episodes']):
+            raise ValueError('集号超出项目范围')
+        task = await task_service.get_task(task_id)
+        if not task:
+            raise LookupError('要关联的单集任务不存在')
+        episode = project['episodes'][episode_num - 1]
+        if not str(episode.get('title') or '').strip():
+            raw_topic = str(task.get('topic') or task.get('user_input') or f'第{episode_num}集').strip()
+            episode['title'] = raw_topic.splitlines()[0][:60]
+        for field, fallback in (
+            ('opening_hook', str(task.get('topic') or '开场核心冲突')[:120]),
+            ('core_event', str(task.get('user_input') or task.get('topic') or '主线冲突推进')[:160]),
+            ('ending_hook', '待确认本集结尾状态与下集钩子'),
+        ):
+            if not str(episode.get(field) or '').strip():
+                episode[field] = fallback
+        episode['task_id'] = task_id
+        context = {
+            'episode_outline': {k: episode[k] for k in ['episode_num', 'title', 'opening_hook', 'core_event', 'ending_hook']},
+            'characters': project['characters'],
+            'previous_snapshot': None,
+            'continuity_ledgers': project.get('continuity_ledgers'),
+            'market_mode': project.get('market_mode', 'cn'),
+            'outline_revision': project['outline_revision'],
+            'episode_revision': episode['revision'],
+        }
+        await mongodb.update_one(
+            'video_tasks',
+            {'_id': task_id},
+            {
+                'series_id': project['series_id'],
+                'episode_num': episode_num,
+                'series_context': context,
+                'metadata.series_context': context,
+            },
+        )
+        t_status = str(task.get('status') or '')
+        if t_status == 'success':
+            snap_res = await self._build_and_store_episode_snapshot(project, episode, allow_vision=False)
+            episode.update(status='needs_confirmation', output_snapshot_id=snap_res['snapshot_id'])
+            if project.get('outline_confirmed'):
+                project['status'] = 'awaiting_confirmation'
+        elif t_status == 'awaiting_shoot_review':
+            episode['status'] = 'awaiting_shoot_review'
+            if project.get('outline_confirmed'):
+                project['status'] = 'awaiting_shoot_review'
+        elif t_status == 'failed':
+            episode['status'] = 'failed'
+        else:
+            episode['status'] = 'pending'
+
+    async def bind_episode_task(self, sid: str, episode_num: int, task_id: str):
+        project = await self._claim(sid)
+        try:
+            prior = project['_prior_status']
+            await self._attach_task_to_episode(project, episode_num, task_id)
+            target_status = project['status'] if project['status'] != 'editing' else prior
+            return await self._save(project, target_status)
+        except Exception:
+            await self._release_error(project)
+            raise
 
     async def update_ledgers(self, sid: str, continuity_ledgers: dict):
         project = await self._claim(sid)
@@ -329,55 +476,11 @@ class SeriesService:
                     return
                 if not isinstance(result, dict) or result.get('status') != 'success':
                     raise RuntimeError(str(result.get('message', result.get('error', '单集生成失败'))) if isinstance(result, dict) else '单集生成失败')
-                scenes = await mongodb.find_many('scenes', {'task_id': episode['task_id']}, limit=200, sort_field='scene_index', sort_direction=1)
-                last = scenes[-1] if scenes else {}
-                frame_path = None
-                if last.get('last_frame_path'):
-                    raw = Path(last['last_frame_path'])
-                    candidate = (raw if raw.is_absolute() else BACKEND.parent / raw).resolve()
-                    if candidate.is_file() and any(candidate.is_relative_to((BACKEND / directory / episode['task_id']).resolve())
-                                                   for directory in ['assets', 'outputs']):
-                        frame_path = candidate.relative_to(BACKEND.parent).as_posix()
-                if not frame_path:
-                    final = BACKEND / 'outputs' / episode['task_id'] / 'final.mp4'
-                    if final.is_file():
-                        from services.media_quality import extract_tail
-
-                        destination = final.with_name(f'ending-{episode["revision"]}.png')
-                        try:
-                            await asyncio.to_thread(extract_tail, final, destination)
-                            if destination.is_file():
-                                frame_path = destination.relative_to(BACKEND.parent).as_posix()
-                        except (OSError, RuntimeError, ValueError):
-                            pass
-                planned = {'ending_hook': episode['ending_hook'], 'core_event': episode['core_event'],
-                           'actual_duration': sum(int(s.get('duration') or 0) for s in scenes),
-                           'last_scene_start_state': last.get('start_state'),
-                           'last_scene_end_state': last.get('effective_end_state', last.get('end_state')),
-                           'last_scene_blocking': last.get('blocking'),
-                           'ending_dialogue': last.get('voiceover'),
-                           'note': '根据大纲和分镜形成的计划状态，尚未进行实际画面观察；请人工补充确认。'}
-                snapshot_id = 'snapshot_' + uuid4().hex[:16]
-                snapshot = {'_id': snapshot_id, 'snapshot_id': snapshot_id, 'series_id': sid,
-                    'episode_num': episode['episode_num'], 'revision': episode['revision'], 'source_task_id': episode['task_id'],
-                    'source_kind': 'planned', 'status': 'draft', 'planned_state': planned, 'observed_state': None,
-                    'source_frame_path': frame_path, 'state': planned, 'created_at': now()}
-                from services.video_vision import review_enabled, observe_episode_ending, ending_is_verified
-
-                verified = False
-                if last.get('video_path') and review_enabled():
-                    try:
-                        observation = await asyncio.to_thread(
-                            observe_episode_ending, last['video_path'], float(last['duration']), planned
-                        )
-                        verified = ending_is_verified(planned, observation)
-                        snapshot.update(
-                            source_kind='observed', observed_state=observation.get('observed_state'),
-                            observation=observation,
-                        )
-                    except Exception:
-                        snapshot['observation_error'] = '画面观察未完成，请人工对照成片确认。'
-                await mongodb.insert_one(SNAPSHOTS, snapshot)
+                snap_res = await self._build_and_store_episode_snapshot(project, episode, allow_vision=True)
+                verified = bool(snap_res.pop('_verified', False))
+                snapshot_id = snap_res['snapshot_id']
+                snapshot = snap_res
+                planned = snapshot['planned_state']
                 episode.update(status='needs_confirmation', output_snapshot_id=snapshot_id)
                 project.pop('error', None)
                 current = await self.require(sid)

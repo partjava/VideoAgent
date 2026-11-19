@@ -1,13 +1,18 @@
 <template>
   <BasicLayout>
     <div class="craft-page">
-      <div class="craft-hero">
+      <div class="craft-hero va-studio-hero">
         <div>
-          <span class="craft-badge">SHORT-DRAMA STUDIO · AI 短剧全流程导演工坊</span>
+          <span class="va-eyebrow">SHORT-DRAMA STUDIO · AI 短剧全流程导演工坊</span>
           <h1>AI 短剧全流程导演与审稿工坊</h1>
           <p>
             由你配置的语言模型与生图模型实时驱动：长文/小说 AI 原创拆剧（中文/英文双模式）、AI 剧本五维审稿与深度重写、AI 场景 3×3 九宫格与道具四视图生成及直接出图、视频动作链 AI 升级与安全清洗。
           </p>
+          <div class="craft-flow-pills" aria-label="工坊工作流">
+            <span><b>①</b> 上游小说拆剧</span>
+            <span><b>②</b> 角色入库与母版生图</span>
+            <span><b>③</b> 一键建连载 / 单集直拍</span>
+          </div>
         </div>
       </div>
 
@@ -59,10 +64,18 @@
               </el-form-item>
               <el-form-item label="单集时长范围" class="flex-1">
                 <el-select v-model="craftRangePreset" @change="applyCraftRange">
-                  <el-option value="30-60" label="30–60 秒（快节奏）" />
-                  <el-option value="45-90" label="45–90 秒（标准短剧）" />
-                  <el-option value="60-120" label="60–120 秒（完整冲突）" />
+                  <el-option value="15-30" label="15–30 秒（超短快节奏）" />
+                  <el-option value="30-60" label="30–60 秒（标准短剧）" />
+                  <el-option value="45-90" label="45–90 秒（强冲突推荐）" />
+                  <el-option value="60-120" label="60–120 秒（完整叙事）" />
+                  <el-option value="custom" label="自定义范围" />
                 </el-select>
+                <div v-if="craftRangePreset === 'custom'" class="custom-craft-range">
+                  <el-input-number v-model="novelForm.episode_duration_min" :min="10" :max="180" :step="5" size="small" controls-position="right" />
+                  <span>~</span>
+                  <el-input-number v-model="novelForm.episode_duration_max" :min="10" :max="180" :step="5" size="small" controls-position="right" />
+                  <span>秒</span>
+                </div>
               </el-form-item>
             </div>
 
@@ -117,7 +130,12 @@
             <el-card shadow="never" class="sub-card next-step-banner">
               <div class="card-title-row" style="margin-bottom: 8px">
                 <div>
-                  <h3>🎬 已生成可拍全案：《{{ novelResult.title }}》—— 下一步去拍视频</h3>
+                  <h3>
+                    🎬 已生成可拍全案：《{{ novelResult.title }}》
+                    <el-tag size="small" type="info" style="margin-left: 8px">
+                      单集目标：{{ novelResult.episode_duration_min || novelForm.episode_duration_min }}–{{ novelResult.episode_duration_max || novelForm.episode_duration_max }} 秒
+                    </el-tag>
+                  </h3>
                   <p class="muted">
                     拆剧结果已自动保存到本机草稿，切换去「角色资产」或「创建视频」再回来也不会消失。你可以直接用第 1 集拍单集视频，或一键建连载追剧。
                   </p>
@@ -239,9 +257,9 @@
                       💰 付费卡点集 · {{ ep.paywall_reason }}
                     </el-tag>
                   </div>
-                  <p><strong>0-3s 开场钩子：</strong>{{ ep.opening_hook }}</p>
-                  <p><strong>15-85s 核心交锋与当集结算：</strong>{{ ep.core_event }}</p>
-                  <p><strong>85-110s 断章钩子：</strong>{{ ep.ending_hook }}</p>
+                  <p><strong>开场钩子：</strong>{{ ep.opening_hook }}</p>
+                  <p><strong>中段交锋与当集结算：</strong>{{ ep.core_event }}</p>
+                  <p><strong>结尾断章钩子：</strong>{{ ep.ending_hook }}</p>
                 </div>
               </div>
             </el-card>
@@ -263,7 +281,7 @@
                     </el-button>
                   </div>
                 </div>
-                <pre class="code-box">{{ novelResult.first_episode_script }}</pre>
+                <pre class="code-box va-scroll">{{ novelResult.first_episode_script }}</pre>
               </el-card>
 
               <el-card shadow="never" class="sub-card">
@@ -654,6 +672,7 @@ import BasicLayout from "../layouts/BasicLayout.vue";
 import { craftApi } from "../api/craft";
 import { charactersApi } from "../api/characters";
 import { seriesApi } from "../api/series";
+import { videoApi } from "../api/video";
 
 const CRAFT_STORAGE_KEY = "videoagent_craft_workspace_v1";
 const PREFILL_VIDEO_KEY = "videoagent_prefill_task";
@@ -688,7 +707,15 @@ const novelForm = reactive({
   novel_text: "",
 });
 
+function syncCraftRangePresetFromForm() {
+  const lo = Number(novelForm.episode_duration_min || 45);
+  const hi = Number(novelForm.episode_duration_max || 90);
+  const key = `${lo}-${hi}`;
+  craftRangePreset.value = ["15-30", "30-60", "45-90", "60-120"].includes(key) ? key : "custom";
+}
+
 function applyCraftRange(preset) {
+  if (preset === "custom") return;
   const [lo, hi] = String(preset || "45-90").split("-").map(Number);
   if (lo && hi) {
     novelForm.episode_duration_min = lo;
@@ -752,6 +779,7 @@ function restoreDraft(draftId) {
   const draft = recentDecompositions.value.find((d) => d.id === draftId);
   if (!draft) return;
   Object.assign(novelForm, draft.form || {});
+  syncCraftRangePresetFromForm();
   novelResult.value = draft.result || null;
   importedCharacters.value = Array.isArray(draft.importedCharacters) ? [...draft.importedCharacters] : [];
   for (const k of Object.keys(renderedUrls)) delete renderedUrls[k];
@@ -884,6 +912,25 @@ async function createSeriesFromDecomposition() {
     const lo = Number(novelResult.value.episode_duration_min || novelForm.episode_duration_min || 45);
     const hi = Number(novelResult.value.episode_duration_max || novelForm.episode_duration_max || 90);
     const target = Number(novelResult.value.episode_duration || novelForm.episode_duration || Math.round((lo + hi) / 2));
+    let matchedFirstTaskId = null;
+    try {
+      const tasksData = await videoApi.listTasks();
+      const tasksList = Array.isArray(tasksData) ? tasksData : tasksData?.tasks || [];
+      const cleanTitle = String(novelResult.value.title || "").replace(/[《》\s]/g, "");
+      if (cleanTitle) {
+        const candidates = tasksList.filter(
+          (t) =>
+            t &&
+            t.task_id &&
+            !t.series_id &&
+            String(`${t.topic || ""} ${t.user_input || ""}`).replace(/[《》\s]/g, "").includes(cleanTitle)
+        );
+        const picked = candidates.find((t) => t.status === "success") || candidates[0];
+        if (picked) matchedFirstTaskId = picked.task_id;
+      }
+    } catch {
+      matchedFirstTaskId = null;
+    }
     const created = await seriesApi.create({
       title: novelResult.value.title,
       brief: novelForm.novel_text,
@@ -901,9 +948,20 @@ async function createSeriesFromDecomposition() {
       initial_episodes: novelResult.value.episodes_outline,
       continuity_ledgers: novelResult.value.continuity_ledgers,
       first_episode_script: novelResult.value.first_episode_script || null,
+      first_episode_task_id: matchedFirstTaskId,
     });
+    const ep1 = (created?.episodes || []).find((e) => e.episode_num === 1);
+    if (matchedFirstTaskId && (!ep1 || !ep1.task_id)) {
+      try {
+        await seriesApi.bindEpisodeTask(created.series_id || created.id, 1, matchedFirstTaskId);
+      } catch {
+        // ignore if already bound
+      }
+    }
     persistCraftWorkspace();
-    if (candidateIds.length && !confirmedIds.length) {
+    if (matchedFirstTaskId) {
+      ElMessage.success("连载短剧项目已创建，并已自动并入你生成的第 1 集视频！");
+    } else if (candidateIds.length && !confirmedIds.length) {
       ElMessage.success("连载短剧项目已创建（角色尚未在「角色资产」确认定妆照，暂按剧本造型创建）");
     } else {
       ElMessage.success("连载短剧项目已创建并带入本剧连续性台账");
@@ -1110,9 +1168,9 @@ const handbookTemplates = [
 【强制禁止项】严禁轴线翻转、严禁文学比喻（如端坐如钟）、严禁单人镜点名画外人、严禁反光道具过度发光。`,
   },
   {
-    title: "④ 短剧 15 秒四挡推进与台词写作规范",
-    summary: "前3秒冲突开场 + 强视觉 △ 动作密度控制 + 短句算账节奏",
-    content: `1. 单集四挡推进：0~15s 抓人立事（强视觉+具体数字/死线） → 15~45s 正面交锋 → 45~85s 亮牌翻转（当集结算，反派必付代价） → 85~110s 余波断章钩子。
+    title: "④ 短剧动态四挡推进与台词写作规范",
+    summary: "前3秒冲突开场 + 强视觉 △ 动作密度控制 + 短句算账节奏（按单集目标时长比例自动分配）",
+    content: `1. 单集四挡推进（按目标时长比例收束）：第一挡 抓人立事（强视觉+具体数字/死线） → 第二挡 正面交锋（≥2轮筹码博弈） → 第三挡 亮牌翻转（当集结算，反派必付代价） → 第四挡 余波断章钩子。
 2. 动作锚点密度：每 2~3 句对白必插一条强视觉 △（物理结果 / 身份反差 / 物证对抗），禁用“眼神微动、微微一怔、心里一紧”等不可拍心理词。
 3. 台词节奏：物证与大白话利害结论同轮直给；专业设定词当句翻译成“多少钱/判几年/谁输谁赢”；3~6字短句与8~16字算账句快慢变速；严禁书面套话。`,
   },
@@ -1134,7 +1192,10 @@ onMounted(() => {
     const saved = JSON.parse(raw);
     if (!saved || typeof saved !== "object") return;
     if (saved.activeTab) activeTab.value = saved.activeTab;
-    if (saved.novelForm) Object.assign(novelForm, saved.novelForm);
+    if (saved.novelForm) {
+      Object.assign(novelForm, saved.novelForm);
+      syncCraftRangePresetFromForm();
+    }
     if (saved.novelResult) novelResult.value = saved.novelResult;
     if (Array.isArray(saved.importedCharacters)) importedCharacters.value = saved.importedCharacters;
     if (saved.renderedUrls) Object.assign(renderedUrls, saved.renderedUrls);
@@ -1183,34 +1244,32 @@ watch(
   margin: 0 auto;
 }
 .craft-hero {
-  background: radial-gradient(ellipse at 90% 15%, #3b82f633 0%, transparent 55%),
-    linear-gradient(125deg, #0f172a, #1e293b);
-  color: #f8fafc;
-  padding: 28px 32px;
-  border-radius: 18px;
   margin-bottom: 20px;
 }
-.craft-badge {
-  display: inline-block;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  color: #a3e635;
-  margin-bottom: 8px;
+.craft-flow-pills {
+  display: flex;
+  flex-wrap: wrap;
+  flex-wrap: balance;
+  gap: 8px;
+  margin-top: 16px;
 }
-.craft-hero h1 {
-  margin: 0 0 8px;
-  font-size: 26px;
-  color: #f8fafc;
+.craft-flow-pills span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  color: #e2e8f0;
+  font-size: 0.78rem;
+  font-weight: 600;
 }
-.craft-hero p {
-  margin: 0;
-  color: #cbd5e1;
-  font-size: 14px;
-  line-height: 1.6;
+.craft-flow-pills b {
+  color: var(--va-studio-accent);
 }
 .craft-tabs {
-  border-radius: 14px;
+  border-radius: var(--va-radius-lg);
   overflow: hidden;
 }
 .tab-header-bar {
@@ -1355,17 +1414,22 @@ watch(
 }
 .two-col-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
   gap: 18px;
 }
+.two-col-grid > * {
+  min-inline-size: 0;
+}
 .code-box {
-  background: #0f172a;
+  background: #0d1526;
   color: #e2e8f0;
-  padding: 14px;
-  border-radius: 10px;
+  padding: 14px 16px;
+  border-radius: var(--va-radius-md);
+  border: 1px solid rgba(148, 163, 184, 0.16);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-size: 13px;
+  font-family: var(--va-mono);
+  font-size: 0.8125rem;
   line-height: 1.65;
   max-height: 360px;
   overflow-y: auto;
@@ -1524,47 +1588,55 @@ watch(
 }
 .handbook-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
   gap: 16px;
 }
 .draft-history-bar {
   display: flex;
   flex-wrap: wrap;
+  flex-wrap: balance;
   align-items: center;
   gap: 8px;
   padding: 10px 14px;
   margin-bottom: 14px;
-  background: #f8fafc;
-  border: 1px dashed #cbd5e1;
-  border-radius: 10px;
+  background: var(--va-surface-subtle);
+  border: 1px dashed var(--va-border-strong);
+  border-radius: var(--va-radius-md);
 }
 .draft-history-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: #475569;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--va-ink-secondary);
 }
 .draft-chip {
   padding: 4px 12px;
   border-radius: 999px;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--va-border-strong);
   background: #ffffff;
-  color: #334155;
-  font-size: 12px;
+  color: var(--va-ink-secondary);
+  font-size: 0.78rem;
+  font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
 }
 .draft-chip:hover {
-  border-color: #4f46e5;
-  color: #4f46e5;
+  border-color: var(--va-brand);
+  color: var(--va-brand);
+  background: var(--va-brand-soft);
 }
 .draft-chip.active {
-  background: #4f46e5;
-  border-color: #4f46e5;
+  background: var(--va-brand);
+  border-color: var(--va-brand);
   color: #ffffff;
-  font-weight: 600;
 }
 .next-step-banner {
-  background: linear-gradient(135deg, #eef2ff 0%, #f0fdf4 100%);
-  border: 1px solid #c7d2fe;
+  background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%);
+  border: 1px solid var(--va-brand-border) !important;
+}
+.custom-craft-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
 }
 </style>

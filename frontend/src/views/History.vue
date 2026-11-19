@@ -1,10 +1,11 @@
 <template>
   <BasicLayout>
     <div class="history-page" v-loading="loading">
-      <div class="header-intro">
+      <div class="header-intro va-workspace-header">
         <div>
+          <span class="va-eyebrow">TASK ARCHIVE · 历史任务</span>
           <h1 class="page-main-title">历史生成任务</h1>
-          <p class="page-subtitle">管理单次视频任务，支持断点续传、开拍前预审与成片复核。</p>
+          <p class="page-subtitle">管理单次视频任务，支持断点续传、开拍前预审、单镜微调与成片下载。</p>
         </div>
         <el-button tag="router-link" to="/series" type="primary" plain>查看连载项目库 →</el-button>
       </div>
@@ -12,10 +13,10 @@
       <!-- Filters & Actions Area -->
       <div class="filter-bar">
         <el-radio-group v-model="statusFilter" class="filter-radio-group">
-          <el-radio-button label="all">全部</el-radio-button>
-          <el-radio-button label="generating">进行中 / 待预审</el-radio-button>
-          <el-radio-button label="success">成功</el-radio-button>
-          <el-radio-button label="failed">失败</el-radio-button>
+          <el-radio-button label="all">全部 ({{ statusCounts.all }})</el-radio-button>
+          <el-radio-button label="generating">进行中 / 待预审 ({{ statusCounts.generating }})</el-radio-button>
+          <el-radio-button label="success">成功 ({{ statusCounts.success }})</el-radio-button>
+          <el-radio-button label="failed">失败 ({{ statusCounts.failed }})</el-radio-button>
         </el-radio-group>
       </div>
 
@@ -173,7 +174,17 @@ const formatDate = (dateStr) => {
   }
 }
 
-// Filtered list
+// Filtered list & status counters
+const statusCounts = computed(() => {
+  const list = tasksList.value
+  return {
+    all: list.length,
+    generating: list.filter(t => t.status !== 'success' && t.status !== 'failed' && t.status !== 'created').length,
+    success: list.filter(t => t.status === 'success').length,
+    failed: list.filter(t => t.status === 'failed').length,
+  }
+})
+
 const filteredTasksList = computed(() => {
   if (statusFilter.value === 'all') {
     return tasksList.value
@@ -291,35 +302,13 @@ onMounted(async () => {
 
 <style scoped>
 .history-page {
-  max-width: 1250px;
+  max-width: 1260px;
   margin: 0 auto;
-  padding: 8px 0;
-}
-
-.header-intro {
-  margin-bottom: 24px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 16px;
-}
-
-.page-main-title {
-  font-size: 26px;
-  font-weight: 800;
-  color: #0f172a;
-  margin: 0 0 8px 0;
-}
-
-.page-subtitle {
-  font-size: 14px;
-  color: #64748b;
-  margin: 0;
+  padding: 4px 0 20px;
 }
 
 .filter-bar {
-  margin-bottom: 20px;
+  margin-bottom: 18px;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -332,22 +321,27 @@ onMounted(async () => {
 }
 
 .table-card {
-  border-radius: 12px;
-  border: 1px solid #e2e8f0;
-  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.03);
+  border-radius: var(--va-radius-lg);
+  border: 1px solid var(--va-border);
+  box-shadow: var(--va-shadow-sm);
 }
 
 .custom-table {
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 
 .mono-text {
-  font-family: monospace;
-  color: #475569;
+  display: inline-block;
+  font-family: var(--va-mono);
+  font-size: 0.78rem;
+  color: var(--va-ink-secondary);
+  background: var(--va-surface-muted);
+  padding: 2px 7px;
+  border-radius: 6px;
 }
 
 .topic-text {
-  font-weight: 600;
-  color: #1e293b;
+  font-weight: 650;
+  color: var(--va-ink);
 }
 </style>

@@ -341,14 +341,25 @@ class StoryJudgeAgent:
                         after_review = audit_script_pacing_and_drama(
                             candidate, task_plan, allow_llm=allow_llm
                         )
-                        final_script = candidate
-                        final_review = after_review
-                        rewritten = True
-                        changes_made = [
-                            str(c).strip()
-                            for c in (rewritten_raw.get("changes_made") or [])
-                            if str(c).strip()
-                        ]
+                        before_score = int(before_review.get("overall_score") or 0)
+                        after_score = int(after_review.get("overall_score") or 0)
+                        before_high = sum(
+                            1 for iss in (before_review.get("issues") or [])
+                            if str(iss.get("severity") or "").lower() == "high"
+                        )
+                        after_high = sum(
+                            1 for iss in (after_review.get("issues") or [])
+                            if str(iss.get("severity") or "").lower() == "high"
+                        )
+                        if after_score >= before_score or after_high < before_high:
+                            final_script = candidate
+                            final_review = after_review
+                            rewritten = True
+                            changes_made = [
+                                str(c).strip()
+                                for c in (rewritten_raw.get("changes_made") or [])
+                                if str(c).strip()
+                            ]
             except Exception as exc:
                 print(f"[StoryJudgeAgent] Auto-rewrite skipped safely: {exc}", flush=True)
 

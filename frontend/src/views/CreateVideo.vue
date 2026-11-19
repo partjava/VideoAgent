@@ -1,17 +1,17 @@
 <template>
   <BasicLayout>
     <div class="create-video-page">
-      <div class="header-intro">
-        <span class="studio-label">VIDEO STUDIO / NEW PROJECT</span>
+      <div class="header-intro va-studio-hero">
+        <span class="va-eyebrow">VIDEO STUDIO · NEW EPISODE</span>
         <h1 class="page-main-title">一句话，开始拍片</h1>
         <p class="page-subtitle">
-          描述一个故事、科普主题或产品创意，接下来可以在工作台查看每一步。
-
+          描述一个故事创意，或直接粘贴剧本与角色设定。系统将完成脚本审稿、分镜设计、角色定妆锚点绘制、配音生成与视频合成，并支持开拍前逐镜预审。
         </p>
-      </div>
-
-      <div class="creation-flow" aria-label="制作流程">
-        <span>01 创意与脚本</span><span>02 分镜与素材</span><span>03 剪辑与导出</span>
+        <div class="creation-flow" aria-label="制作流程">
+          <span><b>01</b> 创意与脚本</span>
+          <span><b>02</b> 分镜与首帧</span>
+          <span><b>03</b> 配音、成片与质检</span>
+        </div>
       </div>
 
       <div class="form-wrapper">
@@ -63,27 +63,43 @@ const handleCreateTask = async (formData) => {
 
 <style scoped>
 .create-video-page {
-  padding: 16px 0;
+  max-inline-size: 1080px;
+  margin-inline: auto;
+  padding: 4px 0 24px;
 }
 
 .header-intro {
-  margin-bottom: 32px;
-  text-align: left;
-}
-
-.page-main-title {
-  font-size: 26px;
-  font-weight: 800;
-  color: #0f172a;
-  margin: 0 0 8px 0;
+  margin-bottom: 22px;
 }
 
 .page-subtitle {
-  font-size: 14px;
-  color: #64748b;
-  margin: 0;
-  line-height: 1.6;
-  max-width: 800px;
+  max-inline-size: 68ch;
+}
+
+.creation-flow {
+  display: flex;
+  flex-wrap: wrap;
+  flex-wrap: balance;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.creation-flow span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: #e2e8f0;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.creation-flow b {
+  color: var(--va-studio-accent);
+  font-variant-numeric: tabular-nums;
 }
 
 .form-wrapper {
@@ -92,13 +108,6 @@ const handleCreateTask = async (formData) => {
 
 .error-alert {
   margin-top: 16px;
-  border-radius: 8px;
+  border-radius: var(--va-radius-md);
 }
-.create-video-page { max-width: 1050px; margin: auto; }
-.header-intro { background: radial-gradient(ellipse at 94% 10%, #38506a 0%, transparent 55%), linear-gradient(125deg, #101b30, #20304b); padding: clamp(23px, 4vw, 46px); border-radius: 23px; }
-.studio-label { color: #baf873; font-size: 11px; font-weight: 750; letter-spacing: .16em; }
-.header-intro .page-main-title { color: #f6f8ff; font-size: clamp(26px, 4vw, 44px); margin: 9px 0 8px; }
-.header-intro .page-subtitle { color: #c2d0e4; line-height: 1.65; }
-.creation-flow { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
-.creation-flow span { padding: 7px 12px; background: #eaf1fc; color: #324c72; border-radius: 7px; font-size: 12px; font-weight: 650; }
 </style>

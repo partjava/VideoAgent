@@ -1,10 +1,12 @@
 <template>
   <BasicLayout>
     <div class="preview-page" v-loading="loading">
-      <!-- Title header -->
-      <div class="header-intro">
-        <h1 class="page-main-title">生成结果控制台</h1>
-        <p class="page-subtitle">您的短视频已合成完毕，可在线播放、按质检定位精修分镜并下载。</p>
+      <div class="header-intro va-workspace-header">
+        <div>
+          <span class="va-eyebrow">DELIVERY STUDIO · 成片预览与精修</span>
+          <h1 class="page-main-title">生成结果控制台</h1>
+          <p class="page-subtitle">您的短视频已合成完毕，可在线播放、按质检定位精修分镜并导出成片与字幕。</p>
+        </div>
       </div>
 
       <!-- Task Failed Error State -->
@@ -99,7 +101,7 @@
                 <div class="clip-overview">
                   <img
                     v-if="scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path"
-                    :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path)"
+                    :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path || scene.image_path, scene.image_version || scene.updated_at || previewVersion)"
                     alt="当前片段首帧"
                   />
                   <div>
@@ -165,11 +167,11 @@
                 />
                 <div v-if="scene.transition_type === 'continue_action'" class="handoff-frames">
                   <figure v-if="storyboardData.find(item => item.scene_index === scene.scene_index - 1)?.last_frame_path">
-                    <img :src="mediaUrl(storyboardData.find(item => item.scene_index === scene.scene_index - 1).last_frame_path)" alt="上一段实际尾帧" />
+                    <img :src="mediaUrl(storyboardData.find(item => item.scene_index === scene.scene_index - 1).last_frame_path, scene.updated_at || previewVersion)" alt="上一段实际尾帧" />
                     <figcaption>上一段当前尾帧</figcaption>
                   </figure>
                   <figure v-if="scene.actual_first_frame_path || scene.continuity_input_path">
-                    <img :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path)" :alt="scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧'" />
+                    <img :src="mediaUrl(scene.actual_first_frame_path || scene.continuity_input_path, scene.image_version || scene.updated_at || previewVersion)" :alt="scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧'" />
                     <figcaption>{{ scene.actual_first_frame_path ? '本段实际首帧' : '本段生成输入帧' }}</figcaption>
                   </figure>
                 </div>
@@ -184,7 +186,7 @@
                   <summary>运镜计划和动作时间点</summary>
                   <p v-if="scene.camera_plan">{{ scene.camera_plan.purpose }} · {{ scene.camera_plan.framing }} · {{ scene.camera_plan.focus }}</p>
                   <p v-if="scene.opening_frame_review?.reason">首帧检查：{{ scene.opening_frame_review.reason }}</p>
-                  <video v-if="scene.video_path" :id="'clip-' + scene.scene_id" :src="mediaUrl(scene.video_path)" controls playsinline preload="none" />
+                  <video v-if="scene.video_path" :id="'clip-' + scene.scene_id" :src="mediaUrl(scene.video_path, scene.updated_at || previewVersion)" controls playsinline preload="none" />
                   <div v-for="beat in scene.observed_handoff?.plan?.motion_beats || scene.motion_beats || []" :key="beat.start" class="cue-row">
                     <button type="button" @click="seekScene(scene, beat.start)">{{ beat.start }} 秒</button>
                     <span>{{ beat.action }}</span>
@@ -442,7 +444,12 @@ const seekScene = (scene, second) => {
   const player = document.getElementById('clip-' + scene.scene_id)
   if (player && Number.isFinite(Number(second))) player.currentTime = Number(second)
 }
-const mediaUrl = path => "/" + path.replace(/^backend\//, "")
+const mediaUrl = (path, version = '') => {
+  if (!path) return ''
+  const base = '/' + String(path).replace(/^backend\//, '').replace(/^\/+/, '')
+  const ver = version === 0 || version ? String(version).trim() : ''
+  return ver ? `${base}${base.includes('?') ? '&' : '?'}v=${encodeURIComponent(ver)}` : base
+}
 
 const handleRerunScene = async (scene, type) => {
   retryingSceneId.value = scene.scene_id
@@ -463,6 +470,7 @@ const handleRerunScene = async (scene, type) => {
     storyboardData.value = await videoApi.getStoryboard(taskId)
     const data = await videoApi.getTask(taskId)
     taskDetail.value = data
+    previewVersion.value = Date.now()
     if (res?.scene) {
       const idx = storyboardData.value.findIndex(s => s.scene_id === scene.scene_id)
       if (idx !== -1) {
@@ -694,15 +702,15 @@ onMounted(async () => {
 }
 
 .main-action-btn {
-  height: 46px;
-  font-weight: 600;
-  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  min-block-size: 44px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--va-brand) 0%, var(--va-brand-hover) 100%);
   border: none;
-  box-shadow: 0 4px 10px rgba(79, 70, 229, 0.2);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.24);
 }
 
 .main-action-btn:hover {
-  background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
+  background: linear-gradient(135deg, var(--va-brand-hover) 0%, #1e40af 100%);
 }
 
 .quality-jump-panel {
@@ -841,7 +849,7 @@ onMounted(async () => {
 }
 
 .scene-badge {
-  background: #4f46e5;
+  background: var(--va-brand);
   color: #ffffff;
   font-size: 12px;
   font-weight: 700;
@@ -908,7 +916,7 @@ onMounted(async () => {
 .timeline-group small { color:#475569; }
 .timeline-clips { display:flex; flex-wrap:wrap; gap:5px; margin-top:6px; }
 .timeline-clips button { border:1px solid #cbd5e1; background:white; border-radius:6px; color:#334155; padding:5px 8px; cursor:pointer; }
-.timeline-clips button[aria-pressed="true"] { background:#4338ca; border-color:#4338ca; color:white; }
+.timeline-clips button[aria-pressed="true"] { background: var(--va-brand); border-color: var(--va-brand); color:white; }
 .studio-card .scenes-edit-list { display:block; }
 .clip-overview { display:flex; gap:12px; align-items:center; margin-bottom:14px; overflow-wrap:anywhere; }
 .clip-overview img { width:64px; height:82px; flex:none; object-fit:cover; border-radius:8px; }

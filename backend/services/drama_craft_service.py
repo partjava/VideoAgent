@@ -49,6 +49,73 @@ OCCUPATION_ANTI_DRIFT_RULES: list[tuple[tuple[str, ...], str]] = [
 
 SHOE_KEYWORDS = ("鞋", "靴", "履", "高跟", "皮鞋", "运动鞋", "球鞋", "布鞋", "凉鞋", "拖鞋", "长靴", "短靴", "shoe", "boot", "heel")
 
+
+def _grade_for_score(score: int) -> str:
+    return "S" if score >= 90 else "A" if score >= 82 else "B" if score >= 70 else "C"
+
+
+def format_four_gear_guide(
+    min_sec: int | None = None,
+    max_sec: int | None = None,
+    fallback_duration: int = 60,
+) -> dict[str, Any]:
+    """Scale the 4 dramatic narrative beats proportionally into the requested duration range."""
+    if min_sec is not None and max_sec is not None:
+        lo = max(10, min(int(min_sec), int(max_sec)))
+        hi = min(180, max(int(min_sec), int(max_sec)))
+        target = max(lo, min(hi, round((lo + hi) / 2)))
+    else:
+        d = max(10, min(180, int(fallback_duration or 60)))
+        lo = max(10, int(round(d * 0.85)))
+        hi = d
+        target = d
+
+    g1 = max(3, min(15, round(target * 0.18)))
+    g2 = max(g1 + 3, min(target - 5, round(target * 0.48)))
+    g3 = max(g2 + 3, min(target - 2, round(target * 0.80)))
+    g4 = target
+
+    gears = [
+        {
+            "label": "第一挡",
+            "range": f"0~{g1}s",
+            "title": "抓人立事",
+            "desc": f"0~{g1}s 抓人立事（强视觉动作+具体数字/死线/压迫处境，严禁空镜寒暄）",
+        },
+        {
+            "label": "第二挡",
+            "range": f"{g1}~{g2}s",
+            "title": "正面交锋",
+            "desc": f"{g1}~{g2}s 正面交锋（至少2轮筹码动作博弈）",
+        },
+        {
+            "label": "第三挡",
+            "range": f"{g2}~{g3}s",
+            "title": "亮牌翻转",
+            "desc": f"{g2}~{g3}s 亮牌翻转（物证与大白话利害结论同步直给，当集反派必付代价）",
+        },
+        {
+            "label": "第四挡",
+            "range": f"{g3}~{g4}s",
+            "title": "断章钩子",
+            "desc": f"{g3}~{g4}s 余波断章钩子（动作做到一半或新危机撞门而入瞬间定格）",
+        },
+    ]
+    chain = " → ".join(g["desc"] for g in gears)
+    prompt_rule = (
+        f"单集四挡紧凑推进（{chain}）；全集时间轴与分段标注严格落在 {lo}~{hi} 秒区间"
+        f"（推荐目标约 {target} 秒，严禁超过 {hi} 秒，严禁擅自写成 85~110s）"
+    )
+    return {
+        "min": lo,
+        "max": hi,
+        "target": target,
+        "boundaries": [0, g1, g2, g3, g4],
+        "gears": gears,
+        "chain": chain,
+        "prompt_rule": prompt_rule,
+    }
+
 ALLOWED_TTS_VOICES = {
     "zh-CN-YunjianNeural",
     "zh-CN-YunxiNeural",
@@ -735,20 +802,28 @@ def ai_decompose_novel_to_drama(
 
     llm = _get_real_llm()
     total_episodes = max(1, min(10, int(total_episodes or 5)))
+    gear_guide = format_four_gear_guide(
+        episode_duration_min,
+        episode_duration_max,
+        fallback_duration=episode_duration,
+    )
+    resolved_min = int(episode_duration_min) if episode_duration_min is not None else int(gear_guide["min"])
+    resolved_max = int(episode_duration_max) if episode_duration_max is not None else int(gear_guide["max"])
+    resolved_target = int(gear_guide["target"])
     lang_label = "出海英文短剧（使用地道美式短剧对白与英文编剧格式，但分析说明字段可用中文或双语）" if market_mode == "en" else "国内爆款中文短剧"
 
     system_prompt = (
         "你是拥有多部破亿爆款作品的短剧总编剧、总制片人与视听美术总监。你必须严格依据用户提供的【原著/创意原文】进行原创改编与拆解，"
         "严禁套用无关模板或照抄他人名字。\n"
         "请严格执行以下创作法则：\n"
-        "1. 【单集 15 秒四挡推进】：0~15s 抓人立事（强视觉动作+具体数字/死线/压迫处境，严禁空镜寒暄）→ 15~45s 正面交锋（至少2轮筹码动作博弈）→ 45~85s 亮牌翻转（物证与大白话利害结论同步直给，当集反派必付代价）→ 85~110s 余波断章钩子（动作做到一半或新危机撞门而入瞬间定格）；\n"
+        f"1. 【单集动态四挡推进】：{gear_guide['prompt_rule']}；\n"
         "2. 【可拍性动作锚点】：首集剧本 `first_episode_script` 中每 2~3 句对白必插一条可拍摄物理动作 `△` 行（写四肢发力、物证撞击或面部肌肉反应），彻底封杀“眼神微动、微微一怔、心里一紧”等心理废话与“然而、不仅如此、显而易见”等书面腔，对白使用 3~6 字短句与 8~16 字大白话算账句变速；\n"
         "3. 【角色资产可生成性】：每个角色 `face_dna` 含五官/发型/辨识特征；`signature_clothing` 必须写出具体鞋履款式与颜色；`tts_voice` 必须选自合法音色："
         + ", ".join(sorted(ALLOWED_TTS_VOICES))
         + "；\n"
         "4. 【场景与道具母版】：提取最核心高频场景（2个）设计布局方位（东西南北）、材质纹理与主光色温 Kelvin（每个场景 9 条 15~35 字精炼机位）；提取推动反转的核心道具（1~2个），严禁给反光道具写“泛着幽光/发光特效”；\n"
         "5. 【跨集四本连续性台账】：结合原著人物与秘密差，生成 `physical_ledger`、`knowledge_ledger`、`prop_ledger`、`relationship_ledger`（每表 2~4 条核心条目）；\n"
-        "6. 【紧凑完备篇幅】：`episodes_outline` 严格按规划总集数输出、每项概括 20~50 字；`first_episode_script` 控制在 500~850 字紧凑可拍篇幅，确保完整 JSON 在长度限制内一次闭合。\n\n"
+        "6. 【紧凑完备篇幅】：`episodes_outline` 严格按规划总集数输出、每项概括 20~50 字；`first_episode_script` 控制在 500~850 字紧凑可拍篇幅并严格控制在目标时长内，确保完整 JSON 在长度限制内一次闭合。\n\n"
         "必须输出严格 JSON 对象，结构如下：\n"
         "{\n"
         '  "title": "本剧剧名",\n'
@@ -760,7 +835,7 @@ def ai_decompose_novel_to_drama(
         '  "scenes_spec": [{"scene_name": "...", "space_type": "indoor|outdoor_building|street_nature", "era_and_style": "...", "layout_and_materials": "...", "lighting_and_kelvin": "...", "angles": ["第1格...", "...共9格针对本场景的具体机位描述"]}],\n'
         '  "props_spec": [{"prop_name": "...", "material_and_color": "哑光实心材质描述", "size_vs_palm": "...", "key_detail": "...", "style": "..."}],\n'
         '  "episodes_outline": [{"episode_num": 1, "title": "...", "opening_hook": "...", "core_event": "...", "ending_hook": "...", "paywall_card": true/false, "paywall_reason": "..."}],\n'
-        '  "first_episode_script": "完整第1集商业剧本正文（使用 \\n 换行，含 △ 动作行与角色对白）",\n'
+        f'  "first_episode_script": "完整第1集商业剧本正文（使用 \\n 换行，时间分段严格落在 {gear_guide["min"]}~{gear_guide["max"]}s 内，含 △ 动作行与角色对白）",\n'
         '  "continuity_ledgers": {\n'
         '    "physical_ledger": [{"character": "...", "location": "...", "costume_state": "...", "injury_or_mark": "...", "stamina_posture": "..."}],\n'
         '    "knowledge_ledger": [{"character": "...", "known_facts": "...", "hidden_blindspots": "..."}],\n'
@@ -771,9 +846,9 @@ def ai_decompose_novel_to_drama(
     )
 
     duration_hint = (
-        f"单集目标时长范围：{int(episode_duration_min)}–{int(episode_duration_max)} 秒（弹性区间，不必凑整）"
+        f"单集目标时长范围：{resolved_min}–{resolved_max} 秒（建议成片约 {resolved_target} 秒，所有剧本分段时间戳严禁超过 {resolved_max} 秒）"
         if episode_duration_min is not None and episode_duration_max is not None
-        else f"单集目标时长：{episode_duration} 秒"
+        else f"单集目标时长：{resolved_target} 秒（所有剧本分段时间戳严禁超过 {resolved_target} 秒）"
     )
     user_prompt = (
         f"剧集名称提示：{title.strip() or '根据故事自动提炼一个极具爆款吸引力的剧名'}\n"
@@ -872,9 +947,9 @@ def ai_decompose_novel_to_drama(
         "market_mode": market_mode,
         "style": style,
         "total_episodes": total_episodes,
-        "episode_duration": episode_duration,
-        "episode_duration_min": episode_duration_min,
-        "episode_duration_max": episode_duration_max,
+        "episode_duration": resolved_target,
+        "episode_duration_min": resolved_min,
+        "episode_duration_max": resolved_max,
         "shootability_report": report,
         "characters": normalized_chars,
         "scenes_sheet": scenes_sheet,
@@ -900,11 +975,13 @@ def ai_review_script(
 
     metrics = scan_script_metrics(text, scenes)
     llm = _get_real_llm()
+    gear_guide = format_four_gear_guide(fallback_duration=duration)
+    g1, g2, g3, g4 = gear_guide["gears"]
 
     system_prompt = (
         "你是顶级爆款短剧总审稿导演。请结合客观扫描统计数据和你对剧本原文的深度阅读，对用户提交的剧本进行严苛、精准、可落地的专业审稿。\n"
         "审查标准（严禁敷衍客套，必须言之有物并原句引用 evidence）：\n"
-        "1. `pacing`（15秒换挡节奏）：前3~15秒是否有强视觉动作/数字死线立事？15~45s是否有两轮以上筹码对抗？结尾85~110s是否在最高悬念处断章而非平淡大结局？\n"
+        f"1. `pacing`（动态四挡换挡节奏，总长约 {gear_guide['target']} 秒）：{g1['range']} 是否有强视觉动作/数字死线立事？{g2['range']} 是否有两轮以上筹码对抗？结尾 {g4['range']} 是否在最高悬念处断章而非平淡大结局？\n"
         "2. `payoff`（爽点与当集结算）：是否做到物证与大白话利害结论同轮直给？反派是否当集付出可见代价？\n"
         "3. `dialogue`（台词去AI味辨识度）：是否有“然而/不仅如此/显而易见/命运的齿轮”等书面套话或超过20字的憋气长句？是否缺少3~6字短句与8~16字算账句变速？\n"
         "4. `shootability`（空间可拍性与△密度）：是否出现连续3~4句纯对白站桩？是否出现“眼神微动/微微一怔/心里一紧/思绪万千”等镜头拍不出的抽象心理词？\n"
@@ -915,24 +992,24 @@ def ai_review_script(
         '  "grade": "S"|"A"|"B"|"C",\n'
         '  "verdict": "pass"|"needs_polish",\n'
         '  "dimensions": {\n'
-        '    "pacing": {"label": "15秒换挡节奏", "score": 0-100},\n'
+        '    "pacing": {"label": "换挡节奏与紧凑度", "score": 0-100},\n'
         '    "payoff": {"label": "爽点与当集结算", "score": 0-100},\n'
         '    "dialogue": {"label": "台词去AI味辨识度", "score": 0-100},\n'
         '    "shootability": {"label": "空间可拍性与△密度", "score": 0-100},\n'
         '    "continuity": {"label": "人物动机与连续性", "score": 0-100}\n'
         "  },\n"
         '  "four_gear_timeline": [\n'
-        '    {"gear": "第一挡 · 0~15s 抓人立事", "target": "结合本剧开场评价", "status": "pass"|"warn"},\n'
-        '    {"gear": "第二挡 · 15~45s 正面交锋", "target": "结合本剧中段评价", "status": "pass"|"warn"},\n'
-        '    {"gear": "第三挡 · 45~85s 亮牌翻转", "target": "结合本集结算评价", "status": "pass"|"warn"},\n'
-        '    {"gear": "第四挡 · 85~110s 断章钩子", "target": "结合本集结尾评价", "status": "pass"|"warn"}\n'
+        f'    {{"gear": "第一挡 · {g1["range"]} 抓人立事", "target": "结合本剧开场评价", "status": "pass"|"warn"}},\n'
+        f'    {{"gear": "第二挡 · {g2["range"]} 正面交锋", "target": "结合本剧中段评价", "status": "pass"|"warn"}},\n'
+        f'    {{"gear": "第三挡 · {g3["range"]} 亮牌翻转", "target": "结合本集结算评价", "status": "pass"|"warn"}},\n'
+        f'    {{"gear": "第四挡 · {g4["range"]} 断章钩子", "target": "结合本集结尾评价", "status": "pass"|"warn"}}\n'
         "  ],\n"
         '  "issues": [{"rule_id": "问题规则名称", "category": "所属维度", "severity": "high"|"medium", "evidence": "精确摘录剧本原句", "diagnosis": "具体问题原因", "prescription": "直接可用的改写建议或示例"}]\n'
         "}"
     )
 
     user_prompt = (
-        f"目标时长：{duration} 秒\n"
+        f"目标时长：{gear_guide['target']} 秒\n"
         f"客观静态扫描事实：{metrics}\n\n"
         f"【待审剧本正文】：\n{text[:15000]}"
     )
@@ -941,6 +1018,12 @@ def ai_review_script(
 
     result = llm._call_api(system_prompt, user_prompt, max_tokens=3200)
     issues = result.get("issues") or []
+    try:
+        overall = int(result.get("overall_score") or 78)
+    except (TypeError, ValueError):
+        overall = 78
+    result["overall_score"] = max(0, min(100, overall))
+    result["grade"] = _grade_for_score(result["overall_score"])
     result["issue_count"] = len(issues)
     result["metrics"] = metrics
     result["source"] = "deepseek"
@@ -961,6 +1044,8 @@ def ai_doctor_script(
 
     metrics = scan_script_metrics(raw)
     llm = _get_real_llm()
+    gear_guide = format_four_gear_guide(fallback_duration=duration)
+    g1, g2, g3, g4 = gear_guide["gears"]
 
     system_prompt = (
         "你是金牌短剧改稿总编剧。你的任务是在【完整保留原剧本核心人物、核心事件与关键反转事实】的前提下，"
@@ -970,7 +1055,7 @@ def ai_doctor_script(
         "2. 【每2~3句必插 △ 强动作】：彻底消除站桩对白，为人物设计符合情境的动作、表情肌肉变化与物证交互（以 `△` 开头成行）；\n"
         "3. 【清除全部心理废话】：严禁“眼神微动/微微一怔/心里一紧/五味杂陈”，全部改写为镜头能拍出的动作或道具变化；\n"
         "4. 【台词七维去 AI 味】：剔除“然而/不仅如此/显而易见/命运的齿轮”等书面腔，把长句拆成 3~6 字短句 + 8~16 字大白话利害算账句，物证与结论当场直给；\n"
-        "5. 【结尾强断章钩子】：把平淡大结局改写成停在动作半途或突发新危机瞬间的追更悬念。\n\n"
+        f"5. 【结尾强断章钩子】：严格按目标时长（约 {gear_guide['target']} 秒）收束节奏，把平淡大结局改写成停在动作半途或突发新危机瞬间的追更悬念。\n\n"
         "必须输出严格 JSON：\n"
         "{\n"
         '  "polished_script": "完整精修后的剧本正文（使用 \\n 换行）",\n'
@@ -980,17 +1065,17 @@ def ai_doctor_script(
         '    "grade": "S"|"A"|"B"|"C",\n'
         '    "verdict": "pass"|"needs_polish",\n'
         '    "dimensions": {\n'
-        '      "pacing": {"label": "15秒换挡节奏", "score": 0-100},\n'
+        '      "pacing": {"label": "换挡节奏与紧凑度", "score": 0-100},\n'
         '      "payoff": {"label": "爽点与当集结算", "score": 0-100},\n'
         '      "dialogue": {"label": "台词去AI味辨识度", "score": 0-100},\n'
         '      "shootability": {"label": "空间可拍性与△密度", "score": 0-100},\n'
         '      "continuity": {"label": "人物动机与连续性", "score": 0-100}\n'
         "    },\n"
         '    "four_gear_timeline": [\n'
-        '      {"gear": "第一挡 · 0~15s 抓人立事", "target": "精修后效果", "status": "pass"|"warn"},\n'
-        '      {"gear": "第二挡 · 15~45s 正面交锋", "target": "精修后效果", "status": "pass"|"warn"},\n'
-        '      {"gear": "第三挡 · 45~85s 亮牌翻转", "target": "精修后效果", "status": "pass"|"warn"},\n'
-        '      {"gear": "第四挡 · 85~110s 断章钩子", "target": "精修后效果", "status": "pass"|"warn"}\n'
+        f'      {{"gear": "第一挡 · {g1["range"]} 抓人立事", "target": "精修后效果", "status": "pass"|"warn"}},\n'
+        f'      {{"gear": "第二挡 · {g2["range"]} 正面交锋", "target": "精修后效果", "status": "pass"|"warn"}},\n'
+        f'      {{"gear": "第三挡 · {g3["range"]} 亮牌翻转", "target": "精修后效果", "status": "pass"|"warn"}},\n'
+        f'      {{"gear": "第四挡 · {g4["range"]} 断章钩子", "target": "精修后效果", "status": "pass"|"warn"}}\n'
         "    ],\n"
         '    "issues": []\n'
         "  }\n"
@@ -999,7 +1084,7 @@ def ai_doctor_script(
 
     user_prompt = (
         f"剧本标题：{title.strip() or '未命名剧本'}\n"
-        f"目标时长：{duration} 秒\n"
+        f"目标时长：{gear_guide['target']} 秒（时间标尺严禁超过 {gear_guide['max']} 秒）\n"
         f"初稿客观扫描发现的问题：{metrics}\n\n"
         f"【待精修剧本初稿】：\n{raw[:15000]}"
     )
@@ -1010,6 +1095,12 @@ def ai_doctor_script(
         raise RuntimeError("AI 未能返回有效的精修剧本内容")
 
     after_review = res.get("after_review") or {}
+    try:
+        after_overall = int(after_review.get("overall_score") or 88)
+    except (TypeError, ValueError):
+        after_overall = 88
+    after_review["overall_score"] = max(0, min(100, after_overall))
+    after_review["grade"] = _grade_for_score(after_review["overall_score"])
     after_review["metrics"] = scan_script_metrics(polished)
     after_review["issue_count"] = len(after_review.get("issues") or [])
     after_review["source"] = "deepseek"

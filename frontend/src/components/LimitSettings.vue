@@ -133,11 +133,12 @@ onMounted(async () => {
 
 <style scoped>
 .limit-card {
-  margin-top: 24px;
-  padding: 20px;
-  border: 1px solid #e2e8f0;
-  border-radius: 14px;
-  background: #ffffff;
+  margin-top: 22px;
+  padding: 22px;
+  border: 1px solid var(--va-border);
+  border-radius: var(--va-radius-lg);
+  background: var(--va-surface);
+  box-shadow: var(--va-shadow-sm);
 }
 .limit-head {
   display: flex;
@@ -149,35 +150,38 @@ onMounted(async () => {
 }
 .limit-head h3 {
   margin: 0 0 4px;
-  font-size: 16px;
+  font-size: 1.05rem;
+  font-weight: 800;
 }
 .limit-desc {
   margin: 0;
-  font-size: 13px;
-  color: #64748b;
+  font-size: 0.8125rem;
+  color: var(--va-ink-muted);
 }
 .preset-row {
   display: flex;
   flex-wrap: wrap;
+  flex-wrap: balance;
   align-items: center;
   gap: 8px;
   margin-bottom: 16px;
-  font-size: 12px;
-  color: #475569;
+  font-size: 0.78rem;
+  color: var(--va-ink-secondary);
 }
 .preset-chip {
   padding: 4px 12px;
   border-radius: 999px;
-  border: 1px solid #cbd5e1;
-  background: #f8fafc;
-  color: #334155;
-  font-size: 12px;
+  border: 1px solid var(--va-border-strong);
+  background: var(--va-surface-subtle);
+  color: var(--va-ink-secondary);
+  font-size: 0.78rem;
+  font-weight: 600;
   cursor: pointer;
 }
 .preset-chip:hover {
-  border-color: #4f46e5;
-  color: #4f46e5;
-  background: #eef2ff;
+  border-color: var(--va-brand);
+  color: var(--va-brand);
+  background: var(--va-brand-soft);
 }
 .limit-form {
   display: grid;

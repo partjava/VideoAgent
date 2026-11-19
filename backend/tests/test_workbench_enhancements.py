@@ -21,10 +21,24 @@ if "pymongo" not in sys.modules:
         errors_mod = types.ModuleType("pymongo.errors")
         class DuplicateKeyError(Exception):
             pass
+        class PyMongoError(Exception):
+            pass
         errors_mod.DuplicateKeyError = DuplicateKeyError
+        errors_mod.PyMongoError = PyMongoError
         pymongo_mod.errors = errors_mod
         sys.modules["pymongo"] = pymongo_mod
         sys.modules["pymongo.errors"] = errors_mod
+
+if "motor" not in sys.modules:
+    try:
+        import motor.motor_asyncio  # noqa: F401
+    except ModuleNotFoundError:
+        motor_mod = types.ModuleType("motor")
+        motor_async = types.ModuleType("motor.motor_asyncio")
+        motor_async.AsyncIOMotorClient = None
+        motor_mod.motor_asyncio = motor_async
+        sys.modules["motor"] = motor_mod
+        sys.modules["motor.motor_asyncio"] = motor_async
 
 if "config" not in sys.modules:
     try:
@@ -74,8 +88,14 @@ for _mod_name, _builder in [
     ("pydantic", lambda: types.SimpleNamespace(
         BaseModel=type("BaseModel", (), {
             "__init__": lambda self, **kw: self.__dict__.update(kw),
+            "model_dump": lambda self, **kw: dict(self.__dict__),
             "model_copy": lambda self, update=None: type(self)(**{**self.__dict__, **(update or {})}),
         }),
+        Field=lambda *a, **k: k.get("default") if "default" in k else (a[0] if a else None),
+        ConfigDict=lambda **kw: kw,
+        field_validator=lambda *a, **k: (lambda fn: fn),
+        model_validator=lambda *a, **k: (lambda fn: fn),
+        ValidationError=ValueError,
         SecretStr=type("SecretStr", (), {
             "__init__": lambda self, val="": setattr(self, "_val", val),
             "get_secret_value": lambda self: self._val,
@@ -612,7 +632,6 @@ class WorkbenchEnhancementsTests(unittest.IsolatedAsyncioTestCase):
                 ai_decompose_novel_to_drama("任意真实测试文本输入")
 
     def test_final_video_motion_prompt_compact_and_sanitized(self):
-        # Provide stubs if optional video_agent imports aren't installed in system python
         for mod_name, builder in [
             ("numpy", lambda: types.SimpleNamespace()),
             ("cv2", lambda: types.SimpleNamespace()),
@@ -623,21 +642,6 @@ class WorkbenchEnhancementsTests(unittest.IsolatedAsyncioTestCase):
                     __import__(mod_name)
                 except ModuleNotFoundError:
                     sys.modules[mod_name] = builder()
-        if "agents.agent_utils" not in sys.modules:
-            au = types.ModuleType("agents.agent_utils")
-            for attr in ("ASSETS_COLLECTION", "SCENES_COLLECTION", "mark_agent_failed", "mark_agent_start", "mark_agent_success", "with_document_id"):
-                setattr(au, attr, lambda *a, **k: None)
-            sys.modules["agents.agent_utils"] = au
-        if "models.asset_model" not in sys.modules:
-            am = types.ModuleType("models.asset_model")
-            am.Asset = object
-            sys.modules["models.asset_model"] = am
-        if "models.task_model" not in sys.modules:
-            tm = types.ModuleType("models.task_model")
-            class DummyStatus:
-                VIDEO_GENERATING = "video_generating"
-            tm.VideoTaskStatus = DummyStatus
-            sys.modules["models.task_model"] = tm
 
         from agents.video_agent import _build_motion_prompt
 

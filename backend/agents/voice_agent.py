@@ -216,12 +216,29 @@ class VoiceAgent:
                 task.get("generation_mode") in {AUTO_DIRECTOR_MODE, STORYBOARD_FLOW_MODE}
                 and not task.get("duration_locked")
             )
-            _, max_clip_seconds = active_provider_duration_bounds(
+            min_clip_seconds, max_clip_seconds = active_provider_duration_bounds(
                 generation_mode=str(task.get("generation_mode") or ""),
                 cfg=settings,
             )
             for scene in task_scenes:
                 scene_id = str(scene["scene_id"])
+                if allow_flexible_duration:
+                    cur_scene_dur = max(1, int(round(float(scene.get("duration") or min_clip_seconds))))
+                    clamped_scene_dur = max(min_clip_seconds, min(max_clip_seconds, cur_scene_dur))
+                    if clamped_scene_dur != int(scene.get("duration") or 0):
+                        rebalanced_beats = rebalance_motion_beats_duration(
+                            scene.get("motion_beats") or [],
+                            cur_scene_dur,
+                            clamped_scene_dur,
+                        )
+                        scene["duration"] = clamped_scene_dur
+                        scene["motion_beats"] = rebalanced_beats
+                        durations_changed = True
+                        await mongodb.update_one(
+                            SCENES_COLLECTION,
+                            {"_id": scene.get("_id") or f"{task_id}_{scene_id}"},
+                            {"duration": clamped_scene_dur, "motion_beats": rebalanced_beats},
+                        )
                 if scene.get("dialogue_lines"):
                     audio = scene.get("dialogue_audio") or []
                     binding_changed = profiles and any(

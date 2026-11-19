@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 from hashlib import sha256
 from copy import deepcopy
+from uuid import uuid4
 import re
 
 import anyio
@@ -25,6 +26,7 @@ from services.generation_contract import (
     format_motion_beats,
     needs_video,
     provider_duration_bounds,
+    rebalance_motion_beats_duration,
     validate_auto_director_scenes,
     validate_motion_beats,
     validate_scene_durations,
@@ -369,6 +371,52 @@ class VideoAgent:
                 except Exception:
                     service = None
                 bounds = _bounds_for_video_service(service, mode_key, _cfg)
+                min_sec, max_sec = bounds
+                rebalanced_any = False
+                for scene in scenes:
+                    scene_patch: dict[str, object] = {}
+                    if scene.get("need_dynamic_video") is not True:
+                        scene["need_dynamic_video"] = True
+                        scene_patch["need_dynamic_video"] = True
+                        if scene.get("status") == "static_fallback":
+                            scene["status"] = "image_done"
+                            scene_patch["status"] = "image_done"
+                    try:
+                        raw_dur = float(scene.get("duration") or 0)
+                    except (TypeError, ValueError):
+                        raw_dur = 0.0
+                    if raw_dur > 0:
+                        old_dur = max(1, int(round(raw_dur)))
+                        clamped_dur = max(min_sec, min(max_sec, old_dur))
+                        if clamped_dur != old_dur or not raw_dur.is_integer():
+                            new_beats = rebalance_motion_beats_duration(
+                                scene.get("motion_beats") or [],
+                                old_dur,
+                                clamped_dur,
+                            )
+                            scene["duration"] = clamped_dur
+                            scene["motion_beats"] = new_beats
+                            rebalanced_any = True
+                            scene_patch["duration"] = clamped_dur
+                            scene_patch["motion_beats"] = new_beats
+                    if scene_patch:
+                        scene_doc_id = scene.get("_id") or f"{task_id}_{scene.get('scene_id')}"
+                        await mongodb.update_one(
+                            SCENES_COLLECTION,
+                            {"_id": scene_doc_id},
+                            scene_patch,
+                        )
+                synced_total = sum(int(s.get("duration") or 0) for s in scenes)
+                if synced_total > 0 and (
+                    rebalanced_any
+                    or (not task.get("duration_locked") and task.get("duration") != synced_total)
+                ):
+                    task["duration"] = synced_total
+                    await mongodb.update_one(
+                        "video_tasks",
+                        {"_id": task_id},
+                        {"duration": synced_total, "metadata.task_plan.duration": synced_total},
+                    )
                 if auto_director:
                     validate_auto_director_scenes(scenes, target_duration=task.get("duration"), bounds=bounds)
                 else:
@@ -506,6 +554,7 @@ class VideoAgent:
                         asset_needs_replace = True
                         scene_fields.update({
                             "video_path": asset["path"],
+                            "video_version": uuid4().hex[:8],
                             "submitted_video_prompt": submitted_prompt,
                             "continuity_input_path": first,
                             "need_dynamic_video": True,
@@ -514,7 +563,7 @@ class VideoAgent:
                             "updated_at": now,
                         })
                     else:
-                        if scene.get("stale_tail") or scene.get("video_path") != cached_path or (
+                        if scene.get("stale_tail") or scene.get("video_path") != cached_path or scene.get("status") != "video_done" or (
                             scene.get("transition_type") == "continue_action" and scene.get("continuity_input_path") != first
                         ):
                             scene_fields.update({
@@ -550,12 +599,24 @@ class VideoAgent:
                         previous_tail = destination
                         scene_fields["last_frame_path"] = previous_tail
 
+                    # 实时落库：单镜视频一旦生成完毕，立即写入 assets 与 scenes，前端轮询可实时呈现该镜头视频
+                    if asset_needs_replace:
+                        asset_id = str(asset["asset_id"])
+                        await mongodb.replace_one(
+                            ASSETS_COLLECTION,
+                            {"_id": asset_id},
+                            with_document_id(asset, asset_id),
+                            upsert=True,
+                        )
+                    if scene_fields:
+                        await mongodb.update_one(SCENES_COLLECTION, key, scene_fields)
+
                     outcomes[index] = {
                         "kind": "ok",
                         "key": key,
                         "asset": asset,
-                        "asset_needs_replace": asset_needs_replace,
-                        "scene_fields": scene_fields,
+                        "asset_needs_replace": False,
+                        "scene_fields": {},
                     }
 
             chain_results = await asyncio.gather(*(_run_chain(c) for c in chains), return_exceptions=True)

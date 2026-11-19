@@ -11,6 +11,8 @@ export const seriesApi = {
   saveLedgers: (id, continuity_ledgers) =>
     client.put(`${path(id)}/ledgers`, { continuity_ledgers }),
   confirm: (id) => client.post(`${path(id)}/confirm`),
+  bindEpisodeTask: (id, num, task_id) =>
+    client.post(`${path(id)}/episodes/${num}/bind-task`, { task_id }),
   run: (id) => client.post(`${path(id)}/run`),
   stop: (id) => client.post(`${path(id)}/stop`),
   approveShoot: (id, taskId) =>

@@ -20,6 +20,7 @@ class CreateSeriesRequest(BaseModel):
     initial_episodes: list[dict[str, Any]] | None = None
     continuity_ledgers: dict[str, Any] | None = None
     first_episode_script: str | None = Field(default=None, max_length=20000)
+    first_episode_task_id: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode='after')
     def normalize_duration_range(self):
@@ -46,6 +47,10 @@ class OutlineRequest(BaseModel):
 
 class ConfirmSnapshotRequest(BaseModel):
     state: dict[str, Any]
+
+
+class BindEpisodeTaskRequest(BaseModel):
+    task_id: str = Field(min_length=1, max_length=64)
 
 
 class PublishNotesRequest(BaseModel):

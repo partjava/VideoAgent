@@ -801,19 +801,28 @@ class DeepSeekService(BaseLLMService):
                 )
             else:
                 segment_rules = "segments 返回空数组，在 content 中编写完整画面和对应台词。"
+            from services.drama_craft_service import format_four_gear_guide
+
             duration_range = task_plan.get("duration_range")
-            if (
+            has_range = (
                 mode in {"auto_director", "storyboard_flow"}
                 and isinstance(duration_range, (list, tuple))
                 and len(duration_range) == 2
                 and all(isinstance(v, (int, float)) for v in duration_range)
-            ):
+            )
+            if has_range:
                 segment_rules += (
                     f"所有 segments 的 duration 合计必须落在 {int(duration_range[0])}–{int(duration_range[1])} 秒弹性区间内"
                     "（按剧情密度自然决定，不需要凑整十秒）。"
                 )
+            gear_guide = format_four_gear_guide(
+                int(duration_range[0]) if has_range else None,
+                int(duration_range[1]) if has_range else None,
+                fallback_duration=int(task_plan.get("duration") or 60),
+            )
+            g1, g2, g3, g4 = gear_guide["gears"]
             system_prompt = (
-                "你是顶级短剧总编剧与分镜导演。你的剧本严格遵循『15秒四挡推进』、"
+                "你是顶级短剧总编剧与分镜导演。你的剧本严格遵循『动态四挡紧凑推进』、"
                 "『每2-3句对白必插强视觉△物理动作（物理结果/身份反差/物证对抗）』与『台词去AI味规则』。"
                 "严禁出现“眼神微动、微微一怔、心里一紧”等不可拍心理套话，严禁“然而、不仅如此、显而易见、命运的齿轮”等书面腔。必须输出严格 JSON。"
             )
@@ -825,11 +834,11 @@ class DeepSeekService(BaseLLMService):
 内容类型：{resolved_style}
 
 剧本核心原则：
-- 单集 15 秒四挡推进：
-  1) 0~15s 抓人立事（强视觉动作开场 + 亮明具体数字/死线/压迫处境，严禁环境空镜与日常寒暄铺垫）；
-  2) 15~45s 正面交锋（至少2轮筹码或动作拉扯）；
-  3) 45~85s 亮牌翻转（当集结算，物证与大白话利害结论同轮直给，反派当场付出可见代价）；
-  4) 85~110s 余波断章钩子（在动作半途或新危机破门瞬间戛然而止）。
+- {gear_guide['prompt_rule']}：
+  1) {g1['desc']}；
+  2) {g2['desc']}；
+  3) {g3['desc']}；
+  4) {g4['desc']}。
 - 拦截站桩纯对白与无效微动作：每 2~3 句对白必插一条强视觉 △（物理结果 / 身份反差 / 物证对抗），彻底封杀“眼神微动、微微一怔、心里一紧、心中五味杂陈”等镜头拍不出来的无效微动作。
 - 台词去 AI 味：物证与大白话利害结论同轮直给（拒当谜语人）；专业/玄学设定词当句翻译成“多少钱/判几年/谁死谁活”；采用 3~6 字快刀短句与 8~16 字算账句快慢变速；禁用“然而、不仅如此、显而易见、命运的齿轮”等书面套话。
 

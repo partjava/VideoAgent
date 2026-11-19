@@ -34,6 +34,31 @@ from pathlib import Path
 
 from fastapi.staticfiles import StaticFiles
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """Serve generated media assets with fresh revalidation while preserving 206 Range streaming for video/audio."""
+
+    async def get_response(self, path: str, scope):
+        raw_headers = list(scope.get("headers") or [])
+        has_range = any(k.lower() == b"range" for k, _ in raw_headers)
+        if has_range:
+            # Strip conditional headers on Range requests so Starlette returns 206 Partial Content
+            # instead of 304 Not Modified (which breaks Chromium <video> moov-atom range loading).
+            scope = dict(scope)
+            scope["headers"] = [
+                (k, v)
+                for k, v in raw_headers
+                if k.lower() not in (b"if-none-match", b"if-modified-since")
+            ]
+        response = await super().get_response(path, scope)
+        lower_path = str(path or "").lower()
+        if lower_path.endswith((".mp4", ".webm", ".mp3", ".wav")):
+            response.headers["Cache-Control"] = "public, max-age=3600"
+        else:
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(video_router)
 app.include_router(settings_router)
@@ -50,8 +75,8 @@ _backend_root = Path(__file__).resolve().parent
 # 确保目录存在（空目录 FastAPI/Starlette 不允许 mount）
 (_backend_root / "assets").mkdir(parents=True, exist_ok=True)
 (_backend_root / "outputs").mkdir(parents=True, exist_ok=True)
-app.mount("/assets", StaticFiles(directory=str(_backend_root / "assets")), name="assets")
-app.mount("/outputs", StaticFiles(directory=str(_backend_root / "outputs")), name="outputs")
+app.mount("/assets", NoCacheStaticFiles(directory=str(_backend_root / "assets")), name="assets")
+app.mount("/outputs", NoCacheStaticFiles(directory=str(_backend_root / "outputs")), name="outputs")
 
 
 @app.get("/health")
