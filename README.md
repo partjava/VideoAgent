@@ -1,5 +1,8 @@
 # VideoAgent · AI 短剧全流程制片工作台
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Security Policy](https://img.shields.io/badge/Security-合规与安全协议-green.svg)](SECURITY.md)
+
 VideoAgent 是一套面向 AI 短剧与漫剧创作的全流程制片工作台，打通 **「小说拆剧 → 角色定妆 → 单集/多集连载排片 → 首帧与配音预审 → 动态视频合成与质检交付」** 闭环。支持从长文小说、分场剧本或一句话创意出发，产出带角色一致性锚定、多角色情绪配音、精准时间轴字幕与背景配乐的完整短片（MP4 + SRT）。
 
 ---
@@ -76,7 +79,17 @@ VideoAgent 是一套面向 AI 短剧与漫剧创作的全流程制片工作台�
 
 ---
 
-## 12 步全自动制片流水线
+## 系统架构与 12 步全自动制片流水线
+
+### 1. 系统总体架构图
+
+![系统架构图](backend/image/架构图.png)
+*系统总体架构：Vue 3 前端工作台 → FastAPI 后端路由 → LangGraph 多智能体协作编排 → MongoDB 状态存储 + 本地媒体资产文件系统*
+
+### 2. 多智能体编排流程图
+
+![生成流程图](backend/image/流程图.png)
+*12 个智能体在 LangGraph StateGraph 中编排执行（串行规划 + Send 并行生成分支 + 条件自愈与质检分支）*
 
 ```text
 01 创意规划 (TaskPlannerAgent)
