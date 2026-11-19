@@ -6,7 +6,7 @@ from typing import Any, Literal
 import anyio
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from core.database import mongodb
 from models.response_model import ApiResponse
@@ -35,9 +35,23 @@ class DecomposeNovelRequest(BaseModel):
     novel_text: str = Field(..., min_length=1, max_length=100000)
     title: str = Field(default="", max_length=120)
     total_episodes: int = Field(default=5, ge=1, le=10)
-    episode_duration: Literal[10, 30, 60, 90] = 60
+    episode_duration: int = Field(default=60, ge=10, le=180)
+    episode_duration_min: int | None = Field(default=None, ge=10, le=180)
+    episode_duration_max: int | None = Field(default=None, ge=10, le=180)
     style: Literal["短剧", "漫剧"] = "短剧"
     market_mode: Literal["cn", "en"] = "cn"
+
+    @model_validator(mode="after")
+    def normalize_duration_range(self):
+        if self.episode_duration_min is not None or self.episode_duration_max is not None:
+            lo = self.episode_duration_min if self.episode_duration_min is not None else min(self.episode_duration, self.episode_duration_max or self.episode_duration)
+            hi = self.episode_duration_max if self.episode_duration_max is not None else max(self.episode_duration, self.episode_duration_min or self.episode_duration)
+            if lo > hi:
+                raise ValueError("单集最小时长不能大于最大时长")
+            self.episode_duration_min = lo
+            self.episode_duration_max = hi
+            self.episode_duration = int(round((lo + hi) / 2))
+        return self
 
 
 class ReviewScriptRequest(BaseModel):
@@ -117,6 +131,8 @@ async def decompose_novel_endpoint(payload: DecomposeNovelRequest):
                 title=payload.title,
                 total_episodes=payload.total_episodes,
                 episode_duration=payload.episode_duration,
+                episode_duration_min=payload.episode_duration_min,
+                episode_duration_max=payload.episode_duration_max,
                 style=payload.style,
                 market_mode=payload.market_mode,
             )

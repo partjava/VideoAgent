@@ -41,6 +41,12 @@ class TaskPlannerAgent:
             llm_service = get_llm_service()
             _user_input = str(task["user_input"]) + series_prompt_context(task)
             _duration = task.get("duration") if isinstance(task.get("duration"), int) else None
+            _range_min = task.get("duration_min") if isinstance(task.get("duration_min"), int) else None
+            _range_max = task.get("duration_max") if isinstance(task.get("duration_max"), int) else None
+            if _duration is None and _range_min and _range_max:
+                _user_input += (
+                    f"\n目标总时长弹性区间：{_range_min}–{_range_max} 秒（按内容密度在区间内自主决定，不要求整十秒）。"
+                )
             _style = task.get("style") if isinstance(task.get("style"), str) else None
             _platform = task.get("platform") if isinstance(task.get("platform"), str) else None
             _ratio = str(task.get("ratio") or "9:16")
@@ -57,6 +63,13 @@ class TaskPlannerAgent:
                     )
             )
             profiles = frozen_characters(task)
+            if _duration is None and _range_min and _range_max:
+                try:
+                    planned = int(task_plan.get("duration") or 0)
+                except (TypeError, ValueError):
+                    planned = 0
+                task_plan["duration"] = min(_range_max, max(_range_min, planned or (_range_min + _range_max) // 2))
+                task_plan["duration_range"] = [_range_min, _range_max]
             if profiles:
                 task_plan["characters"] = [
                     {**profile, "appearance": profile["face_dna"] + "；默认服装：" + profile["signature_clothing"]}

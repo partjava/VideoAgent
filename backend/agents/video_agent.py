@@ -317,6 +317,17 @@ def video_service_for_task(task):
     return get_video_service()
 
 
+def _bounds_for_video_service(service, generation_mode: str, cfg) -> tuple[int, int]:
+    """优先依据本任务实际使用的视频服务推导合法片段时长范围，未命中时再回退至全局生效配置。"""
+    if service is not None:
+        cls_name = type(service).__name__.lower()
+        raw_model = getattr(service, "model", "")
+        model_text = raw_model.lower() if isinstance(raw_model, str) else ""
+        if any(tok in f"{cls_name} {model_text}" for tok in ("wan", "vidu", "doubao", "seedance", "siliconflow", "minimax", "comfyui")):
+            return provider_duration_bounds(cls_name, model_text, generation_mode=generation_mode)
+    return active_provider_duration_bounds(generation_mode=generation_mode, cfg=cfg)
+
+
 class VideoAgent:
     agent_name = "VideoAgent"
 
@@ -343,30 +354,27 @@ class VideoAgent:
             native = task.get("generation_mode") == NATIVE_GENERATION_MODE
             auto_director = task.get("generation_mode") == AUTO_DIRECTOR_MODE
             storyboard_flow = task.get("generation_mode") == STORYBOARD_FLOW_MODE
+            service = None
             if paired:
                 validate_paired_scenes(scenes, task.get("duration"))
             elif native:
                 validate_native_scenes(scenes, task.get("duration"))
                 for scene in scenes:
                     validate_motion_beats(scene.get("motion_beats"), 10, detailed=True, per_second=True)
-            elif auto_director:
+            elif auto_director or storyboard_flow:
                 from config import settings as _cfg
-                validate_auto_director_scenes(
-                    scenes,
-                    target_duration=task.get("duration"),
-                    bounds=active_provider_duration_bounds(generation_mode=AUTO_DIRECTOR_MODE, cfg=_cfg),
-                )
+                mode_key = AUTO_DIRECTOR_MODE if auto_director else STORYBOARD_FLOW_MODE
+                try:
+                    service = video_service_for_task(task)
+                except Exception:
+                    service = None
+                bounds = _bounds_for_video_service(service, mode_key, _cfg)
+                if auto_director:
+                    validate_auto_director_scenes(scenes, target_duration=task.get("duration"), bounds=bounds)
+                else:
+                    validate_storyboard_flow_scenes(scenes, target_duration=task.get("duration"), bounds=bounds)
                 for scene in scenes:
-                    validate_motion_beats(scene.get("motion_beats"), int(scene["duration"]), detailed=True, per_second=True)
-            elif storyboard_flow:
-                from config import settings as _cfg
-                validate_storyboard_flow_scenes(
-                    scenes,
-                    target_duration=task.get("duration"),
-                    bounds=active_provider_duration_bounds(generation_mode=STORYBOARD_FLOW_MODE, cfg=_cfg),
-                )
-                for scene in scenes:
-                    validate_motion_beats(scene.get("motion_beats"), int(scene["duration"]), detailed=True, per_second=False)
+                    validate_motion_beats(scene.get("motion_beats"), int(scene["duration"]), detailed=True, per_second=auto_director)
             else:
                 validate_scene_durations(scenes, task.get("duration"), whole=task.get("generation_mode") == WHOLE_GENERATION_MODE)
             selected = list(enumerate(scenes))
@@ -392,7 +400,8 @@ class VideoAgent:
             for asset in stored:  # Database orders newest first.
                 if asset.get("asset_type") == "video_clip":
                     videos.setdefault(asset["scene_id"], asset)
-            service = video_service_for_task(task)
+            if service is None:
+                service = video_service_for_task(task)
             sem = getattr(anyio, "Semaphore", asyncio.Semaphore)(3)
             chains: list[list[tuple[int, dict]]] = []
             for pair in selected:

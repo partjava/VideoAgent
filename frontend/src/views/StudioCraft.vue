@@ -57,6 +57,13 @@
                   <el-option :value="10" label="10 集连载版" />
                 </el-select>
               </el-form-item>
+              <el-form-item label="单集时长范围" class="flex-1">
+                <el-select v-model="craftRangePreset" @change="applyCraftRange">
+                  <el-option value="30-60" label="30–60 秒（快节奏）" />
+                  <el-option value="45-90" label="45–90 秒（标准短剧）" />
+                  <el-option value="60-120" label="60–120 秒（完整冲突）" />
+                </el-select>
+              </el-form-item>
             </div>
 
             <el-form-item label="输入你的小说正文、故事梗概或一句短剧创意">
@@ -78,11 +85,77 @@
               >
                 {{ decomposing ? "🤖 AI 正在深度拆解并创作剧本与资产..." : "🚀 调用 AI 实时拆解并生成全套开发资产" }}
               </el-button>
+              <el-button
+                v-if="novelResult"
+                size="large"
+                plain
+                @click="clearCurrentDecomposition"
+              >
+                清空当前结果（保留历史草稿）
+              </el-button>
             </div>
           </el-form>
 
+          <!-- 最近拆剧草稿（切换页面 / 刷新浏览器自动保留） -->
+          <div v-if="recentDecompositions.length" class="draft-history-bar">
+            <span class="draft-history-label">💾 自动保存的拆剧记录（切页不丢失）：</span>
+            <button
+              v-for="draft in recentDecompositions"
+              :key="draft.id"
+              type="button"
+              class="draft-chip"
+              :class="{ active: activeDraftId === draft.id }"
+              @click="restoreDraft(draft.id)"
+            >
+              {{ draft.title || "未命名拆剧" }} · {{ draft.episodes_count || 5 }}集
+            </button>
+          </div>
+
           <!-- AI 拆剧结果展示 -->
           <div v-if="novelResult" class="result-container">
+            <!-- 下一步直通拍片引导栏 -->
+            <el-card shadow="never" class="sub-card next-step-banner">
+              <div class="card-title-row" style="margin-bottom: 8px">
+                <div>
+                  <h3>🎬 已生成可拍全案：《{{ novelResult.title }}》—— 下一步去拍视频</h3>
+                  <p class="muted">
+                    拆剧结果已自动保存到本机草稿，切换去「角色资产」或「创建视频」再回来也不会消失。你可以直接用第 1 集拍单集视频，或一键建连载追剧。
+                  </p>
+                </div>
+                <div class="btn-group">
+                  <el-button
+                    type="success"
+                    plain
+                    :loading="importingChars"
+                    @click="importCharactersToLibrary"
+                  >
+                    {{ importedCharacters.length ? `✅ 已入库 ${importedCharacters.length} 位角色（再入库）` : `✨ 1. 先入库角色 (${novelResult.characters?.length || 0}人)` }}
+                  </el-button>
+                  <el-button
+                    v-if="importedCharacters.length"
+                    plain
+                    @click="router.push('/characters')"
+                  >
+                    去角色库看定妆照 →
+                  </el-button>
+                  <el-button
+                    type="primary"
+                    @click="sendFirstEpisodeToVideoCreate()"
+                  >
+                    🚀 2A. 用第 1 集直接生成视频 →
+                  </el-button>
+                  <el-button
+                    type="warning"
+                    plain
+                    :loading="creatingSeries"
+                    @click="createSeriesFromDecomposition"
+                  >
+                    📺 2B. 创建多集连载项目 →
+                  </el-button>
+                </div>
+              </div>
+            </el-card>
+
             <!-- 1. 可拍性诊断 -->
             <el-card shadow="never" class="sub-card">
               <div class="card-title-row">
@@ -184,6 +257,9 @@
                     </el-button>
                     <el-button size="small" type="primary" plain @click="sendToReviewer(novelResult.first_episode_script)">
                       送入 AI 审稿校验 →
+                    </el-button>
+                    <el-button size="small" type="success" @click="sendFirstEpisodeToVideoCreate(novelResult.first_episode_script)">
+                      🚀 去生成视频 →
                     </el-button>
                   </div>
                 </div>
@@ -294,6 +370,14 @@
               @click="handleDoctorScript"
             >
               {{ doctoring ? "🤖 AI 正在重写去AI味与动作锚点..." : "⚡ 调用 AI 深度重写精修剧本" }}
+            </el-button>
+            <el-button
+              v-if="reviewScriptInput.trim()"
+              type="warning"
+              plain
+              @click="sendFirstEpisodeToVideoCreate(reviewScriptInput)"
+            >
+              🚀 直接用当前剧本去生成视频 →
             </el-button>
           </div>
 
@@ -563,13 +647,16 @@
 </template>
 
 <script setup>
-import { ref, reactive } from "vue";
+import { ref, reactive, onMounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import BasicLayout from "../layouts/BasicLayout.vue";
 import { craftApi } from "../api/craft";
 import { charactersApi } from "../api/characters";
 import { seriesApi } from "../api/series";
+
+const CRAFT_STORAGE_KEY = "videoagent_craft_workspace_v1";
+const PREFILL_VIDEO_KEY = "videoagent_prefill_task";
 
 const router = useRouter();
 const activeTab = ref("novel");
@@ -585,22 +672,120 @@ const creatingSeries = ref(false);
 const renderingAssetKey = ref("");
 const renderedUrls = reactive({});
 const novelResult = ref(null);
+const importedCharacters = ref([]);
+const recentDecompositions = ref([]);
+const activeDraftId = ref("");
 
+const craftRangePreset = ref("45-90");
 const novelForm = reactive({
   title: "",
   market_mode: "cn",
   style: "短剧",
   total_episodes: 5,
   episode_duration: 60,
+  episode_duration_min: 45,
+  episode_duration_max: 90,
   novel_text: "",
 });
+
+function applyCraftRange(preset) {
+  const [lo, hi] = String(preset || "45-90").split("-").map(Number);
+  if (lo && hi) {
+    novelForm.episode_duration_min = lo;
+    novelForm.episode_duration_max = hi;
+    novelForm.episode_duration = Math.round((lo + hi) / 2);
+  }
+}
+
+function persistCraftWorkspace() {
+  try {
+    const snapshot = {
+      activeTab: activeTab.value,
+      novelForm: { ...novelForm },
+      novelResult: novelResult.value,
+      importedCharacters: importedCharacters.value,
+      renderedUrls: { ...renderedUrls },
+      activeDraftId: activeDraftId.value,
+      recentDecompositions: recentDecompositions.value.slice(0, 6),
+      reviewScriptInput: reviewScriptInput.value,
+      reviewReport: reviewReport.value,
+      doctorResult: doctorResult.value,
+      sceneForm: { ...sceneForm },
+      sceneGridResult: sceneGridResult.value,
+      propForm: { ...propForm },
+      propSheetResult: propSheetResult.value,
+      videoSanitizeForm: { ...videoSanitizeForm },
+      videoSanitizeResult: videoSanitizeResult.value,
+    };
+    localStorage.setItem(CRAFT_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // 忽略浏览器存储配额限制，不影响主流程
+  }
+}
+
+function saveDecompositionToHistory(result) {
+  if (!result) return;
+  const draftId = `craft_${Date.now()}`;
+  const entry = {
+    id: draftId,
+    title: result.title || novelForm.title || "未命名拆剧",
+    episodes_count: result.total_episodes || novelForm.total_episodes || 5,
+    form: { ...novelForm },
+    result,
+    importedCharacters: [...importedCharacters.value],
+    renderedUrls: { ...renderedUrls },
+  };
+  recentDecompositions.value = [entry, ...recentDecompositions.value].slice(0, 6);
+  activeDraftId.value = draftId;
+}
+
+function syncActiveDraftExtras() {
+  if (!activeDraftId.value) return;
+  const target = recentDecompositions.value.find((d) => d.id === activeDraftId.value);
+  if (target) {
+    target.importedCharacters = [...importedCharacters.value];
+    target.renderedUrls = { ...renderedUrls };
+  }
+}
+
+function restoreDraft(draftId) {
+  const draft = recentDecompositions.value.find((d) => d.id === draftId);
+  if (!draft) return;
+  Object.assign(novelForm, draft.form || {});
+  novelResult.value = draft.result || null;
+  importedCharacters.value = Array.isArray(draft.importedCharacters) ? [...draft.importedCharacters] : [];
+  for (const k of Object.keys(renderedUrls)) delete renderedUrls[k];
+  Object.assign(renderedUrls, draft.renderedUrls || {});
+  activeDraftId.value = draft.id;
+  persistCraftWorkspace();
+}
+
+function clearCurrentDecomposition() {
+  novelResult.value = null;
+  importedCharacters.value = [];
+  activeDraftId.value = "";
+  for (const k of Object.keys(renderedUrls)) delete renderedUrls[k];
+  persistCraftWorkspace();
+}
 
 async function handleDecomposeNovel() {
   pageError.value = "";
   decomposing.value = true;
   try {
-    novelResult.value = await craftApi.decomposeNovel({ ...novelForm });
-    ElMessage.success("AI 已完成原文拆解与全套开发资产生成");
+    const lo = Math.min(novelForm.episode_duration_min || 45, novelForm.episode_duration_max || 90);
+    const hi = Math.max(novelForm.episode_duration_min || 45, novelForm.episode_duration_max || 90);
+    const res = await craftApi.decomposeNovel({
+      ...novelForm,
+      episode_duration: Math.round((lo + hi) / 2),
+      episode_duration_min: lo,
+      episode_duration_max: hi,
+    });
+    novelResult.value = res;
+    importedCharacters.value = [];
+    for (const k of Object.keys(renderedUrls)) delete renderedUrls[k];
+    saveDecompositionToHistory(res);
+    persistCraftWorkspace();
+    ElMessage.success("AI 已完成原文拆解并自动保存在本页，切换页面也不会丢失");
   } catch (e) {
     pageError.value = e.message || "AI 拆解失败，请确认已在配置中开启付费 API 与有效模型密钥";
     ElMessage.error(pageError.value);
@@ -621,7 +806,14 @@ async function importCharactersToLibrary() {
       rate: c.rate || "+0%",
       pitch: c.pitch || "+0Hz",
     }));
-    await charactersApi.batchCreate(payload);
+    const created = await charactersApi.batchCreate(payload);
+    const createdList = Array.isArray(created) ? created : created?.characters || [];
+    importedCharacters.value = createdList.map((item) => ({
+      character_id: item.character_id || item.id,
+      name: item.name,
+    }));
+    syncActiveDraftExtras();
+    persistCraftWorkspace();
     ElMessage.success(`已将 ${payload.length} 位角色入库到「角色资产库」`);
   } catch (e) {
     ElMessage.error(e.message || "角色入库失败");
@@ -630,25 +822,92 @@ async function importCharactersToLibrary() {
   }
 }
 
+function sendFirstEpisodeToVideoCreate(customScript = "") {
+  const title = novelResult.value?.title || novelForm.title || "工坊短剧第一集";
+  const scriptBody = String(
+    customScript ||
+      novelResult.value?.first_episode_script ||
+      novelForm.novel_text ||
+      ""
+  ).trim();
+  if (!scriptBody) {
+    ElMessage.warning("当前还没有可用于生成视频的剧本内容");
+    return;
+  }
+  const charsSummary = (novelResult.value?.characters || [])
+    .slice(0, 4)
+    .map((c) => `${c.name}（${c.role || "角色"}：${c.face_dna || ""}；${c.signature_clothing || ""}）`)
+    .join("\n");
+  const fullBrief = [
+    `【剧名】${title}`,
+    charsSummary ? `【主要人物造型】\n${charsSummary}` : "",
+    `【第1集拍摄剧本】\n${scriptBody}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const lo = Number(novelResult.value?.episode_duration_min || novelForm.episode_duration_min || 45);
+  const hi = Number(novelResult.value?.episode_duration_max || novelForm.episode_duration_max || 90);
+  const prefill = {
+    title,
+    user_input: fullBrief,
+    style: novelResult.value?.style || novelForm.style || "短剧",
+    generation_mode: "storyboard_flow",
+    duration: 0,
+    duration_min: lo,
+    duration_max: hi,
+    intro_title: title.slice(0, 40),
+    character_ids: importedCharacters.value.map((c) => c.character_id).filter(Boolean),
+  };
+  localStorage.setItem(PREFILL_VIDEO_KEY, JSON.stringify(prefill));
+  persistCraftWorkspace();
+  router.push("/");
+}
+
 async function createSeriesFromDecomposition() {
   if (!novelResult.value) return;
   creatingSeries.value = true;
   try {
+    let confirmedIds = [];
+    const candidateIds = importedCharacters.value.map((c) => c.character_id).filter(Boolean);
+    if (candidateIds.length) {
+      try {
+        const list = await charactersApi.list();
+        const items = Array.isArray(list) ? list : list?.characters || [];
+        const confirmedSet = new Set(
+          items.filter((c) => c && c.confirmed && !c.archived).map((c) => c.character_id || c.id)
+        );
+        confirmedIds = candidateIds.filter((id) => confirmedSet.has(id));
+      } catch {
+        confirmedIds = [];
+      }
+    }
+    const lo = Number(novelResult.value.episode_duration_min || novelForm.episode_duration_min || 45);
+    const hi = Number(novelResult.value.episode_duration_max || novelForm.episode_duration_max || 90);
+    const target = Number(novelResult.value.episode_duration || novelForm.episode_duration || Math.round((lo + hi) / 2));
     const created = await seriesApi.create({
       title: novelResult.value.title,
       brief: novelForm.novel_text,
       total_episodes: novelResult.value.total_episodes || 5,
-      episode_duration: novelResult.value.episode_duration || 60,
+      episode_duration: Math.min(180, Math.max(10, target)),
+      episode_duration_min: Math.max(10, Math.min(lo, hi)),
+      episode_duration_max: Math.min(180, Math.max(15, lo, hi)),
+      generation_mode: "auto_director",
       style: novelResult.value.style || "短剧",
       ratio: "9:16",
       market_mode: novelResult.value.market_mode || "cn",
-      character_ids: [],
+      character_ids: confirmedIds,
       auto_continue: false,
       pre_shoot_review: true,
       initial_episodes: novelResult.value.episodes_outline,
       continuity_ledgers: novelResult.value.continuity_ledgers,
+      first_episode_script: novelResult.value.first_episode_script || null,
     });
-    ElMessage.success("连载短剧项目已创建并带入本剧连续性台账");
+    persistCraftWorkspace();
+    if (candidateIds.length && !confirmedIds.length) {
+      ElMessage.success("连载短剧项目已创建（角色尚未在「角色资产」确认定妆照，暂按剧本造型创建）");
+    } else {
+      ElMessage.success("连载短剧项目已创建并带入本剧连续性台账");
+    }
     router.push(`/series/${created.series_id || created.id}`);
   } catch (e) {
     ElMessage.error(e.message || "创建连载项目失败");
@@ -771,6 +1030,8 @@ async function renderNovelAssetImage(item, category, key) {
       ratio: "16:9",
     });
     renderedUrls[key] = res.asset_path;
+    syncActiveDraftExtras();
+    persistCraftWorkspace();
     ElMessage.success("生图完成！");
   } catch (e) {
     ElMessage.error(e.message || "生图失败，请检查图片模型与付费 API 开关");
@@ -865,6 +1126,55 @@ async function copyText(text, label = "内容") {
     ElMessage.warning("复制失败，请手动选中复制");
   }
 }
+
+onMounted(() => {
+  try {
+    const raw = localStorage.getItem(CRAFT_STORAGE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (!saved || typeof saved !== "object") return;
+    if (saved.activeTab) activeTab.value = saved.activeTab;
+    if (saved.novelForm) Object.assign(novelForm, saved.novelForm);
+    if (saved.novelResult) novelResult.value = saved.novelResult;
+    if (Array.isArray(saved.importedCharacters)) importedCharacters.value = saved.importedCharacters;
+    if (saved.renderedUrls) Object.assign(renderedUrls, saved.renderedUrls);
+    if (saved.activeDraftId) activeDraftId.value = saved.activeDraftId;
+    if (Array.isArray(saved.recentDecompositions)) recentDecompositions.value = saved.recentDecompositions;
+    if (typeof saved.reviewScriptInput === "string") reviewScriptInput.value = saved.reviewScriptInput;
+    if (saved.reviewReport) reviewReport.value = saved.reviewReport;
+    if (saved.doctorResult) doctorResult.value = saved.doctorResult;
+    if (saved.sceneForm) Object.assign(sceneForm, saved.sceneForm);
+    if (saved.sceneGridResult) sceneGridResult.value = saved.sceneGridResult;
+    if (saved.propForm) Object.assign(propForm, saved.propForm);
+    if (saved.propSheetResult) propSheetResult.value = saved.propSheetResult;
+    if (saved.videoSanitizeForm) Object.assign(videoSanitizeForm, saved.videoSanitizeForm);
+    if (saved.videoSanitizeResult) videoSanitizeResult.value = saved.videoSanitizeResult;
+  } catch {
+    // 忽略损坏的本地草稿
+  }
+});
+
+watch(
+  [
+    activeTab,
+    novelForm,
+    novelResult,
+    reviewScriptInput,
+    reviewReport,
+    doctorResult,
+    sceneForm,
+    sceneGridResult,
+    propForm,
+    propSheetResult,
+    videoSanitizeForm,
+    videoSanitizeResult,
+    renderedUrls,
+  ],
+  () => {
+    persistCraftWorkspace();
+  },
+  { deep: true }
+);
 </script>
 
 <style scoped>
@@ -891,6 +1201,7 @@ async function copyText(text, label = "内容") {
 .craft-hero h1 {
   margin: 0 0 8px;
   font-size: 26px;
+  color: #f8fafc;
 }
 .craft-hero p {
   margin: 0;
@@ -1215,5 +1526,45 @@ async function copyText(text, label = "内容") {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
   gap: 16px;
+}
+.draft-history-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+}
+.draft-history-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+}
+.draft-chip {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #334155;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.draft-chip:hover {
+  border-color: #4f46e5;
+  color: #4f46e5;
+}
+.draft-chip.active {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #ffffff;
+  font-weight: 600;
+}
+.next-step-banner {
+  background: linear-gradient(135deg, #eef2ff 0%, #f0fdf4 100%);
+  border: 1px solid #c7d2fe;
 }
 </style>

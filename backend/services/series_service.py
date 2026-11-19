@@ -51,6 +51,25 @@ async def pipeline_runner(task_id):
     return await run_pipeline(task_id)
 
 
+def episode_duration_plan(project):
+    """返回 (generation_mode, duration, range_min, range_max)。
+
+    native_10s 必须是 10 的整数倍且锁定时长；auto_director / storyboard_flow 不锁死秒数，
+    只给出弹性区间，由剧本按戏剧节奏自然决定最终时长。
+    """
+    mode = project.get('generation_mode') or 'native_10s'
+    target = int(project.get('episode_duration') or 30)
+    lo = project.get('episode_duration_min')
+    hi = project.get('episode_duration_max')
+    if mode == 'native_10s':
+        locked = max(10, ((target + 5) // 10) * 10)
+        return mode, locked, None, None
+    if lo is None or hi is None:
+        lo = max(10, int(round(target * 0.75)))
+        hi = max(lo, int(round(target * 1.25)))
+    return mode, None, int(lo), int(hi)
+
+
 class SeriesService:
     def __init__(self):
         self._active_leases = set()
@@ -158,6 +177,9 @@ class SeriesService:
                 'characters': project['characters'],
                 'total_episodes': project['total_episodes'],
                 'episode_duration': project['episode_duration'],
+                'episode_duration_range': [project.get('episode_duration_min'), project.get('episode_duration_max')]
+                if project.get('episode_duration_min') and project.get('episode_duration_max') else None,
+                'generation_mode': project.get('generation_mode') or 'native_10s',
                 'market_mode': project.get('market_mode', 'cn'),
             }
             system_msg = (
@@ -172,7 +194,7 @@ class SeriesService:
                 DeepSeekService()._call_api,
                 system_msg,
                 json.dumps(prompt, ensure_ascii=False),
-                6000,
+                8192,
             )
             normalized = normalize_outline(result.get('episodes', []), project['total_episodes'])
             for old, new in zip(project['episodes'], normalized):
@@ -200,8 +222,13 @@ class SeriesService:
         current = await self.require(sid)
         if current['characters']:
             from services.provider_factory import get_image_service
-            if not getattr(get_image_service(), 'supports_reference_images', False):
-                raise ValueError('连载角色需要支持参考图的图片模型，请先更换型号')
+            img_svc = get_image_service()
+            if not getattr(img_svc, 'supports_reference_images', False):
+                print(
+                    f"[SeriesService] Series {sid}: image model {getattr(img_svc, 'model', '')} "
+                    "does not support reference images; running with locked character DNA text + voice profiles.",
+                    flush=True,
+                )
         allowed = ['ready', 'stopped', 'failed', 'awaiting_confirmation']
         if current['status'] == 'running' and current.get('lease') not in self._active_leases:
             if (datetime.now(UTC) - datetime.fromisoformat(current['updated_at'])).total_seconds() < 60:
@@ -276,10 +303,17 @@ class SeriesService:
                            'market_mode': project.get('market_mode', 'cn'),
                            'outline_revision': project['outline_revision'], 'episode_revision': episode['revision']}
                 if not episode['task_id']:
+                    mode, duration, range_min, range_max = episode_duration_plan(project)
+                    user_input = project['brief'] + '\n本集大纲：' + json.dumps(context['episode_outline'], ensure_ascii=False)
+                    if episode['episode_num'] == 1 and project.get('first_episode_script'):
+                        user_input += '\n参考第1集拍摄剧本：\n' + str(project['first_episode_script'])[:6000]
+                    if range_min is not None and range_max is not None:
+                        user_input += f'\n本集目标时长：{range_min}–{range_max} 秒弹性区间（按剧情密度自然落在区间内，不必凑整）。'
                     task = await task_service.create_task(CreateVideoTaskRequest(
-                        user_input=project['brief'] + '\n本集大纲：' + json.dumps(context['episode_outline'], ensure_ascii=False),
-                        duration=project['episode_duration'], style=project['style'], ratio=project['ratio'],
-                        generation_mode='native_10s', pre_shoot_review=project.get('pre_shoot_review', False)))
+                        user_input=user_input,
+                        duration=duration, duration_min=range_min, duration_max=range_max,
+                        style=project['style'], ratio=project['ratio'],
+                        generation_mode=mode, pre_shoot_review=project.get('pre_shoot_review', False)))
                     episode['task_id'] = task.task_id
                     episode['input_snapshot_id'] = previous['snapshot_id'] if previous else None
                     await mongodb.update_one('video_tasks', {'_id': task.task_id}, {'series_id': sid,
@@ -317,8 +351,11 @@ class SeriesService:
                         except (OSError, RuntimeError, ValueError):
                             pass
                 planned = {'ending_hook': episode['ending_hook'], 'core_event': episode['core_event'],
+                           'actual_duration': sum(int(s.get('duration') or 0) for s in scenes),
                            'last_scene_start_state': last.get('start_state'),
                            'last_scene_end_state': last.get('effective_end_state', last.get('end_state')),
+                           'last_scene_blocking': last.get('blocking'),
+                           'ending_dialogue': last.get('voiceover'),
                            'note': '根据大纲和分镜形成的计划状态，尚未进行实际画面观察；请人工补充确认。'}
                 snapshot_id = 'snapshot_' + uuid4().hex[:16]
                 snapshot = {'_id': snapshot_id, 'snapshot_id': snapshot_id, 'series_id': sid,

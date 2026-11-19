@@ -1,7 +1,7 @@
 import os
 
 from config import settings
-from services.model_config import model_config, saved_models
+from services.model_config import is_siliconflow_url, model_config, saved_models
 from services.image.base import BaseImageService
 from services.llm.base import BaseLLMService
 from services.video.base import BaseVideoService
@@ -12,7 +12,7 @@ def _runtime_provider(env_key: str, configured_value: str) -> str:
 
 
 def get_llm_service() -> BaseLLMService:
-    provider = _runtime_provider("MODEL_PROVIDER", settings.model_provider)
+    provider = _runtime_provider("MODEL_PROVIDER", getattr(settings, "model_provider", "deepseek"))
     if provider == "deepseek":
         from services.llm.deepseek_service import DeepSeekService
 
@@ -21,9 +21,14 @@ def get_llm_service() -> BaseLLMService:
 
 
 def get_image_service() -> BaseImageService:
-    provider = _runtime_provider("IMAGE_PROVIDER", settings.image_provider)
-    if provider != "comfyui" and "image" in saved_models():
-        provider = "qwen"
+    provider = _runtime_provider("IMAGE_PROVIDER", getattr(settings, "image_provider", "qwen"))
+    saved = saved_models()
+    if provider != "comfyui" and "image" in saved:
+        provider = "siliconflow" if is_siliconflow_url(saved["image"].get("url")) else "qwen"
+    if provider == "siliconflow":
+        from services.image.siliconflow_image_service import SiliconFlowImageService
+
+        return SiliconFlowImageService()
     if provider == "qwen":
         from services.image.qwen_image_service import QwenImageService
 
@@ -42,8 +47,10 @@ def get_image_service() -> BaseImageService:
 def _resolve_video_provider_name(cfg=None) -> str:
     resolved_cfg = cfg if cfg is not None else settings
     provider = _runtime_provider("VIDEO_PROVIDER", getattr(resolved_cfg, "video_provider", "wan"))
-    if (cfg is None or cfg is settings) and provider != "comfyui" and "video" in saved_models():
-        return "wan"
+    if (cfg is None or cfg is settings) and provider != "comfyui":
+        saved = saved_models()
+        if "video" in saved:
+            return "siliconflow" if is_siliconflow_url(saved["video"].get("url")) else "wan"
     return provider
 
 
@@ -51,6 +58,18 @@ def active_video_provider_and_model(cfg=None) -> tuple[str, str]:
     """返回当前真实生效的视频服务商和模型名（感知 .env.models.local 与环境变量，同时保留测试 patch）。"""
     resolved_cfg = cfg if cfg is not None else settings
     provider = _resolve_video_provider_name(resolved_cfg)
+    if provider == "siliconflow":
+        try:
+            cfg_model = str(model_config("video", resolved_cfg).get("model") or "")
+        except Exception:
+            cfg_model = ""
+        if (
+            (cfg is None or cfg is settings)
+            and "video" not in saved_models()
+            and cfg_model == getattr(resolved_cfg, "wan_video_model", "")
+        ):
+            cfg_model = "MiniMaxAI/MiniMax-H3"
+        return provider, cfg_model or "MiniMaxAI/MiniMax-H3"
     if provider == "wan":
         try:
             model = str(model_config("video", resolved_cfg).get("model") or getattr(resolved_cfg, "wan_video_model", "") or "")
@@ -70,6 +89,10 @@ def get_video_service() -> BaseVideoService:
         from services.video.vidu_video_service import ViduVideoService
 
         return ViduVideoService()
+    if provider == "siliconflow":
+        from services.video.siliconflow_video_service import SiliconFlowVideoService
+
+        return SiliconFlowVideoService()
     if provider == "wan":
         from services.video.wan_video_service import WanVideoService
 

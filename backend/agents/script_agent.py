@@ -66,6 +66,12 @@ class ScriptAgent:
             llm_service = get_llm_service()
             task_plan = {**task_plan, "generation_mode": task.get("generation_mode", "full_dynamic"),
                          "series_context": series_prompt_context(task)}
+            if (
+                "duration_range" not in task_plan
+                and isinstance(task.get("duration_min"), int)
+                and isinstance(task.get("duration_max"), int)
+            ):
+                task_plan["duration_range"] = [task["duration_min"], task["duration_max"]]
             script_data = await anyio.to_thread.run_sync(
                 lambda _plan=task_plan: llm_service.generate_script(_plan)
             )

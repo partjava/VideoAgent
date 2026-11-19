@@ -37,6 +37,7 @@ class Settings:
     vidu_model: str = os.getenv("VIDU_MODEL", "viduq3-turbo")
     vidu_resolution: str = os.getenv("VIDU_RESOLUTION", "1080p")
     vidu_trial_resolution: str = os.getenv("VIDU_TRIAL_RESOLUTION", "720p")
+    siliconflow_video_resolution: str = os.getenv("SILICONFLOW_VIDEO_RESOLUTION", "768p")
     volcengine_api_key: str | None = os.getenv("VOLCENGINE_API_KEY")
     volcengine_model: str = os.getenv("VOLCENGINE_MODEL", "doubao-seedance-1-5-pro-251215")
     volcengine_image_model: str = os.getenv(

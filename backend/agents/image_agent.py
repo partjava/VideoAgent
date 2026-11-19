@@ -103,16 +103,29 @@ class ImageAgent:
                 raise ValueError(f"Scenes not found for task: {task_id}")
 
             from services.generation_contract import STORYBOARD_FLOW_MODE, needs_video
+            from services.model_config import generation_limits
             task_scenes = [scene for scene in task_scenes
                            if not (needs_video(scene) and scene.get("transition_type") == "continue_action")]
-            if len(task_scenes) > settings.max_images_per_task:
-                raise ValueError(f"分镜共需 {len(task_scenes)} 张首帧图，超过 MAX_IMAGES_PER_TASK={settings.max_images_per_task} 上限，请调高配置或缩短时长")
-            image_service = get_image_service()
-            # 获取任务比例，后续传给生图服务
             task = await mongodb.find_one("video_tasks", {"_id": task_id})
+            limits = generation_limits(settings)
+            max_images = int(limits.get("max_images_per_task", 20))
+            task_gen_limit = (task or {}).get("generation_limit")
+            if isinstance(task_gen_limit, int) and task_gen_limit > 0 and max_images > 0:
+                max_images = max(max_images, task_gen_limit)
+            if max_images > 0 and len(task_scenes) > max_images:
+                raise ValueError(
+                    f"分镜共需 {len(task_scenes)} 张首帧图，超过当前上限 {max_images} 张；"
+                    "请前往「API 配置 → 生成额度上限」调高或设为 0（不限制），或缩短目标时长后重试"
+                )
+            image_service = get_image_service()
             is_storyboard_flow = (task or {}).get("generation_mode") == STORYBOARD_FLOW_MODE
-            if frozen_characters(task or {}) and not getattr(image_service, "supports_reference_images", False):
-                raise ValueError("连载角色需要支持参考图的图片模型，请先在模型配置中更换型号")
+            supports_refs = bool(getattr(image_service, "supports_reference_images", False))
+            if frozen_characters(task or {}) and not supports_refs:
+                print(
+                    f"[ImageAgent] Task {task_id}: image model {getattr(image_service, 'model', '')} "
+                    "does not accept reference images; using character text DNA & style locks.",
+                    flush=True,
+                )
             task_ratio = str(task.get("ratio", "9:16")) if task else "9:16"
 
             assets: list[dict[str, object]] = []
@@ -155,7 +168,11 @@ class ImageAgent:
                             upsert=True,
                         )
                         existing_asset = asset.model_dump()
-                    choices = reference_choices_for_scene(task or {}, scene)
+                    choices = (
+                        reference_choices_for_scene(task or {}, scene)
+                        if bool(getattr(image_service, "supports_reference_images", False))
+                        else []
+                    )
                     await mongodb.update_one(
                         SCENES_COLLECTION,
                         {"_id": f"{task_id}_{scene_id}"},
@@ -220,7 +237,7 @@ class ImageAgent:
                     known_by_name.keys(),
                     key=lambda nm: (-seen_names.get(nm, 0), order_rank.get(nm, 999)),
                 )
-                headroom = max(0, int(getattr(settings, "max_images_per_task", 20) or 20) - len(task_scenes))
+                headroom = 4 if max_images <= 0 else max(0, max_images - len(task_scenes))
                 max_cards = min(4, len(ordered_names), headroom) if headroom > 0 else 0
                 card_targets = [known_by_name[nm] for nm in ordered_names[:max_cards]]
 
@@ -314,10 +331,15 @@ class ImageAgent:
                 )
                 if (task or {}).get("style") == "短剧":
                     negative_prompt = PHOTO_EXCLUSIONS + "，" + (negative_prompt or "")
-                choices = reference_choices_for_scene(task or {}, scene)
+                supports_refs = bool(getattr(image_service, "supports_reference_images", False))
+                max_refs = int(getattr(image_service, "max_reference_images", 0) or 0) if supports_refs else 0
+                choices = (
+                    reference_choices_for_scene(task or {}, scene, max_refs=min(2, max_refs))
+                    if max_refs > 0
+                    else []
+                )
                 ref_paths = [item["path"] for item in choices]
                 env_anchor = str(scene.get("scene_anchor_path") or "").strip()
-                max_refs = int(getattr(image_service, "max_reference_images", 3) or 0)
                 if env_anchor and len(ref_paths) < max_refs:
                     from services.media_quality import resolve_media
                     if resolve_media(env_anchor).is_file() and env_anchor not in ref_paths:

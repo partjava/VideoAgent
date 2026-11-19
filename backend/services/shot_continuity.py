@@ -44,6 +44,8 @@ def resolve_provider_dialect(service: Any) -> str:
         return "wan"
     if "doubao" in cls_name or "seedance" in model_name:
         return "doubao"
+    if "siliconflow" in cls_name or "minimax" in model_name:
+        return "siliconflow"
     if "vidu" in cls_name or "vidu" in model_name:
         return "vidu"
     if "comfyui" in cls_name:
@@ -104,7 +106,7 @@ def compile_prompt_for_dialect(prompt: str, dialect: str) -> str:
         # Seedance 系列适合保留清晰时间段标与因果推进句
         cleaned = _BEAT_PREFIX_RE.sub(lambda m: f"{m.group(1)}：{m.group(2).strip()}", cleaned)
         cleaned = cleaned.replace("｜", "，")
-    elif dialect in {"vidu", "comfyui"}:
+    elif dialect in {"vidu", "comfyui", "siliconflow"}:
         cleaned = cleaned.replace("@", "")
         cleaned = _BEAT_PREFIX_RE.sub(lambda m: f"{m.group(1)} {m.group(2).strip()}", cleaned)
         cleaned = cleaned.replace("｜", "，")
@@ -133,6 +135,13 @@ def adapt_video_submission(service: Any, scene: dict[str, Any], prompt: str) -> 
             extra_options["resolution"] = str(getattr(_cfg, "vidu_trial_resolution", "720p") or "720p")
         else:
             extra_options["resolution"] = str(getattr(_cfg, "vidu_resolution", "1080p") or "1080p")
+
+    if dialect == "siliconflow" and getattr(service, "supports_resolution", False) is True:
+        from config import settings as _cfg
+        if scene.get("_is_trial"):
+            extra_options["resolution"] = "480p"
+        else:
+            extra_options["resolution"] = str(getattr(_cfg, "siliconflow_video_resolution", "768p") or "768p")
 
     last_frame = scene.get("last_frame_target_path")
     if (

@@ -16,6 +16,7 @@ class ScriptSegment(BaseModel):
     voice_start: float = Field(ge=0, lt=30)
     voiceover: str = ""
     dialogue_lines: list[ScriptLine] = Field(default_factory=list)
+    allow_silent: bool = False
 
     @model_validator(mode="after")
     def validate_speech(self):
@@ -26,7 +27,7 @@ class ScriptSegment(BaseModel):
                 raise ValueError("对白出声时间必须小于本段时长")
             if any(right.start <= left.start for left, right in zip(self.dialogue_lines, self.dialogue_lines[1:])):
                 raise ValueError("对白出声时间必须依次递增")
-        elif not self.voiceover.strip():
+        elif not self.voiceover.strip() and not self.allow_silent:
             raise ValueError("旁白段落必须提供旁白文本")
         return self
 

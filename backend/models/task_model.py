@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class VideoTaskStatus(str, Enum):
@@ -27,6 +27,8 @@ class VideoTask(BaseModel):
     user_input: str = Field(..., description="Original user prompt")
     topic: str | None = Field(default=None, description="Parsed video topic")
     duration: int | None = Field(default=None, description="Target duration in seconds")
+    duration_min: int | None = Field(default=None, ge=5, le=300, description="Flexible minimum target duration in seconds")
+    duration_max: int | None = Field(default=None, ge=5, le=300, description="Flexible maximum target duration in seconds")
     style: str | None = Field(default=None, description="Video style")
     platform: str | None = Field(default=None, description="Target publishing platform")
     ratio: str | None = Field(default="9:16", description="Video aspect ratio")
@@ -51,6 +53,8 @@ class VideoTask(BaseModel):
 class CreateVideoTaskRequest(BaseModel):
     user_input: str = Field(..., min_length=1)
     duration: int | None = Field(default=None, ge=1)
+    duration_min: int | None = Field(default=None, ge=5, le=300)
+    duration_max: int | None = Field(default=None, ge=5, le=300)
     style: str | None = None
     platform: str | None = None
     ratio: str = "9:16"
@@ -63,6 +67,12 @@ class CreateVideoTaskRequest(BaseModel):
     max_heal_attempts: int = Field(default=2, ge=0, le=3)
     generation_limit: int | None = Field(default=None, ge=1, le=10000)
     character_ids: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_duration_range(self):
+        if self.duration_min is not None and self.duration_max is not None and self.duration_min > self.duration_max:
+            raise ValueError("目标最小时长不能大于最大时长")
+        return self
 
 
 class CreateVideoTaskResponse(BaseModel):

@@ -19,6 +19,12 @@ from routes.drama_craft_routes import router as drama_craft_router
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await mongodb.connect()
     try:
+        from services.settings_persistence import hydrate_settings_from_db
+
+        await hydrate_settings_from_db()
+    except Exception as exc:
+        print(f"[Startup] Settings DB hydration skipped: {exc}", flush=True)
+    try:
         yield
     finally:
         await mongodb.close()

@@ -42,6 +42,98 @@ from agents.agent_utils import (
 VAGUE_STORYBOARD_TERMS = ("震撼", "充满希望", "引发思考", "电影感", "高质量", "氛围感")
 
 
+def _sanitize_storyboard_draft(
+    draft: list[dict[str, Any]],
+    *,
+    segments: list[dict[str, Any]] | None = None,
+    allow_silent: bool = False,
+    bound_cast: list[dict[str, Any]] | None = None,
+) -> None:
+    """清洗大模型分镜草稿中常见的轻度格式瑕疵（空泛词、缺失辅助字段、越界音效时间、非法转场名及角色ID纠偏），避免无意义硬崩溃。"""
+    valid_transitions = {"cut", "continue_action", "scene_change"}
+    valid_sfx = {"footstep", "impact", "water", "paper", "wind"}
+    cast_ids = {str(c.get("character_id")).strip() for c in (bound_cast or []) if isinstance(c, dict) and c.get("character_id")}
+    name_to_id = {
+        str(c.get("name")).strip(): str(c.get("character_id")).strip()
+        for c in (bound_cast or [])
+        if isinstance(c, dict) and c.get("name") and c.get("character_id")
+    }
+    for idx, scene in enumerate(draft):
+        if cast_ids and isinstance(scene.get("character_ids"), list):
+            cleaned_ids: list[str] = []
+            for raw_cid in scene["character_ids"]:
+                cid = str(raw_cid or "").strip()
+                mapped = cid if cid in cast_ids else name_to_id.get(cid)
+                if mapped and mapped not in cleaned_ids:
+                    cleaned_ids.append(mapped)
+            scene["character_ids"] = cleaned_ids
+        seg = segments[idx] if segments and idx < len(segments) and isinstance(segments[idx], dict) else {}
+        if not str(scene.get("scene_id") or "").strip():
+            scene["scene_id"] = f"scene_{idx + 1:02d}"
+        scene["scene_index"] = idx + 1
+        dur = max(3 if allow_silent else 4, min(12, int(scene.get("duration") or seg.get("duration") or 5)))
+        scene["duration"] = dur
+
+        trans = str(scene.get("transition_type") or "cut").strip()
+        if trans not in valid_transitions:
+            trans = "scene_change" if any(k in trans.lower() for k in ("flash", "fade", "dissolve", "change", "dream")) else "cut"
+        if trans == "continue_action":
+            if idx == 0:
+                trans = "cut"
+            elif not str(draft[idx - 1].get("end_state") or "").strip():
+                prev_vis = str(draft[idx - 1].get("visual_description") or "").strip()
+                if prev_vis:
+                    draft[idx - 1]["end_state"] = prev_vis[:60]
+                else:
+                    trans = "cut"
+        scene["transition_type"] = trans
+
+        vis = str(scene.get("visual_description") or seg.get("plot") or "").strip()
+        for vague in VAGUE_STORYBOARD_TERMS:
+            vis = vis.replace(vague, "")
+        vis = re.sub(r"[，,、]{2,}", "，", vis).strip("，, ")
+        if len(vis) < 6:
+            fallback_vis = str(seg.get("plot") or scene.get("voiceover") or "镜头推进呈现当前人物动作与空间反应").strip()
+            vis = f"{vis} {fallback_vis}".strip()
+            if len(vis) < 6:
+                vis = "中景实拍人物动作与神情变化过程"
+        scene["visual_description"] = vis
+
+        if len(str(scene.get("character_state") or "").strip()) < 2:
+            scene["character_state"] = "情绪紧绷转为警觉反应"
+        if len(str(scene.get("scene_continuity") or "").strip()) < 2:
+            scene["scene_continuity"] = "承接上一镜空间位置与人物状态" if idx > 0 else "建立主场景空间与人物初始方位"
+        if len(str(scene.get("transition_note") or "").strip()) < 2:
+            scene["transition_note"] = "动作收束后硬切下一镜"
+
+        v_start = float(scene.get("voice_start") or 0.0)
+        scene["voice_start"] = max(0.0, min(round(dur - 0.5, 2), v_start))
+
+        raw_cues = scene.get("sound_cues")
+        if isinstance(raw_cues, list):
+            clean_cues = []
+            for cue in raw_cues:
+                if not isinstance(cue, dict):
+                    continue
+                cname = str(cue.get("name") or "").strip().lower()
+                if cname not in valid_sfx:
+                    continue
+                try:
+                    cstart = float(cue.get("start") or 0.0)
+                except (TypeError, ValueError):
+                    cstart = 0.0
+                clean_cues.append({"name": cname, "start": round(max(0.0, min(dur - 0.1, cstart)), 2)})
+            scene["sound_cues"] = clean_cues
+        else:
+            scene["sound_cues"] = []
+
+        if not allow_silent and not scene.get("dialogue_lines") and len(str(scene.get("voiceover") or "").strip()) < 2:
+            fallback_vo = str(seg.get("voiceover") or "").strip()
+            if len(fallback_vo) >= 2:
+                scene["voiceover"] = fallback_vo
+                scene["subtitle"] = fallback_vo
+
+
 def _spoken_char_count(text: str) -> int:
     return len(re.findall(r"[\w\u4e00-\u9fff]", text))
 
@@ -230,6 +322,18 @@ class StoryboardAgent:
                             task_id,
                             {"duration": resolved_duration, "metadata.task_plan.duration": resolved_duration},
                         )
+                _sanitize_storyboard_draft(
+                    draft,
+                    segments=segments,
+                    allow_silent=_generation_mode == STORYBOARD_FLOW_MODE,
+                    bound_cast=frozen_characters(task),
+                )
+                if not task.get("duration_locked") and _generation_mode in {AUTO_DIRECTOR_MODE, STORYBOARD_FLOW_MODE}:
+                    resolved_duration = sum(int(s["duration"]) for s in draft)
+                    await task_service.update_task_fields(
+                        task_id,
+                        {"duration": resolved_duration, "metadata.task_plan.duration": resolved_duration},
+                    )
                 validate_storyboard_scenes(
                     draft,
                     target_duration=resolved_duration,

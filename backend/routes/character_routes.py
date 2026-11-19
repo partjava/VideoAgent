@@ -40,6 +40,28 @@ async def batch_create_characters(payload: list[CharacterFields]):
     return await respond(character_service.batch_create(payload))
 
 
+@router.get("/image-capabilities", response_model=ApiResponse)
+async def get_character_image_capabilities():
+    from services.provider_factory import get_image_service
+
+    try:
+        svc = get_image_service()
+        data = {
+            "model": str(getattr(svc, "model", "") or ""),
+            "supports_reference_images": bool(getattr(svc, "supports_reference_images", False)),
+            "max_reference_images": int(getattr(svc, "max_reference_images", 0) or 0),
+            "recommended_models": ["Qwen/Qwen-Image-Edit-2509", "black-forest-labs/FLUX.1-Kontext-dev"],
+        }
+    except Exception:
+        data = {
+            "model": "",
+            "supports_reference_images": False,
+            "max_reference_images": 0,
+            "recommended_models": ["Qwen/Qwen-Image-Edit-2509", "black-forest-labs/FLUX.1-Kontext-dev"],
+        }
+    return JSONResponse(content={"status": "success", "data": data})
+
+
 @router.get("/{character_id}", response_model=ApiResponse)
 async def get_character(character_id: str):
     return await respond(character_service.get(character_id))

@@ -4,6 +4,7 @@ const path = (id) => `/${encodeURIComponent(id)}`;
 export const charactersApi = {
   list: (includeArchived = false) =>
     client.get("", { params: includeArchived ? { include_archived: true } : {} }),
+  imageCapabilities: () => client.get("/image-capabilities"),
   create: (data) => client.post("", data),
   batchCreate: (items) => client.post("/batch", items),
   update: (id, data) => client.put(path(id), data),

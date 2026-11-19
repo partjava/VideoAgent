@@ -1,5 +1,14 @@
 <template>
   <el-card class="form-card" shadow="never">
+    <el-alert
+      v-if="prefillNotice"
+      :title="prefillNotice"
+      type="success"
+      show-icon
+      closable
+      style="margin-bottom: 16px"
+      @close="prefillNotice = ''"
+    />
     <el-form :model="form" label-position="top" @submit.prevent="handleSubmit">
       <el-form-item label="视频生成需求" required>
         <el-input
@@ -63,14 +72,33 @@
           </el-select>
         </el-form-item>
 
-        <el-form-item label="目标时长" class="form-item-third">
-          <el-select v-model="form.duration" placeholder="选择预计时长" class="full-width">
-            <el-option :label="form.generation_mode === 'storyboard_flow' ? '自动（由剧本与单元数决定）' : '自动'" :value="0" />
-            <el-option label="10 秒测试" :value="10" />
-            <el-option label="30 秒" :value="30" />
-            <el-option label="60 秒" :value="60" />
-            <el-option label="90 秒" :value="90" />
-          </el-select>
+        <el-form-item :label="form.generation_mode === 'native_10s' ? '目标时长（10秒倍数）' : '目标时长范围'" class="form-item-third">
+          <template v-if="form.generation_mode === 'native_10s'">
+            <el-select v-model="form.duration" placeholder="选择预计时长" class="full-width">
+              <el-option label="自动（10 秒倍数）" :value="0" />
+              <el-option label="10 秒测试" :value="10" />
+              <el-option label="20 秒" :value="20" />
+              <el-option label="30 秒" :value="30" />
+              <el-option label="60 秒" :value="60" />
+              <el-option label="90 秒" :value="90" />
+            </el-select>
+          </template>
+          <template v-else>
+            <el-select v-model="durationPreset" class="full-width">
+              <el-option label="自动（AI 按剧情节奏决定）" value="auto" />
+              <el-option label="15–30 秒（快节奏测试）" value="15-30" />
+              <el-option label="30–60 秒（标准短剧 · 推荐）" value="30-60" />
+              <el-option label="45–90 秒（中长强冲突）" value="45-90" />
+              <el-option label="60–120 秒（完整叙事）" value="60-120" />
+              <el-option label="自定义范围" value="custom" />
+            </el-select>
+            <div v-if="durationPreset === 'custom'" class="custom-range-row">
+              <el-input-number v-model="form.duration_min" :min="10" :max="180" :step="5" size="small" controls-position="right" />
+              <span>~</span>
+              <el-input-number v-model="form.duration_max" :min="10" :max="180" :step="5" size="small" controls-position="right" />
+              <span>秒</span>
+            </div>
+          </template>
         </el-form-item>
 
         <el-form-item label="画面比例" class="form-item-third">
@@ -88,7 +116,10 @@
         <span v-else-if="form.generation_mode === 'paired_5s'">每段由两个 5 秒连续动作镜头拼接而成。</span>
         <span v-else>关键镜头生成动态视频，其余镜头辅以运镜衔接。</span>
         <span class="estimate-badge">预计消耗：约 {{ estimatedUsage.images }} 张图 + {{ estimatedUsage.videos }} 段视频（共 {{ estimatedUsage.total }} 次生成操作）</span>
-        <p v-if="limitWarning" class="limit-warning">⚠️ {{ limitWarning }}</p>
+        <p v-if="limitWarning" class="limit-warning">
+          ⚠️ {{ limitWarning }}
+          <router-link to="/settings" class="limit-settings-link">去「API 配置」调高或设为不限制 →</router-link>
+        </p>
       </div>
 
       <div class="workflow-switches">
@@ -167,10 +198,21 @@ const emit = defineEmits(['submit'])
 
 const confirmedCharacters = ref([])
 const capabilities = ref(null)
+const prefillNotice = ref('')
+const durationPreset = ref('auto')
+
+const RANGE_PRESETS = {
+  '15-30': [15, 30],
+  '30-60': [30, 60],
+  '45-90': [45, 90],
+  '60-120': [60, 120],
+}
 
 const form = reactive({
   user_input: '',
   duration: 0,
+  duration_min: 30,
+  duration_max: 60,
   style: '短剧',
   ratio: '9:16',
   generation_mode: 'auto_director',
@@ -182,6 +224,17 @@ const form = reactive({
   pre_shoot_review: false,
   generation_limit: '',
   character_ids: []
+})
+
+const activeDurationBounds = computed(() => {
+  if (form.generation_mode === 'native_10s') return null
+  if (durationPreset.value === 'auto') return null
+  if (durationPreset.value === 'custom') {
+    const a = Number(form.duration_min || 30)
+    const b = Number(form.duration_max || 60)
+    return [Math.min(a, b), Math.max(a, b)]
+  }
+  return RANGE_PRESETS[durationPreset.value] || null
 })
 
 onMounted(async () => {
@@ -197,10 +250,53 @@ onMounted(async () => {
   } catch {
     capabilities.value = null
   }
+  try {
+    const rawPrefill = localStorage.getItem('videoagent_prefill_task')
+    if (rawPrefill) {
+      const prefill = JSON.parse(rawPrefill)
+      localStorage.removeItem('videoagent_prefill_task')
+      if (prefill && typeof prefill === 'object') {
+        if (prefill.user_input) form.user_input = String(prefill.user_input)
+        if (prefill.style) form.style = String(prefill.style)
+        if (prefill.generation_mode) form.generation_mode = String(prefill.generation_mode)
+        if (prefill.duration_min && prefill.duration_max) {
+          const lo = Number(prefill.duration_min)
+          const hi = Number(prefill.duration_max)
+          const key = `${lo}-${hi}`
+          if (RANGE_PRESETS[key]) {
+            durationPreset.value = key
+          } else {
+            durationPreset.value = 'custom'
+            form.duration_min = lo
+            form.duration_max = hi
+          }
+        } else if (prefill.duration !== undefined && prefill.duration !== null) {
+          form.duration = Number(prefill.duration)
+        }
+        if (prefill.intro_title) form.intro_title = String(prefill.intro_title)
+        if (Array.isArray(prefill.character_ids) && prefill.character_ids.length) {
+          const confirmedIds = new Set(confirmedCharacters.value.map(c => c.character_id))
+          form.character_ids = prefill.character_ids.filter(id => confirmedIds.has(id))
+        }
+        prefillNotice.value = `已从「短剧导演工坊」自动载入剧本：《${prefill.title || '工坊剧本'}》。确认画面比例与模式后，点击下方「开始生成视频」即可开拍。`
+      }
+    }
+  } catch {
+    // 忽略异常预填数据
+  }
+})
+
+const expectedSeconds = computed(() => {
+  if (form.generation_mode !== 'native_10s') {
+    const bounds = activeDurationBounds.value
+    if (bounds) return Math.round((bounds[0] + bounds[1]) / 2)
+    return form.generation_mode === 'storyboard_flow' ? 60 : 30
+  }
+  return form.duration > 0 ? form.duration : 30
 })
 
 const estimatedUsage = computed(() => {
-  const seconds = form.duration > 0 ? form.duration : (form.generation_mode === 'storyboard_flow' ? 60 : 30)
+  const seconds = expectedSeconds.value
   if (form.generation_mode === 'storyboard_flow') {
     const clips = Math.max(2, Math.round(seconds / 4))
     const images = clips + (Array.isArray(form.character_ids) && form.character_ids.length > 0 ? 0 : 2)
@@ -219,19 +315,25 @@ const limitWarning = computed(() => {
   const caps = capabilities.value
   if (!caps) return ''
   const est = estimatedUsage.value
-  const seconds = form.duration > 0 ? form.duration : (form.generation_mode === 'storyboard_flow' ? 60 : 30)
+  const seconds = expectedSeconds.value
+  const taskGenLimit = String(form.generation_limit ?? '').trim()
+    ? Number.parseInt(form.generation_limit, 10)
+    : 0
+  const maxImages = caps.max_images_per_task > 0
+    ? (taskGenLimit > 0 ? Math.max(caps.max_images_per_task, taskGenLimit) : caps.max_images_per_task)
+    : 0
   const reasons = []
-  if (est.images > caps.max_images_per_task) {
-    reasons.push(`预计首帧/设定图约 ${est.images} 张 > 上限 ${caps.max_images_per_task} 张`)
+  if (maxImages > 0 && est.images > maxImages) {
+    reasons.push(`预计首帧/设定图约 ${est.images} 张 > 上限 ${maxImages} 张`)
   }
-  if (est.videos > caps.max_dynamic_scenes_per_task) {
+  if (caps.max_dynamic_scenes_per_task > 0 && est.videos > caps.max_dynamic_scenes_per_task) {
     reasons.push(`预计动态镜约 ${est.videos} 段 > 上限 ${caps.max_dynamic_scenes_per_task} 段`)
   }
-  if (seconds > caps.max_video_seconds_per_task) {
+  if (caps.max_video_seconds_per_task > 0 && seconds > caps.max_video_seconds_per_task) {
     reasons.push(`目标时长 ${seconds} 秒 > 上限 ${caps.max_video_seconds_per_task} 秒`)
   }
   if (!reasons.length) return ''
-  return `${reasons.join('；')}。建议调高后端 .env 配置，或缩短时长 / 拆分成多集连载运行。`
+  return `${reasons.join('；')}。可直接调高额度，或缩短时长 / 拆分成多集连载运行。`
 })
 
 const handleSubmit = () => {
@@ -241,9 +343,12 @@ const handleSubmit = () => {
   const limitNum = String(form.generation_limit ?? '').trim()
     ? Number.parseInt(form.generation_limit, 10)
     : null
+  const bounds = activeDurationBounds.value
   emit('submit', {
     ...form,
-    duration: form.duration || null,
+    duration: form.generation_mode === 'native_10s' ? (form.duration || null) : null,
+    duration_min: bounds ? bounds[0] : null,
+    duration_max: bounds ? bounds[1] : null,
     style: form.style || null,
     generation_limit: Number.isInteger(limitNum) && limitNum > 0 ? limitNum : null,
     character_ids: Array.isArray(form.character_ids) ? form.character_ids : []
@@ -376,6 +481,21 @@ const handleSubmit = () => {
   color: #92400e;
   font-size: 12px;
   line-height: 1.5;
+}
+.limit-settings-link {
+  margin-left: 6px;
+  color: #2563eb;
+  font-weight: 600;
+  text-decoration: none;
+}
+.limit-settings-link:hover {
+  text-decoration: underline;
+}
+.custom-range-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .submit-button:active {

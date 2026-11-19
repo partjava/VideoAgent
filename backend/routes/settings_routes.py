@@ -245,10 +245,41 @@ from pydantic import BaseModel, SecretStr
 from urllib.parse import urlsplit
 
 from services.image.qwen_image_service import REFERENCE_MODELS as SUPPORTED_QWEN_IMAGE_MODELS
-from services.model_config import KINDS, model_config, save_models, saved_models, validate_config
+from services.model_config import (
+    KINDS,
+    clear_limits,
+    env_default_limits,
+    generation_limits,
+    is_siliconflow_url,
+    model_config,
+    save_limits,
+    save_models,
+    saved_limits,
+    saved_models,
+    siliconflow_v1_base,
+    validate_config,
+)
+from services.settings_persistence import (
+    hydrate_limits_from_db,
+    hydrate_models_from_db,
+    persist_limits_to_db,
+    persist_models_to_db,
+)
 from services.video.wan_video_service import FLASH_MODEL, SILENT_OUTPUT_MODELS, WAN3_MODELS
 
 SUPPORTED_WAN_VIDEO_MODELS = SILENT_OUTPUT_MODELS | WAN3_MODELS | {FLASH_MODEL}
+SUPPORTED_SILICONFLOW_VIDEO_MODELS = frozenset({"MiniMaxAI/MiniMax-H3"})
+SUPPORTED_SILICONFLOW_IMAGE_MODELS = frozenset({
+    "Qwen/Qwen-Image-Edit-2509",
+    "Qwen/Qwen-Image-Edit",
+    "Qwen/Qwen-Image",
+    "black-forest-labs/FLUX.1-Kontext-dev",
+    "black-forest-labs/FLUX.1-Kontext-pro",
+    "black-forest-labs/FLUX.1-Kontext-max",
+    "black-forest-labs/FLUX.1-dev",
+    "black-forest-labs/FLUX.1-schnell",
+    "Kwai-Kolors/Kolors",
+})
 SUPPORTED_DASHSCOPE_IMAGE_MODELS = frozenset(SUPPORTED_QWEN_IMAGE_MODELS) | {
     "wan2.7-image",
     "wan2.6-image",
@@ -280,6 +311,10 @@ def model_catalog_url(kind, base):
 
 
 def model_catalog_candidates(kind: str, base: str) -> list[str]:
+    if is_siliconflow_url(base):
+        sf_v1 = siliconflow_v1_base(base)
+        sf_type = {"prompt": "text", "image": "image", "video": "video"}.get(kind, "text")
+        return [f"{sf_v1}/models?type={sf_type}", f"{sf_v1}/models"]
     primary = model_catalog_url(kind, base)
     root = dashscope_base_url(base)
     if kind == "prompt":
@@ -353,15 +388,17 @@ def matches_third_party_video_catalog(item: dict, model_id: str) -> bool:
     return bool(
         re.search(
             r"(?:^|[-_/])(?:video|i2v|t2v|v2v|r2v|s2v|kling|vidu|seedance|veo|wanx?\d*(?:\.\d+)*|"
-            r"cogvideox?|hunyuan-video|luma|runway|sora|hailuo|minimax-video|pika|mochi)(?:[-_\d.]|$)",
+            r"cogvideox?|hunyuan-video|luma|runway|sora|hailuo|minimax(?:-video|-h\d+)?|pika|mochi)(?:[-_\d.]|$)",
             name,
         )
     )
 
 
-def matches_model_catalog(kind, item, model_id):
+def matches_model_catalog(kind, item, model_id, *, siliconflow: bool = False):
     name = model_id.lower().rsplit("/", 1)[-1]
     if kind == "video":
+        if siliconflow:
+            return model_id in SUPPORTED_SILICONFLOW_VIDEO_MODELS or matches_third_party_video_catalog(item, model_id)
         return model_id in SUPPORTED_WAN_VIDEO_MODELS or name in SUPPORTED_WAN_VIDEO_MODELS
 
     inputs = item.get("input_modalities")
@@ -373,7 +410,7 @@ def matches_model_catalog(kind, item, model_id):
     wan_image = bool(re.match(r"wanx?\d+(?:\.\d+)*-(?:image|t2i)(?:-|$)", name))
     edit_only = bool(re.search(r"(?:^|[-_])(?:edit|imageedit|i2i|inpaint)(?:[-_]|$)", name))
     if kind == "image":
-        if edit_only:
+        if edit_only and not siliconflow:
             return False
         if isinstance(outputs, list):
             return "image" in outputs and (isinstance(inputs, list) or qwen_image or wan_image)
@@ -431,16 +468,19 @@ def effective_model(kind, payload):
 
 
 @router.get("/models")
-def get_models():
+async def get_models():
+    await hydrate_models_from_db()
     models = {}
     configured = saved_models()
+    db_connected = getattr(mongodb, "database", None) is not None
     for kind in KINDS:
         config = model_config(kind)
         local_key = configured.get(kind, {}).get("key")
         key_source = "local" if local_key else "environment" if config["key"] else "none"
         models[kind] = {"url": config["url"], "model": config["model"],
                         "has_key": bool(config["key"]), "key_source": key_source,
-                        "active": kind in configured}
+                        "active": kind in configured,
+                        "persisted_in_db": db_connected and kind in configured}
     return {"status": "success", "data": models}
 
 
@@ -452,7 +492,11 @@ async def put_model(kind: Literal["prompt", "image", "video"], payload: ModelInp
     models = saved_models()
     models[kind] = config
     save_models(models)
-    return {"status": "success", "data": {"has_key": True, "key_source": "local", "active": True}}
+    persisted = await persist_models_to_db(models)
+    return {
+        "status": "success",
+        "data": {"has_key": True, "key_source": "local", "active": True, "persisted_in_db": persisted},
+    }
 
 
 @router.delete("/models/{kind}/key")
@@ -463,7 +507,8 @@ async def clear_model_key(kind: Literal["prompt", "image", "video"]):
         # Keep an explicit empty key so the environment key is not reused.
         profile["key"] = ""
         save_models(models)
-    return {"status": "success", "data": get_models()["data"][kind]}
+        await persist_models_to_db(models)
+    return {"status": "success", "data": (await get_models())["data"][kind]}
 
 
 @router.post("/models/{kind}/test")
@@ -473,8 +518,8 @@ async def test_model(kind: Literal["prompt", "image", "video"], payload: ModelIn
         raise HTTPException(422, detail="Enter a key for this URL.")
     headers = {"Authorization": f"Bearer {config['key']}"}
     probe_urls = (
-        model_catalog_candidates("prompt", config["url"])
-        if kind == "prompt"
+        model_catalog_candidates(kind, config["url"])
+        if kind == "prompt" or is_siliconflow_url(config["url"])
         else [
             f"{dashscope_base_url(config['url'])}/api/v1/files",
             *model_catalog_candidates(kind, config["url"]),
@@ -542,6 +587,7 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
         raise HTTPException(422, detail="Enter a key for this URL.")
     candidates = model_catalog_candidates(kind, config["url"])
     official_dashscope = _is_dashscope_url(config["url"])
+    sf_mode = is_siliconflow_url(config["url"])
     headers = {"Authorization": f"Bearer {config['key']}"}
     items = None
     last_response = None
@@ -573,7 +619,7 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
     models = sorted({
         model_id for item in (items if available else [])
         if isinstance(item, dict) and isinstance(item.get("id"), str)
-        and (model_id := item["id"].strip()) and matches_model_catalog(kind, item, model_id)
+        and (model_id := item["id"].strip()) and matches_model_catalog(kind, item, model_id, siliconflow=sf_mode)
     })
     suggestion_source = "none"
     if official_dashscope and kind == "video":
@@ -581,6 +627,12 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
         suggestion_source = "official" if suggested_models else "none"
     elif official_dashscope and kind == "image":
         suggested_models = sorted(SUPPORTED_DASHSCOPE_IMAGE_MODELS.difference(models))
+        suggestion_source = "official" if suggested_models else "none"
+    elif sf_mode and kind == "video":
+        suggested_models = sorted(SUPPORTED_SILICONFLOW_VIDEO_MODELS.difference(models))
+        suggestion_source = "official" if suggested_models else "none"
+    elif sf_mode and kind == "image":
+        suggested_models = sorted(SUPPORTED_SILICONFLOW_IMAGE_MODELS.difference(models))
         suggestion_source = "official" if suggested_models else "none"
     elif kind == "video" and available:
         suggested_models = sorted({
@@ -601,3 +653,42 @@ async def query_model_catalog(kind: Literal["prompt", "image", "video"], payload
         "suggestion_source": suggestion_source,
         "endpoint": last_response.request.url.path if (last_response is not None and getattr(last_response, "request", None) is not None) else None,
     }}
+
+
+class LimitsInput(BaseModel):
+    max_images_per_task: int = 0
+    max_video_seconds_per_task: int = 0
+    max_dynamic_scenes_per_task: int = 0
+
+
+@router.get("/limits")
+async def get_limits():
+    await hydrate_limits_from_db()
+    local = saved_limits()
+    effective = generation_limits()
+    return {
+        "status": "success",
+        "data": {
+            **effective,
+            "source": "local" if local else "env",
+            "persisted_in_db": getattr(mongodb, "database", None) is not None and bool(local),
+            "env_defaults": env_default_limits(),
+        },
+    }
+
+
+@router.put("/limits")
+async def update_limits(body: LimitsInput):
+    try:
+        cleaned = save_limits(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    await persist_limits_to_db(cleaned)
+    return await get_limits()
+
+
+@router.delete("/limits")
+async def reset_limits():
+    clear_limits()
+    await persist_limits_to_db(None)
+    return await get_limits()

@@ -47,6 +47,9 @@ def normalize_segments_for_mode(
         seg = dict(raw_seg)
         seg_dur = 10 if mode == NATIVE_GENERATION_MODE else max(min_sec, min(max_sec, int(seg.get("duration") or 8)))
         seg["duration"] = seg_dur
+        seg["voiceover"] = str(seg.get("voiceover") or "")
+        if mode == STORYBOARD_FLOW_MODE:
+            seg["allow_silent"] = True
         v_start = float(seg.get("voice_start") or 0.0)
         seg["voice_start"] = max(0.0, min(round(seg_dur - 0.5, 2), v_start))
         lines = seg.get("dialogue_lines")
@@ -69,10 +72,16 @@ def normalize_segments_for_mode(
                     line_obj["emotion"] = emotion
                 fixed_lines.append(line_obj)
                 cursor = round(safe_start + 0.1, 2)
+            if len(fixed_lines) > 1 and any(
+                right["start"] <= left["start"] for left, right in zip(fixed_lines, fixed_lines[1:])
+            ):
+                step = max(0.05, round((seg_dur - 0.2) / len(fixed_lines), 2))
+                for idx, item in enumerate(fixed_lines):
+                    item["start"] = round(min(seg_dur - 0.1, idx * step), 2)
             seg["dialogue_lines"] = fixed_lines
             if fixed_lines:
                 seg["voice_start"] = fixed_lines[0]["start"]
-                if not str(seg.get("voiceover") or "").strip():
+                if not seg["voiceover"].strip():
                     seg["voiceover"] = "\n".join(item["text"] for item in fixed_lines)
         normalized.append(seg)
     return normalized

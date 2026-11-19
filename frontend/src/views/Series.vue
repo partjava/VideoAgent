@@ -33,7 +33,7 @@
           <p>{{ project.brief }}</p>
           <p>
             {{ project.total_episodes }} 集 · 每集
-            {{ project.episode_duration }} 秒 · {{ project.style }} ·
+            {{ durationText(project) }} · {{ modeText(project.generation_mode) }} · {{ project.style }} ·
             {{ project.ratio }}
           </p>
           <div class="heading">
@@ -66,10 +66,33 @@
                   :key="n"
                   :value="n"
                   :label="`${n} 集`" /></el-select></el-form-item
-            ><el-form-item label="单集时长"
+            ><el-form-item label="生成模式"
+              ><el-select v-model="form.generation_mode"
+                ><el-option value="auto_director" label="AI 自主导演（推荐 · 弹性时长）" /><el-option
+                  value="storyboard_flow"
+                  label="剧组单元自由流（多镜交替 · 弹性时长）" /><el-option
+                  value="native_10s"
+                  label="原生 10 秒整切（时长须为 10 的倍数）" /></el-select
+            ></el-form-item>
+          </div>
+          <div class="row" v-if="form.generation_mode !== 'native_10s'">
+            <el-form-item label="单集时长范围（秒）">
+              <div class="range-row">
+                <el-input-number v-model="form.episode_duration_min" :min="10" :max="180" :step="5" controls-position="right" />
+                <span>~</span>
+                <el-input-number v-model="form.episode_duration_max" :min="10" :max="180" :step="5" controls-position="right" />
+              </div>
+              <div class="preset-row">
+                <button v-for="p in rangePresets" :key="p.label" type="button" class="preset-chip"
+                  @click="form.episode_duration_min = p.min; form.episode_duration_max = p.max">{{ p.label }}</button>
+              </div>
+            </el-form-item>
+          </div>
+          <div class="row" v-else>
+            <el-form-item label="单集时长（10 秒整数倍）"
               ><el-select v-model="form.episode_duration"
                 ><el-option
-                  v-for="n in [10, 30, 60, 90]"
+                  v-for="n in [10, 20, 30, 40, 60, 90, 120]"
                   :key="n"
                   :value="n"
                   :label="`${n} 秒`" /></el-select
@@ -143,6 +166,7 @@ import BasicLayout from "../layouts/BasicLayout.vue";
 import { seriesApi } from "../api/series";
 import { charactersApi } from "../api/characters";
 import { statusText } from "../utils/seriesStatus";
+import { durationText, modeText } from "../utils/seriesDuration";
 const router = useRouter(),
   projects = ref([]),
   characters = ref([]),
@@ -155,6 +179,9 @@ const form = reactive({
   brief: "",
   total_episodes: 3,
   episode_duration: 30,
+  episode_duration_min: 45,
+  episode_duration_max: 90,
+  generation_mode: "auto_director",
   style: "短剧",
   ratio: "9:16",
   market_mode: "cn",
@@ -163,8 +190,18 @@ const form = reactive({
   pre_shoot_review: false,
   generation_limit: "",
 });
+const rangePresets = [
+  { label: "30–60 秒", min: 30, max: 60 },
+  { label: "45–90 秒", min: 45, max: 90 },
+  { label: "60–120 秒", min: 60, max: 120 },
+];
+const flexibleMode = computed(() => form.generation_mode !== "native_10s");
 const estimatedSeriesOps = computed(() => {
-  const clipsPerEp = Math.max(1, Math.ceil((form.episode_duration || 30) / 10));
+  const seconds = flexibleMode.value
+    ? Math.round(((form.episode_duration_min || 30) + (form.episode_duration_max || 60)) / 2)
+    : form.episode_duration || 30;
+  const perClip = form.generation_mode === "storyboard_flow" ? 5 : form.generation_mode === "auto_director" ? 9 : 10;
+  const clipsPerEp = Math.max(1, Math.ceil(seconds / perClip));
   const episodes = form.total_episodes || 1;
   const images = clipsPerEp * episodes;
   const videos = clipsPerEp * episodes;
@@ -193,8 +230,13 @@ async function create() {
     const limitNum = String(form.generation_limit ?? "").trim()
       ? Number.parseInt(form.generation_limit, 10)
       : null;
+    const lo = Math.min(form.episode_duration_min || 30, form.episode_duration_max || 60);
+    const hi = Math.max(form.episode_duration_min || 30, form.episode_duration_max || 60);
     const project = await seriesApi.create({
       ...form,
+      episode_duration: flexibleMode.value ? Math.round((lo + hi) / 2) : form.episode_duration,
+      episode_duration_min: flexibleMode.value ? lo : null,
+      episode_duration_max: flexibleMode.value ? hi : null,
       generation_limit: Number.isInteger(limitNum) && limitNum > 0 ? limitNum : null,
     });
     dialog.value = false;
@@ -276,5 +318,28 @@ p {
 }
 .el-select {
   width: 100%;
+}
+.range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.preset-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.preset-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  font-size: 12px;
+  cursor: pointer;
+}
+.preset-chip:hover {
+  border-color: #4f46e5;
+  color: #4f46e5;
 }
 </style>

@@ -74,24 +74,48 @@ class DialoguePolishAgent:
             ]
             dialogues = []
             if narration_scenes:
-                llm_service = get_llm_service()
-                dialogues = await anyio.to_thread.run_sync(
-                    lambda: llm_service.polish_dialogue(narration_scenes, target_duration=_target_duration)
-                )
-            dialogue_by_scene_id = {str(item.get("scene_id")): item for item in dialogues}
+                try:
+                    llm_service = get_llm_service()
+                    dialogues = await anyio.to_thread.run_sync(
+                        lambda: llm_service.polish_dialogue(narration_scenes, target_duration=_target_duration)
+                    ) or []
+                except Exception as polish_exc:
+                    print(f"[DialoguePolishAgent] Polish call fallback to storyboard lines: {polish_exc}", flush=True)
+                    dialogues = []
+            dialogue_by_scene_id = {
+                str(item.get("scene_id")): item
+                for item in dialogues
+                if isinstance(item, dict) and item.get("scene_id") is not None
+            }
+            dialogue_by_index = {
+                int(item.get("scene_index")): item
+                for item in dialogues
+                if isinstance(item, dict) and str(item.get("scene_index") or "").isdigit()
+            }
+            narration_pos = {str(sc.get("scene_id")): pos for pos, sc in enumerate(narration_scenes)}
 
             updated_scenes: list[dict[str, Any]] = []
             now = datetime.now(UTC)
             for scene in task_scenes:
                 scene_id = str(scene.get("scene_id"))
-                dialogue = dialogue_by_scene_id.get(scene_id)
+                scene_idx = int(scene.get("scene_index") or 0)
+                dialogue = dialogue_by_scene_id.get(scene_id) or dialogue_by_index.get(scene_idx)
+                if dialogue is None and scene_id in narration_pos:
+                    pos = narration_pos[scene_id]
+                    if pos < len(dialogues) and isinstance(dialogues[pos], dict):
+                        dialogue = dialogues[pos]
                 if scene.get("dialogue_lines"):
                     spoken = "\n".join(line["text"] for line in scene["dialogue_lines"])
                     dialogue = {"speaker": scene["dialogue_lines"][0]["speaker"], "voiceover": spoken, "subtitle": spoken}
                 elif is_flow and not str(scene.get("voiceover") or "").strip():
                     dialogue = {"speaker": str(scene.get("speaker") or "无"), "voiceover": "", "subtitle": ""}
-                if dialogue is None:
-                    raise ValueError(f"Dialogue polish result missing scene: {scene_id}")
+                elif dialogue is None or not str(dialogue.get("voiceover") or "").strip():
+                    existing_vo = str(scene.get("voiceover") or "").strip()
+                    dialogue = {
+                        "speaker": str(scene.get("speaker") or "旁白").strip(),
+                        "voiceover": existing_vo,
+                        "subtitle": str(scene.get("subtitle") or existing_vo).strip(),
+                    }
 
                 values = {
                     "speaker": str(dialogue.get("speaker") or "旁白").strip(),

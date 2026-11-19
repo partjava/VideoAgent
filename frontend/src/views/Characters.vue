@@ -187,6 +187,25 @@
             </el-button>
           </div>
 
+          <el-alert
+            v-if="imageCaps"
+            :type="imageCaps.supports_reference_images ? 'success' : 'warning'"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 14px"
+          >
+            <template #title>
+              <template v-if="imageCaps.supports_reference_images">
+                当前图片模型（{{ imageCaps.model || "已支持参考图" }}）支持参考图锁脸，生成侧面 / 全身 / 四视图时将自动锁定正面照五官。
+              </template>
+              <template v-else>
+                当前图片模型（{{ imageCaps.model || "未识别" }}）不支持参考图锁脸，分别生成正面 / 侧面 / 全身会画出不同的脸。建议前往
+                <router-link to="/settings" style="color: #2563eb; font-weight: 600">「API 配置」切换为 Qwen/Qwen-Image-Edit-2509 或 black-forest-labs/FLUX.1-Kontext-dev →</router-link>
+                （或只生成/上传 1 张正面照即可确认使用）。
+              </template>
+            </template>
+          </el-alert>
+
           <!-- 正面 / 侧面 / 全身 三视图大图 -->
           <div class="reference-grid">
             <figure v-for="view in views" :key="view.key">
@@ -481,7 +500,8 @@ const characters = ref([]),
   promptPreviewDialog = ref(false),
   promptPreviewData = ref(null),
   aiCharacterBrief = ref(""),
-  expandingCharacter = ref(false);
+  expandingCharacter = ref(false),
+  imageCaps = ref(null);
 
 const id = (c) => c?.character_id || c?.id;
 
@@ -770,6 +790,9 @@ async function generatePortrait(
         `已生成「${character.name}」的${views.find((v) => v.key === view)?.label || ""}定妆照`,
       );
     }
+    if (res?.consistency_warning) {
+      ElMessage.warning(res.consistency_warning);
+    }
   });
   generatingKey.value = "";
 }
@@ -883,7 +906,14 @@ async function restore(character) {
   });
 }
 
-onMounted(load);
+onMounted(async () => {
+  await load();
+  try {
+    imageCaps.value = await charactersApi.imageCapabilities();
+  } catch {
+    imageCaps.value = null;
+  }
+});
 </script>
 <style scoped>
 .page {

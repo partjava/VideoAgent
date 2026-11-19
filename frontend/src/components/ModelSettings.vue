@@ -11,7 +11,7 @@
           <el-form-item label="API URL">
             <el-input
               v-model.trim="profiles[item.id].url"
-              placeholder="例如 https://api.deepseek.com/v1 或自定义中转地址"
+              placeholder="例如 https://api.siliconflow.cn/v1 或 https://api.deepseek.com/v1"
               @input="clearCatalog(item.id)"
             />
           </el-form-item>
@@ -103,9 +103,9 @@ import { onMounted, reactive, ref } from 'vue'
 import { settingsApi } from '../api/settings'
 
 const stages = [
-  { id: 'prompt', title: '提示词模型', protocol: '支持 OpenAI / DeepSeek / 通义千问兼容地址（自动适配 /v1/models 与 /models）。' },
-  { id: 'image', title: '图片生成模型', protocol: '支持 DashScope 原生接口及兼容中转地址（自动回退探测模型目录）。' },
-  { id: 'video', title: '视频生成模型', protocol: '支持 DashScope 原生 Wan 接口及兼容中转地址（支持查询目录或手动输入型号）。' },
+  { id: 'prompt', title: '提示词模型', protocol: '支持 OpenAI / DeepSeek / 硅基流动 / 通义千问兼容地址（自动适配 /v1/models）。' },
+  { id: 'image', title: '图片生成模型', protocol: '支持硅基流动（推荐 Qwen/Qwen-Image-Edit-2509 或 FLUX.1-Kontext-dev 支持参考图锁脸；Kolors / FLUX.1-dev 仅文生图）及 DashScope 原生接口。' },
+  { id: 'video', title: '视频生成模型', protocol: '支持硅基流动（MiniMax-H3 等）及 DashScope Wan 异步接口，自动按协议调用。' },
 ]
 const profiles = reactive({})
 const savedUrls = reactive({})
@@ -157,7 +157,7 @@ function clearCatalog(id) {
 const busy = reactive({})
 const loadError = ref('')
 const clearResult = id => { delete feedback[id] }
-const keySources = { local: '已保存本地 Key', environment: '使用环境配置的 Key', none: '未配置 Key' }
+const keySources = { local: '已保存到数据库与本地缓存（实时生效）', environment: '使用环境配置的 Key', none: '未配置 Key' }
 const messages = {
   model_listed: ['success', '连接成功（零成本只读校验），服务返回的模型列表包含当前模型。'],
   model_unlisted: ['warning', '接口连接与 Key 校验成功，但返回的模型列表未包含当前填写的模型名称。'],
@@ -212,7 +212,7 @@ async function submit(id, action) {
     } else if (action === 'save') {
       Object.assign(profiles[id], await settingsApi.saveModel(id, payload), { key: '' })
       savedUrls[id] = profiles[id].url
-      feedback[id] = { type: 'success', message: key.trim() ? '配置与新 Key 已保存。' : '已保存配置，沿用已有 Key。' }
+      feedback[id] = { type: 'success', message: key.trim() ? '配置与新 Key 已保存到数据库与本地缓存（实时生效，无需重启）。' : '已保存配置并同步到数据库，沿用已有 Key。' }
     } else if (action === 'catalog') {
       const { models, available, suggested_models = [], suggestion_source = 'none' } = await settingsApi.queryModels(id, payload)
       if (profiles[id].url !== url || profiles[id].key !== key) return

@@ -46,3 +46,4 @@ backend/data/comfyui/test_history.json
 comfyui_*.json
 
 backend/.env.models.local
+backend/.env.limits.local

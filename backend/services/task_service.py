@@ -46,6 +46,8 @@ class TaskService:
             task_id=_build_task_id(),
             user_input=payload.user_input,
             duration=payload.duration,
+            duration_min=payload.duration_min,
+            duration_max=payload.duration_max,
             style=payload.style,
             platform=payload.platform,
             ratio=payload.ratio,
@@ -69,6 +71,8 @@ class TaskService:
         document["auto_heal"] = payload.auto_heal
         document["max_heal_attempts"] = payload.max_heal_attempts
         document["duration_locked"] = payload.duration is not None
+        document["duration_min"] = payload.duration_min
+        document["duration_max"] = payload.duration_max
         document["generation_limit"] = payload.generation_limit
         if getattr(payload, "character_ids", None):
             from services.character_service import get_confirmed_profiles

@@ -3,6 +3,7 @@
     <div class="settings-page">
       <h2>模型配置</h2>
       <ModelSettings />
+      <LimitSettings />
       <details class="advanced-settings">
         <summary>高级设置</summary>
         <p>本地生成可以连接 ComfyUI，配置图片和视频工作流。</p>
@@ -14,6 +15,7 @@
 
 <script setup>
 import BasicLayout from '../layouts/BasicLayout.vue'
+import LimitSettings from '../components/LimitSettings.vue'
 import ModelSettings from '../components/ModelSettings.vue'
 </script>
 

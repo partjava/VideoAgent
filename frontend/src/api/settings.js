@@ -34,6 +34,15 @@ export const settingsApi = {
   testModel(kind, payload) {
     return client.post(`/models/${kind}/test`, payload)
   },
+  getLimits() {
+    return client.get('/limits')
+  },
+  saveLimits(payload) {
+    return client.put('/limits', payload)
+  },
+  resetLimits() {
+    return client.delete('/limits')
+  },
   getKeys() {
     return client.get('/keys')
   },

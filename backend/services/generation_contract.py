@@ -58,6 +58,9 @@ def provider_duration_bounds(
     if "doubao" in combined or "seedance" in combined:
         # Doubao / Seedance API 物理强校验仅接受 4–12 秒整数片段
         return (4, 12)
+    if "siliconflow" in combined or "minimax" in combined:
+        # SiliconFlow 当前主力 MiniMax-H3 等视频模型支持 5–15 秒，取 5–12 秒区间保证长短均衡
+        return (5, 12)
     if "comfyui" in combined:
         return (min_sec, 12)
     return (min_sec, 12)

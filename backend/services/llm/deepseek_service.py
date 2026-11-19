@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 from config import settings
-from services.model_config import model_config
+from services.model_config import is_siliconflow_url, model_config
 from services.visual_style import PHOTO_RULES
 from services.llm.base import BaseLLMService
 
@@ -204,9 +204,12 @@ def _escape_inner_quotes(text: str) -> str:
 def _extract_and_parse_json(content: str) -> dict[str, Any]:
     """容错解析模型返回的 JSON（清理思考标签、Markdown围栏、尾逗号、内嵌引号、换行及截断恢复）。"""
     text = re.sub(r"<think>.*?</think>", "", str(content or ""), flags=re.DOTALL).strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
-    if fence:
-        text = fence.group(1).strip()
+    if "</think>" in text:
+        # 部分推理模型模板在前缀中自带 <think>，回复仅保留尾部 </think>
+        text = text.rsplit("</think>", 1)[-1].strip()
+    fences = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    if fences:
+        text = fences[-1].strip()
     else:
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text).strip()
@@ -237,7 +240,201 @@ def _extract_and_parse_json(content: str) -> dict[str, Any]:
                 return parsed
         except json.JSONDecodeError:
             continue
+
+    # 若正文夹杂前置说明或多个 {...} 片段，扫描提取最后一个合法且信息最完整的 JSON 对象
+    decoder = json.JSONDecoder(strict=False)
+    best_obj: dict[str, Any] | None = None
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict) and (best_obj is None or len(obj) >= len(best_obj)):
+                best_obj = obj
+        except json.JSONDecodeError:
+            continue
+    if best_obj is not None:
+        return best_obj
+
     raise ValueError(f"JSON format error. Snippet: {content[:200]}")
+
+
+def _is_length_limit_error(exc: Exception) -> bool:
+    """识别模型输出触及 max_tokens 长度上限触发的异常（含 LengthFinishReasonError）。"""
+    msg = str(exc or "").lower()
+    return (
+        type(exc).__name__ == "LengthFinishReasonError"
+        or "length limit was reached" in msg
+        or "lengthfinishreason" in msg
+    )
+
+
+def _is_max_tokens_param_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return "max_tokens" in msg and (
+        getattr(exc, "status_code", None) == 400
+        or any(k in msg for k in ("invalid", "range", "limit", "exceed", "maximum", "400"))
+    )
+
+
+def _is_thinking_model(model: str | None) -> bool:
+    """识别默认开启思维链推理、易与 json_object 冲突或吞掉输出预算的模型。"""
+    lower = str(model or "").lower()
+    return any(
+        tok in lower
+        for tok in ("glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "qwen3", "deepseek-r1", "deepseek-v3.1", "deepseek-v3.2", "deepseek-reasoner", "qwq", "thinking")
+    )
+
+
+_THINKING_PARAM_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _thinking_extra_variants(model: str | None, light_mode: bool) -> list[dict[str, Any]]:
+    """按模型家族返回降低/关闭思考链的参数候选，兼顾 GLM-5.3 强制思考与 Qwen3/GLM-4 开关。"""
+    if not light_mode:
+        return [{}]
+    lower = str(model or "").lower()
+    if "glm-5.2" in lower or "glm-5.3" in lower:
+        return [{"reasoning_effort": "low"}, {"thinking_budget": 1024}, {}]
+    if "glm-" in lower:
+        return [{"thinking": {"type": "disabled"}}, {"enable_thinking": False}, {"reasoning_effort": "low"}, {}]
+    return [{"enable_thinking": False}, {"chat_template_kwargs": {"enable_thinking": False}}, {"thinking_budget": 1024}, {}]
+
+
+def _is_extra_param_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return isinstance(exc, TypeError) or (
+        getattr(exc, "status_code", None) in (400, 422)
+        and any(
+            k in msg
+            for k in (
+                "enable_thinking",
+                "chat_template_kwargs",
+                "reasoning_effort",
+                "thinking_budget",
+                "thinking",
+                "extra_body",
+                "extra_inputs",
+                "unrecognized",
+                "unknown",
+                "invalid parameter",
+                "unsupported",
+            )
+        )
+    )
+
+
+def _join_content_value(val: Any) -> tuple[str, str]:
+    """拆分文本内容与内嵌 thinking 内容块。"""
+    if isinstance(val, list):
+        texts, thinks = [], []
+        for part in val:
+            if isinstance(part, dict):
+                ptype = str(part.get("type") or "").lower()
+                chunk = str(part.get("text") or part.get("thinking") or part.get("reasoning_content") or "")
+                if ptype in ("thinking", "reasoning"):
+                    thinks.append(chunk)
+                else:
+                    texts.append(chunk)
+            else:
+                texts.append(str(part))
+        return "".join(texts), "".join(thinks)
+    return str(val or ""), ""
+
+
+def _extract_completion_text(exc: Exception) -> str:
+    """从 LengthFinishReasonError.completion 提取已生成的部分文本（含 reasoning_content 兜底）。"""
+    completion = getattr(exc, "completion", None)
+    choices = getattr(completion, "choices", None)
+    if not choices:
+        return ""
+    msg_obj = getattr(choices[0], "message", None)
+    if msg_obj is None:
+        return ""
+    content, thinks = _join_content_value(getattr(msg_obj, "content", ""))
+    if content.strip():
+        return content
+    return str(getattr(msg_obj, "reasoning_content", "") or thinks or "")
+
+
+def _extract_message_parts(response: Any) -> tuple[str, str, str]:
+    """从 ChatOpenAI 响应中提取正文、reasoning_content 与 finish_reason。"""
+    if not response:
+        return "", "", ""
+    content, block_thinks = _join_content_value(getattr(response, "content", ""))
+    extra = getattr(response, "additional_kwargs", None) or {}
+    meta = getattr(response, "response_metadata", None) or {}
+    reasoning = str(extra.get("reasoning_content") or getattr(response, "reasoning_content", "") or block_thinks or "")
+    finish_reason = str(meta.get("finish_reason") or meta.get("FinishReason") or "")
+    return content, reasoning, finish_reason
+
+
+def _invoke_raw_http_chat(
+    base_url: str,
+    api_key: str,
+    model: str,
+    sys_msg: str,
+    user_prompt: str,
+    temperature: float,
+    token_limit: int,
+    light_thinking: bool,
+    timeout_s: float = 180.0,
+) -> tuple[str, str, str]:
+    """直连 OpenAI 兼容 /chat/completions，避免旧版 langchain_openai 丢弃 reasoning_content 或重复等待。"""
+    import httpx
+
+    client_cls = getattr(httpx, "Client", None)
+    if client_cls is None:
+        return "", "", ""
+
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_prompt}]
+    cache_key = (base_url, model)
+    variants = _thinking_extra_variants(model, light_thinking)
+    cached = _THINKING_PARAM_CACHE.get(cache_key)
+    if cached is not None and light_thinking:
+        variants = [cached] + [v for v in variants if v != cached]
+
+    with client_cls(timeout=max(30.0, float(timeout_s))) as client:
+        for extra_fields in variants:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": token_limit,
+                **extra_fields,
+            }
+            print(
+                f"[DeepSeekService] Direct HTTP model={model} (max_tokens={token_limit}, extra={extra_fields or 'none'}, timeout={int(timeout_s)}s)...",
+                flush=True,
+            )
+            t0 = time.time()
+            resp = client.post(endpoint, headers=headers, json=payload)
+            if resp.status_code in (400, 422) and extra_fields and "max_tokens" not in resp.text.lower():
+                continue
+            if resp.status_code == 400 and token_limit > 8192 and "max_tokens" in resp.text.lower():
+                payload["max_tokens"] = 8192
+                resp = client.post(endpoint, headers=headers, json=payload)
+            if resp.status_code >= 400:
+                resp.raise_for_status()
+            if light_thinking:
+                _THINKING_PARAM_CACHE[cache_key] = extra_fields
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                return "", "", ""
+            choice = choices[0]
+            msg = choice.get("message") or {}
+            content, block_thinks = _join_content_value(msg.get("content"))
+            reasoning = str(msg.get("reasoning_content") or block_thinks or "")
+            finish_reason = str(choice.get("finish_reason") or "")
+            print(
+                f"[DeepSeekService] Direct HTTP received in {time.time()-t0:.1f}s (content={len(content)} chars, reasoning={len(reasoning)} chars, finish_reason={finish_reason})",
+                flush=True,
+            )
+            return content, reasoning, finish_reason
+    return "", "", ""
 
 
 class DeepSeekService(BaseLLMService):
@@ -246,71 +443,191 @@ class DeepSeekService(BaseLLMService):
             raise ValueError("付费 API 调用未启用，请在环境变量中设置 ENABLE_PAID_API=true。")
         profile = model_config("prompt", settings)
         if not profile["key"]:
-            raise ValueError("未找到 DEEPSEEK_API_KEY，请在环境变量中配置。")
+            raise ValueError("未找到模型 API Key，请在「API 配置」或环境变量中配置。")
 
         base_url = _normalize_openai_base_url(profile["url"])
+        model_name = str(profile["model"] or "")
+        sf_mode = is_siliconflow_url(base_url)
+        thinking_model = _is_thinking_model(model_name)
+        current_limit = max(256, int(max_tokens or 2000))
+        using_real_langchain = getattr(ChatOpenAI, "__module__", "").startswith("langchain")
+        call_deadline = time.time() + 300.0
 
-        def _invoke(use_json_mode: bool, temperature: float, sys_msg: str) -> str:
+        def _remaining_timeout(cap: float = 210.0) -> float:
+            return min(cap, max(35.0, call_deadline - time.time()))
+
+        def _invoke(use_json_mode: bool, temperature: float, sys_msg: str, token_limit: int, disable_thinking: bool) -> tuple[str, str, str]:
+            if using_real_langchain and sf_mode and thinking_model and not use_json_mode:
+                import httpx
+                if getattr(httpx, "Client", None) is not None:
+                    return _invoke_raw_http_chat(
+                        base_url,
+                        profile["key"],
+                        model_name,
+                        sys_msg,
+                        user_prompt,
+                        temperature,
+                        token_limit,
+                        disable_thinking,
+                        timeout_s=_remaining_timeout(240.0),
+                    )
             kwargs: dict[str, Any] = {
-                "model": profile["model"],
+                "model": model_name,
                 "api_key": profile["key"],
                 "base_url": base_url,
                 "temperature": temperature,
-                "max_tokens": max_tokens,
-                "timeout": 300,
+                "max_tokens": token_limit,
+                "timeout": int(_remaining_timeout(240.0)),
             }
             if use_json_mode:
                 kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+            if disable_thinking:
+                extra_opt = _thinking_extra_variants(model_name, True)[0]
+                if extra_opt:
+                    kwargs["extra_body"] = extra_opt
             llm = ChatOpenAI(**kwargs)
             messages = [
                 SystemMessage(content=sys_msg),
                 HumanMessage(content=user_prompt),
             ]
-            print(f"[DeepSeekService] Requesting model={profile['model']} (max_tokens={max_tokens}, json_mode={use_json_mode})...", flush=True)
+            print(
+                f"[DeepSeekService] Requesting model={model_name} (max_tokens={token_limit}, json_mode={use_json_mode}, disable_thinking={disable_thinking})...",
+                flush=True,
+            )
             t0 = time.time()
             response = llm.invoke(messages)
-            content = response.content if response else ""
-            if isinstance(content, list):
-                content = "".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in content
-                )
-            print(f"[DeepSeekService] Response received in {time.time()-t0:.1f}s ({len(str(content or ''))} chars)", flush=True)
-            return str(content or "")
+            content, reasoning, finish_reason = _extract_message_parts(response)
+            print(
+                f"[DeepSeekService] Response received in {time.time()-t0:.1f}s (content={len(content)} chars, reasoning={len(reasoning)} chars, finish_reason={finish_reason or 'unknown'})",
+                flush=True,
+            )
+            return content, reasoning, finish_reason
+
+        concise_hint = "\n注意：只能输出一个合法 JSON 对象，字段描述保持精炼紧凑，确保在长度上限内完整闭合 JSON，禁止输出 ```json 标记。"
+        strict_hint = "\n注意：只能输出一个合法 JSON 对象，字符串内部禁止出现未转义英文双引号 \" ，不要输出 ```json 标记。"
+
+        attempts = (
+            [
+                (False, 0.35, system_prompt + strict_hint, True),
+                (False, 0.2, system_prompt + concise_hint, False),
+            ]
+            if (sf_mode and thinking_model)
+            else [
+                (True, 0.65, system_prompt, False),
+                (False, 0.25, system_prompt + strict_hint, thinking_model and sf_mode),
+            ]
+        )
 
         last_err: Exception | None = None
-        for attempt, (use_json_mode, temperature, sys_msg) in enumerate(
-            [
-                (True, 0.65, system_prompt),
-                (False, 0.25, system_prompt + "\n注意：只能输出一个合法 JSON 对象，字符串内部禁止出现未转义英文双引号 \" ，不要输出 ```json 标记。"),
-            ],
-            start=1,
-        ):
+        last_reasoning_len = 0
+        for attempt, (use_json_mode, temperature, sys_msg, disable_thinking) in enumerate(attempts, start=1):
+            if attempt > 1 and (call_deadline - time.time()) < 45.0:
+                break
+            content, reasoning, finish_reason = "", "", ""
             try:
-                content = _invoke(use_json_mode, temperature, sys_msg)
+                content, reasoning, finish_reason = _invoke(use_json_mode, temperature, sys_msg, current_limit, disable_thinking)
             except Exception as invoke_exc:
                 msg = str(invoke_exc).lower()
-                if use_json_mode and (
+                if "timeout" in msg or "timed out" in msg:
+                    last_err = TimeoutError(
+                        f"模型 {model_name} 响应超时（可能因推理耗时过长）；建议在「API 配置」改用非推理模型（如 deepseek-ai/DeepSeek-V3 或 Qwen/Qwen2.5-72B-Instruct），通常 20 秒内即可完成。"
+                    )
+                    continue
+                if disable_thinking and _is_extra_param_error(invoke_exc):
+                    try:
+                        content, reasoning, finish_reason = _invoke(use_json_mode, temperature, sys_msg, current_limit, False)
+                    except Exception as retry_exc:
+                        if _is_length_limit_error(retry_exc):
+                            content = _extract_completion_text(retry_exc)
+                        last_err = retry_exc
+                elif _is_length_limit_error(invoke_exc):
+                    partial = _extract_completion_text(invoke_exc)
+                    current_limit = 8192 if current_limit < 8192 else min(16384, current_limit * 2)
+                    print(f"[DeepSeekService] Attempt {attempt} hit length limit; retrying with max_tokens={current_limit}...", flush=True)
+                    try:
+                        content, reasoning, finish_reason = _invoke(False, 0.25, system_prompt + concise_hint, current_limit, disable_thinking)
+                    except Exception as retry_exc:
+                        if _is_max_tokens_param_error(retry_exc) and current_limit > 8192:
+                            current_limit = 8192
+                            try:
+                                content, reasoning, finish_reason = _invoke(False, 0.2, system_prompt + concise_hint + " 请显著压缩每段文案篇幅。", current_limit, False)
+                            except Exception as clamp_exc:
+                                content = _extract_completion_text(clamp_exc) or partial
+                                last_err = clamp_exc
+                        else:
+                            content = _extract_completion_text(retry_exc) or partial
+                            last_err = retry_exc
+                elif _is_max_tokens_param_error(invoke_exc) and current_limit > 4096:
+                    current_limit = 8192 if current_limit > 8192 else 4096
+                    try:
+                        content, reasoning, finish_reason = _invoke(use_json_mode, temperature, sys_msg + concise_hint, current_limit, disable_thinking)
+                    except Exception as clamp_exc:
+                        last_err = clamp_exc
+                        continue
+                elif use_json_mode and (
                     getattr(invoke_exc, "status_code", None) == 400
                     or any(k in msg for k in ("response_format", "json_object", "json mode", "unsupported", "invalid parameter"))
                 ):
                     try:
-                        content = _invoke(False, temperature, sys_msg)
+                        content, reasoning, finish_reason = _invoke(False, temperature, sys_msg, current_limit, disable_thinking)
                     except Exception as fallback_exc:
+                        if _is_length_limit_error(fallback_exc):
+                            content = _extract_completion_text(fallback_exc)
                         last_err = fallback_exc
-                        continue
                 else:
                     raise
-            if not content:
-                last_err = ValueError("DeepSeek returned an empty response.")
-                continue
-            try:
-                return _extract_and_parse_json(content)
-            except ValueError as parse_exc:
-                print(f"[DeepSeekService] JSON parse failed on attempt {attempt}. Raw: {content[:300]}")
-                last_err = parse_exc
 
-        raise last_err or ValueError("DeepSeek returned invalid JSON.")
+            # 若非直连路径仍返回空内容（如旧版 langchain 丢失 reasoning_content），走底层 HTTP 回查一次
+            if not content.strip() and not reasoning.strip() and using_real_langchain and not (sf_mode and thinking_model):
+                try:
+                    raw_c, raw_r, raw_f = _invoke_raw_http_chat(
+                        base_url,
+                        profile["key"],
+                        model_name,
+                        system_prompt + concise_hint,
+                        user_prompt,
+                        temperature,
+                        max(current_limit, 12288) if sf_mode else current_limit,
+                        disable_thinking or thinking_model,
+                        timeout_s=_remaining_timeout(180.0),
+                    )
+                    content, reasoning, finish_reason = raw_c or content, raw_r or reasoning, raw_f or finish_reason
+                except Exception as raw_exc:
+                    print(f"[DeepSeekService] Raw HTTP fallback skipped/failed: {raw_exc}", flush=True)
+
+            if reasoning.strip():
+                last_reasoning_len = max(last_reasoning_len, len(reasoning))
+
+            if content.strip():
+                try:
+                    return _extract_and_parse_json(content)
+                except ValueError as parse_exc:
+                    print(f"[DeepSeekService] JSON parse failed on attempt {attempt}. Raw: {content[:300]}")
+                    last_err = parse_exc
+            elif reasoning.strip():
+                # 部分 GLM/Qwen 推理模型会把 JSON 放进 reasoning_content 而 content 留空
+                try:
+                    parsed_reasoning = _extract_and_parse_json(reasoning)
+                    if isinstance(parsed_reasoning, dict) and parsed_reasoning:
+                        print("[DeepSeekService] Recovered JSON object from reasoning_content.", flush=True)
+                        return parsed_reasoning
+                except ValueError:
+                    pass
+                print(
+                    f"[DeepSeekService] Empty content with reasoning-only output ({len(reasoning)} chars, finish_reason={finish_reason}).",
+                    flush=True,
+                )
+                current_limit = min(16384, max(current_limit * 2, 12288)) if sf_mode else max(current_limit, 8192)
+                last_err = ValueError(
+                    f"模型 {model_name} 仅输出了推理过程（{last_reasoning_len} 字）而未输出最终 JSON 正文；"
+                    "若持续触发，请在「API 配置」将提示词模型换为非推理模型（如 deepseek-ai/DeepSeek-V3 或 Qwen/Qwen2.5-72B-Instruct）。"
+                )
+            elif last_err is None:
+                last_err = ValueError(
+                    f"模型 {model_name} 返回了空响应（content 为空）；请确认模型名称正确或切换为 deepseek-ai/DeepSeek-V3 / Qwen/Qwen2.5-72B-Instruct 后重试。"
+                )
+
+        raise last_err or ValueError(f"模型 {model_name} 未返回有效的 JSON 结果。")
 
     def plan_task(
         self,
@@ -484,6 +801,17 @@ class DeepSeekService(BaseLLMService):
                 )
             else:
                 segment_rules = "segments 返回空数组，在 content 中编写完整画面和对应台词。"
+            duration_range = task_plan.get("duration_range")
+            if (
+                mode in {"auto_director", "storyboard_flow"}
+                and isinstance(duration_range, (list, tuple))
+                and len(duration_range) == 2
+                and all(isinstance(v, (int, float)) for v in duration_range)
+            ):
+                segment_rules += (
+                    f"所有 segments 的 duration 合计必须落在 {int(duration_range[0])}–{int(duration_range[1])} 秒弹性区间内"
+                    "（按剧情密度自然决定，不需要凑整十秒）。"
+                )
             system_prompt = (
                 "你是顶级短剧总编剧与分镜导演。你的剧本严格遵循『15秒四挡推进』、"
                 "『每2-3句对白必插强视觉△物理动作（物理结果/身份反差/物证对抗）』与『台词去AI味规则』。"
@@ -523,7 +851,8 @@ class DeepSeekService(BaseLLMService):
 - ending: 结尾钩子台词
 - publish_copy: 发布文案（带悬念的短文案，引导点赞关注）
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=3600)
+            script_max_tokens = 8192 if mode in {"auto_director", "storyboard_flow"} else 4500
+            result = self._call_api(system_prompt, user_prompt, max_tokens=script_max_tokens)
             result["source"] = "deepseek"
             if mode not in {"native_10s", "auto_director", "storyboard_flow"}:
                 result["segments"] = []
@@ -540,12 +869,21 @@ class DeepSeekService(BaseLLMService):
         """根据情节审稿与节奏诊断，结构化重写爆款短剧剧本与 segments。"""
         mode = str(task_plan.get("generation_mode") or "auto_director")
         target_duration = int(task_plan.get("duration") or 48)
+        duration_range = task_plan.get("duration_range")
+        has_range = (
+            mode in {"auto_director", "storyboard_flow"}
+            and isinstance(duration_range, (list, tuple))
+            and len(duration_range) == 2
+            and all(isinstance(v, (int, float)) for v in duration_range)
+        )
         if mode == "native_10s":
             seg_constraint = f"保持 segments 总段数与每段 duration 严格为 10 秒（共 {max(1, target_duration // 10)} 段）。"
         elif mode == "storyboard_flow":
             seg_constraint = "segments 数量 4–24 段、每段整数 3–10 秒（主节奏 3–5 秒快切，允许极少数无台词纯情绪凝视留白段）。"
         else:
             seg_constraint = "segments 数量 4–7 段、每段整数 4–12 秒（总时长贴近剧情需要且节奏紧凑，40–65 秒优先）。"
+        if has_range:
+            seg_constraint += f"总时长严格落在 {int(duration_range[0])}–{int(duration_range[1])} 秒弹性区间内（不必凑整十秒）。"
         system_prompt = (
             "你是金牌爆款短剧总编剧兼剧本医生。你刚刚审完一份节奏拖沓、缺乏筹码升级、对白过于稀碎或存在无声干瞪眼的初稿。"
             "请你保留原有核心设定与角色姓名，彻底重构写出一版高张力、无废话、密集攻防、反转精准落底的结构化剧本。"
@@ -701,7 +1039,7 @@ class DeepSeekService(BaseLLMService):
 
 返回 JSON：{{"scenes": [...]}}
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=5200)
+            result = self._call_api(system_prompt, user_prompt, max_tokens=8192)
             scenes = result.get("scenes", [])
             for scene in scenes:
                 scene["source"] = "deepseek"
@@ -754,7 +1092,7 @@ class DeepSeekService(BaseLLMService):
   {{"scene_id": "...", "speaker": "...", "voiceover": "...", "subtitle": "..."}}
 ]}}
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=3200)
+            result = self._call_api(system_prompt, user_prompt, max_tokens=6000)
             dialogues = result.get("dialogues", [])
             for dialogue in dialogues:
                 dialogue["source"] = "deepseek"
@@ -831,8 +1169,8 @@ movement 只能是 fixed/track/pan/tilt/push/pull，时间用整组秒数，固�
 配音：{style_rules["voice"]}
 构图：{ratio_desc}
 
-请为每个分镜生成给 Qwen-Image 和当前配置的视频生成模型使用的提示词。
-如果分镜提供 previous_segment_context，将其作为上一段已经写好的剧情、blocking 站位和 final_second 收尾物态（手拿什么、道具落在何处、人物朝向与伤痕状态）。按当前分镜设计新的首帧，严格延续仍相关的人物左右轴线、手持/放下道具的归属位置（上一镜放下、甩出或转交的道具绝不可在本镜首帧无故捏回原主手里）和剧情因果。允许按分镜切换场景或机位，不重演上一段已经完成的动作，不把计划收尾当作实际尾帧。只输出当前分镜的提示词和逐秒描述。
+请为分镜列表中的每个分镜生成给图片模型和当前配置的视频生成模型使用的提示词（若列表包含多个连续分镜，必须按顺序逐条输出且 scene_id 一一对应，第 1 条承接 previous_segment_context，后续条目自然承接同批次前一条分镜的站位、道具归属与收尾状态）。
+如果分镜提供 previous_segment_context，将其作为上一段已经写好的剧情、blocking 站位和 final_second 收尾物态（手拿什么、道具落在何处、人物朝向与伤痕状态）。按当前分镜设计新的首帧，严格延续仍相关的人物左右轴线、手持/放下道具的归属位置（上一镜放下、甩出或转交的道具绝不可在本镜首帧无故捏回原主手里）和剧情因果。允许按分镜切换场景或机位，不重演上一段已经完成的动作，不把计划收尾当作实际尾帧。只输出列表中每个分镜的提示词和运动节拍描述。
 
 image_prompt 要求（采用三层工艺分离与八段式结构）：
 - 首帧的角色姿态、道具状态和相对位置以 start_state 为唯一时序依据，与第0秒的起始画面一致。visual_description 仅提供静态场景与角色信息，剥离动作过程、后续姿态、接触结果及事后痕迹。只描述此刻已经存在、能直接画出来的画面。
@@ -900,7 +1238,8 @@ video_prompt 要求：
 
 返回 JSON：{{"prompts": [...]}}
 """
-            result = self._call_api(system_prompt, user_prompt, max_tokens=14000)
+            prompt_token_budget = 4096 if len(clean_scenes) <= 1 else 8192
+            result = self._call_api(system_prompt, user_prompt, max_tokens=prompt_token_budget)
             prompts = result.get("prompts", [])
             for prompt in prompts:
                 prompt["source"] = "deepseek"

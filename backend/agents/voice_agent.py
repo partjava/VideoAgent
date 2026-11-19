@@ -65,7 +65,13 @@ def clean_tts_text(text: str) -> str:
 async def synthesize_dialogue(scene, backend_dir, task_id, render_id, *, allow_duration_extend: bool = False, max_duration: int = 12):
     from services.generation_contract import scene_event_offset, voice_speed
 
-    lines = scene["dialogue_lines"]
+    raw_lines = scene["dialogue_lines"]
+    lines = [line for line in raw_lines if isinstance(line, dict) and clean_tts_text(line.get("text") or "")]
+    if len(lines) != len(raw_lines):
+        scene["dialogue_lines"] = lines
+        scene["_dialogue_lines_cleaned"] = True
+    if not lines:
+        return []
     offsets = [scene_event_offset(scene, line["start"]) for line in lines]
     scene_end = float(scene["duration"])
     if any(current <= previous for previous, current in zip(offsets, offsets[1:])):
@@ -235,6 +241,15 @@ class VoiceAgent:
                             max_duration=max_clip_seconds,
                         )
                         update_payload: dict[str, object] = {"dialogue_audio": audio}
+                        if scene.pop("_dialogue_lines_cleaned", False):
+                            cleaned_vo = "\n".join(clean_tts_text(line.get("text") or "") for line in scene["dialogue_lines"])
+                            scene["voiceover"] = cleaned_vo
+                            scene["subtitle"] = cleaned_vo
+                            update_payload.update({
+                                "dialogue_lines": scene["dialogue_lines"],
+                                "voiceover": cleaned_vo,
+                                "subtitle": cleaned_vo,
+                            })
                         adapted_dur = scene.pop("_adapted_duration", None)
                         if adapted_dur and adapted_dur > int(scene["duration"]):
                             old_dur = int(scene["duration"])

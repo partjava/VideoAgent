@@ -32,6 +32,12 @@ STYLE_QUALITY_BLOCKS: dict[str, str] = {
     ),
 }
 
+STYLE_TURNAROUND_BLOCKS: dict[str, str] = {
+    "realistic": "真人演员实拍定妆摄影质感，自然真实皮肤纹理与发丝细节，真实衣物垂坠感与织物经纬线，影棚柔光均匀打光",
+    "3d": "高精度 3D CG 角色资产，Unreal Engine 5 渲染品质，PBR 物理服装材质，自然柔和次表面散射",
+    "anime": "高品质 2D 动画角色设定稿，精准勾线与清晰色指定，赛璐珞结合轻厚涂上色",
+}
+
 OCCUPATION_ANTI_DRIFT_RULES: list[tuple[tuple[str, ...], str]] = [
     (("保安", "门卫", "物业"), "严禁画成警察制服、严禁警用肩章、严禁警徽与警用对讲机"),
     (("外卖", "骑手", "快递", "跑腿"), "严禁画成协警或交警制服、严禁肩章与警用反光背心"),
@@ -102,26 +108,60 @@ def ensure_shoes_in_clothing(clothing: str, face_dna: str = "") -> str:
     return f"{text}，{shoe}" if text else shoe
 
 
-def build_character_sheet_4grid_prompt(profile: dict[str, Any], style: str = "realistic", custom_prompt: str = "") -> str:
+def build_portrait_negative_prompt(
+    profile: dict[str, Any],
+    view: str = "front",
+    style: str = "realistic",
+) -> str:
+    """构造传递给生图模型 negative_prompt 参数的正交负向约束，避免在正向词写『严禁/禁止』触发反向引导。"""
+    parts: list[str] = [
+        "多人，多张脸，双头，重影，分屏拼图，水印，文字，AI生成，签名，Q版大头，畸形手指，额外肢体，夸张鬼脸，手持道具，杂乱背景"
+    ]
+    if style == "realistic":
+        parts.append("动漫，漫画，卡通，插画，二次元，赛璐珞，3D建模，蜡像，塑料皮肤")
+    if view == "whole":
+        parts.append("大头照，特写，半身照，胸像，截断小腿，缺脚，切头，坐姿")
+    elif view == "profile":
+        parts.append("正脸，正面看镜头，直视镜头，三分之二侧脸，大头特写")
+    elif view == "sheet":
+        parts.append("单一特写大头，单张头像，错乱五官，人物换脸，文字乱码")
+
+    combined = f"{profile.get('name') or ''} {profile.get('face_dna') or ''} {profile.get('signature_clothing') or ''}"
+    for keywords, rule in OCCUPATION_ANTI_DRIFT_RULES:
+        if any(k in combined for k in keywords):
+            cleaned = re.sub(r"严禁画成|严禁", "", rule).replace("、", "，")
+            if cleaned.strip("， "):
+                parts.append(cleaned.strip("， "))
+    return "，".join(p.strip("， ") for p in parts if p.strip("， "))
+
+
+def build_character_sheet_4grid_prompt(
+    profile: dict[str, Any],
+    style: str = "realistic",
+    custom_prompt: str = "",
+    has_reference: bool = False,
+) -> str:
     """生成单张 16:9 横图四格角色设定板提示词"""
-    style_block = STYLE_QUALITY_BLOCKS.get(style, STYLE_QUALITY_BLOCKS["realistic"])
+    style_block = STYLE_TURNAROUND_BLOCKS.get(style, STYLE_TURNAROUND_BLOCKS["realistic"])
     name = (profile.get("name") or "角色").strip()
     face_dna = (profile.get("face_dna") or "").strip("。 ")
     clothing_with_shoes = ensure_shoes_in_clothing(profile.get("signature_clothing") or "", face_dna)
     voice_tag = profile.get("tts_voice") or "zh-CN-YunyangNeural"
-    anti_drift = infer_anti_drift_negatives(face_dna, clothing_with_shoes, name)
+    ref_lock = (
+        "严格保持参考图中同一人物的五官、性别、年龄、发型与服装完全一致（same person, identical identity across all 4 panels）。"
+        if has_reference
+        else ""
+    )
     extra = f"补充要求：{custom_prompt.strip()}。" if custom_prompt and custom_prompt.strip() else ""
     return (
-        f"角色设定图，整板 16:9 横版构图，纯白无接缝影棚背景（#FFFFFF）。"
-        f"画面风格：{style_block}。"
-        f"人物主体：{name}，真人正常 7 头身比例（严禁Q版或大头娃娃比例）。"
-        f"全图共 4 格，从左到右横向并排，仅此 4 格，不设独立大主图："
-        f"① 左一格：头部正面特写（占格高70%以上，全图唯一清晰完整展示五官区域，{face_dna or '五官立体清晰'}，平静中性表情 neutral expression，底部仅配简短英文音色标签 \"{voice_tag}\" 及极简黑白声纹波形线）；"
-        f"② 左二格：正面全身站立图（头顶至鞋底完整入画，上下各留5%白边，双手自然垂放身体两侧，空手不持物，展示正面服装：{clothing_with_shoes or '统一常服与完整鞋履'}）；"
-        f"③ 左三格：90度正侧面全身站立图（头顶至鞋底完整入画，展示鼻梁下颌侧面轮廓、后脑发型层次与服装侧面剪裁）；"
-        f"④ 右一格：背面全身站立图（头顶至鞋底完整入画，展示后背发型收束与衣摆鞋跟背面结构）。"
-        f"{extra}"
-        f"强制禁止项：严禁出现第5个独立主图人物、严禁中文乱码标注、{anti_drift}。"
+        f"角色设定图，整板 16:9 横版构图，全图共 4 格，从左到右横向并排，纯白无接缝影棚背景（#FFFFFF）。"
+        f"{ref_lock}"
+        f"人物主体：{name}，{face_dna or '亚洲成人清晰五官'}，{clothing_with_shoes or '统一常服与完整鞋履'}，真人正常 7 头身比例。"
+        f"① 左一格：头部正面特写（展示五官与发型，{face_dna or '五官清晰对称'}，平静中性表情，底部极简英文标签 \"{voice_tag}\"）；"
+        f"② 左二格：正面全身站立图（35mm广角完整全身，头顶至鞋底完整入画，上下留5%白边，双手自然下垂空手，展示完整服装：{clothing_with_shoes or '统一常服与鞋履'}）；"
+        f"③ 左三格：90度正侧面全身站立图（头顶至鞋底完整入画，展示鼻梁下颌侧面轮廓与背面发型层次）；"
+        f"④ 右一格：背面全身站立图（头顶至鞋底完整入画，展示后背发型与衣摆鞋跟结构）。"
+        f"画面风格：{style_block}。{extra}"
     )
 
 
@@ -679,6 +719,8 @@ def ai_decompose_novel_to_drama(
     title: str = "",
     total_episodes: int = 5,
     episode_duration: int = 60,
+    episode_duration_min: int | None = None,
+    episode_duration_max: int | None = None,
     style: str = "短剧",
     market_mode: str = "cn",
 ) -> dict[str, Any]:
@@ -704,8 +746,9 @@ def ai_decompose_novel_to_drama(
         "3. 【角色资产可生成性】：每个角色 `face_dna` 含五官/发型/辨识特征；`signature_clothing` 必须写出具体鞋履款式与颜色；`tts_voice` 必须选自合法音色："
         + ", ".join(sorted(ALLOWED_TTS_VOICES))
         + "；\n"
-        "4. 【场景与道具母版】：提取最核心高频场景（2~3个）设计布局方位（东西南北）、材质纹理与主光色温 Kelvin；提取推动反转的核心道具（1~2个），严禁给反光道具写“泛着幽光/发光特效”；\n"
-        "5. 【跨集四本连续性台账】：结合原著人物与秘密差，生成 `physical_ledger`、`knowledge_ledger`、`prop_ledger`、`relationship_ledger`。\n\n"
+        "4. 【场景与道具母版】：提取最核心高频场景（2个）设计布局方位（东西南北）、材质纹理与主光色温 Kelvin（每个场景 9 条 15~35 字精炼机位）；提取推动反转的核心道具（1~2个），严禁给反光道具写“泛着幽光/发光特效”；\n"
+        "5. 【跨集四本连续性台账】：结合原著人物与秘密差，生成 `physical_ledger`、`knowledge_ledger`、`prop_ledger`、`relationship_ledger`（每表 2~4 条核心条目）；\n"
+        "6. 【紧凑完备篇幅】：`episodes_outline` 严格按规划总集数输出、每项概括 20~50 字；`first_episode_script` 控制在 500~850 字紧凑可拍篇幅，确保完整 JSON 在长度限制内一次闭合。\n\n"
         "必须输出严格 JSON 对象，结构如下：\n"
         "{\n"
         '  "title": "本剧剧名",\n'
@@ -727,16 +770,21 @@ def ai_decompose_novel_to_drama(
         "}"
     )
 
+    duration_hint = (
+        f"单集目标时长范围：{int(episode_duration_min)}–{int(episode_duration_max)} 秒（弹性区间，不必凑整）"
+        if episode_duration_min is not None and episode_duration_max is not None
+        else f"单集目标时长：{episode_duration} 秒"
+    )
     user_prompt = (
         f"剧集名称提示：{title.strip() or '根据故事自动提炼一个极具爆款吸引力的剧名'}\n"
         f"规划总集数：{total_episodes} 集\n"
-        f"单集目标时长：{episode_duration} 秒\n"
+        f"{duration_hint}\n"
         f"视觉风格：{style}\n"
         f"目标市场模式：{lang_label}\n\n"
         f"【待改编原著/故事正文】：\n{clean_text[:18000]}"
     )
 
-    result = llm._call_api(system_prompt, user_prompt, max_tokens=6000)
+    result = llm._call_api(system_prompt, user_prompt, max_tokens=8192)
 
     # 规范化角色资产与 TTS 参数
     normalized_chars = []
@@ -793,17 +841,21 @@ def ai_decompose_novel_to_drama(
             )
         )
 
-    # 规范化分集大纲（确保集号连续 1..N）
+    # 规范化分集大纲（确保集号连续 1..N 且核心三字段非空，避免建连载时被误丢弃）
     raw_eps = result.get("episodes_outline") or []
     episodes_outline = []
     for idx in range(1, total_episodes + 1):
         src = raw_eps[idx - 1] if idx - 1 < len(raw_eps) and isinstance(raw_eps[idx - 1], dict) else {}
+        ep_title = str(src.get("title") or f"第{idx}集").strip() or f"第{idx}集"
+        opening = str(src.get("opening_hook") or src.get("opening_3s_hook") or "").strip() or f"{ep_title}：开场危机直切冲突"
+        core = str(src.get("core_event") or "").strip() or f"{ep_title}：主角正面交锋与物证亮牌"
+        ending = str(src.get("ending_hook") or src.get("cliffhanger_hook") or "").strip() or f"{ep_title}：突发逆转留下悬念断章"
         episodes_outline.append({
             "episode_num": idx,
-            "title": str(src.get("title") or f"第{idx}集").strip(),
-            "opening_hook": str(src.get("opening_hook") or "").strip(),
-            "core_event": str(src.get("core_event") or "").strip(),
-            "ending_hook": str(src.get("ending_hook") or "").strip(),
+            "title": ep_title,
+            "opening_hook": opening,
+            "core_event": core,
+            "ending_hook": ending,
             "paywall_card": bool(src.get("paywall_card", False)),
             "paywall_reason": str(src.get("paywall_reason") or "").strip(),
         })
@@ -821,6 +873,8 @@ def ai_decompose_novel_to_drama(
         "style": style,
         "total_episodes": total_episodes,
         "episode_duration": episode_duration,
+        "episode_duration_min": episode_duration_min,
+        "episode_duration_max": episode_duration_max,
         "shootability_report": report,
         "characters": normalized_chars,
         "scenes_sheet": scenes_sheet,
@@ -950,7 +1004,7 @@ def ai_doctor_script(
         f"【待精修剧本初稿】：\n{raw[:15000]}"
     )
 
-    res = llm._call_api(system_prompt, user_prompt, max_tokens=5000)
+    res = llm._call_api(system_prompt, user_prompt, max_tokens=8000)
     polished = str(res.get("polished_script") or "").strip()
     if not polished:
         raise RuntimeError("AI 未能返回有效的精修剧本内容")

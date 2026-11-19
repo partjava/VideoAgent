@@ -123,18 +123,20 @@ async def get_video_capabilities() -> ApiResponse:
         STORYBOARD_FLOW_MODE,
         active_provider_duration_bounds,
     )
+    from services.model_config import generation_limits
     from services.provider_factory import active_video_provider_and_model
 
     provider, model = active_video_provider_and_model(settings)
+    limits = generation_limits(settings)
     return ApiResponse(
         status="success",
         data={
             "video_provider": provider,
             "video_model": model,
             "vidu_resolution": str(getattr(settings, "vidu_resolution", "1080p") or "1080p"),
-            "max_images_per_task": int(getattr(settings, "max_images_per_task", 20) or 20),
-            "max_video_seconds_per_task": int(getattr(settings, "max_video_seconds_per_task", 600) or 600),
-            "max_dynamic_scenes_per_task": int(getattr(settings, "max_dynamic_scenes_per_task", 99) or 99),
+            "max_images_per_task": int(limits["max_images_per_task"]),
+            "max_video_seconds_per_task": int(limits["max_video_seconds_per_task"]),
+            "max_dynamic_scenes_per_task": int(limits["max_dynamic_scenes_per_task"]),
             "duration_bounds": {
                 AUTO_DIRECTOR_MODE: list(active_provider_duration_bounds(AUTO_DIRECTOR_MODE, cfg=settings)),
                 STORYBOARD_FLOW_MODE: list(active_provider_duration_bounds(STORYBOARD_FLOW_MODE, cfg=settings)),
@@ -541,11 +543,11 @@ async def rerun_scene_asset(
             image_prompt = payload.prompt or scene.get("image_prompt")
             if image_prompt:
                 image_service = get_image_service()
-                choices = reference_choices_for_scene(task, scene)
+                max_refs = int(getattr(image_service, "max_reference_images", 2) or 0)
+                choices = reference_choices_for_scene(task, scene, max_refs=min(2, max_refs) if max_refs > 0 else 2)
                 ref_paths = [item["path"] for item in choices]
                 implicit_cards = (task.get("metadata") or {}).get("implicit_cast_cards") or []
-                if not ref_paths and implicit_cards and getattr(image_service, "supports_reference_images", False):
-                    max_refs = int(getattr(image_service, "max_reference_images", 2) or 2)
+                if not ref_paths and implicit_cards and getattr(image_service, "supports_reference_images", False) and max_refs >= 1:
                     ref_paths = [
                         p for p in _match_cast_card_paths(scene, implicit_cards, max_refs)
                         if resolve_media(p).is_file()

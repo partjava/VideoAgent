@@ -97,10 +97,9 @@ def validate_series_scene(task, scene):
     if not profiles:
         return
     characters_in_scene(task, scene)
-    allowed = {profile[key] for profile in profiles for key in ("character_id", "name")}
     for line in scene.get("dialogue_lines") or []:
-        if line["speaker"] not in allowed and line["speaker"] not in {"旁白", "解说", "narrator"}:
-            raise ValueError(f"说话角色“{line['speaker']}”未绑定角色卡，请补充角色或调整大纲")
+        if not isinstance(line, dict) or not isinstance(line.get("speaker"), str) or not line["speaker"].strip():
+            raise ValueError("连载对白中的说话角色名不能为空")
 
 
 def scene_voice_options(scene, speaker):

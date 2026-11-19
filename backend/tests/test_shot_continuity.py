@@ -778,6 +778,162 @@ class ShotContinuityTests(unittest.TestCase):
             self.assertEqual(res["topic"], "ok")
             self.assertEqual(len(calls), 3)
 
+            # 5. _call_api: LengthFinishReasonError 自动扩容 max_tokens 并支持从 completion 截断修复
+            class LengthFinishReasonError(Exception):
+                def __init__(self, message, completion=None):
+                    super().__init__(message)
+                    self.completion = completion
+
+            len_calls = []
+
+            class FakeLengthLLM:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def invoke(self, msgs):
+                    len_calls.append(dict(self.kw))
+                    if len(len_calls) == 1:
+                        partial_completion = SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    message=SimpleNamespace(content='{"title": "退婚夜", "characters": [{"name": "沈栀"}]')
+                                )
+                            ]
+                        )
+                        raise LengthFinishReasonError(
+                            "Could not parse response content as the length limit was reached - CompletionUsage(completion_tokens=6000)",
+                            completion=partial_completion,
+                        )
+                    return SimpleNamespace(content='{"title": "退婚夜", "status": "complete"}')
+
+            with patch("services.llm.deepseek_service.settings", fake_settings), patch(
+                "services.llm.deepseek_service.model_config",
+                return_value={"url": "https://api.siliconflow.cn/v1", "model": "deepseek-ai/DeepSeek-V3", "key": "sk-sf"},
+            ), patch("services.llm.deepseek_service.ChatOpenAI", side_effect=lambda **kw: FakeLengthLLM(**kw)):
+                res_expanded = svc._call_api("sys", "user", max_tokens=6000)
+            self.assertEqual(res_expanded["status"], "complete")
+            self.assertEqual(len_calls[0]["max_tokens"], 6000)
+            self.assertEqual(len_calls[1]["max_tokens"], 8192)
+            self.assertNotIn("model_kwargs", len_calls[1])
+
+            always_truncated_completion = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"title": "抢表反杀", "characters": [{"name": "沈栀"}, {"incomplete')
+                    )
+                ]
+            )
+
+            class AlwaysLengthLLM:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def invoke(self, msgs):
+                    if self.kw.get("max_tokens", 0) > 8192:
+                        err = RuntimeError("Invalid max_tokens: exceeds 8192 limit")
+                        err.status_code = 400
+                        raise err
+                    raise LengthFinishReasonError(
+                        "Could not parse response content as the length limit was reached",
+                        completion=always_truncated_completion,
+                    )
+
+            with patch("services.llm.deepseek_service.settings", fake_settings), patch(
+                "services.llm.deepseek_service.model_config",
+                return_value={"url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "key": "sk-test"},
+            ), patch("services.llm.deepseek_service.ChatOpenAI", side_effect=lambda **kw: AlwaysLengthLLM(**kw)):
+                res_repaired = svc._call_api("sys", "user", max_tokens=8192)
+            self.assertEqual(res_repaired["title"], "抢表反杀")
+            self.assertEqual(res_repaired["characters"][0]["name"], "沈栀")
+
+            from services import drama_craft_service
+
+            seen_tokens = []
+
+            class StubCraftLLM:
+                def _call_api(self, sys_p, usr_p, max_tokens=2000):
+                    seen_tokens.append(max_tokens)
+                    return {
+                        "title": "三集精悍测试",
+                        "shootability_report": {"overall_feasibility": "S级", "metrics": []},
+                        "characters": [{"name": "沈栀", "role": "女主", "face_dna": "浅疤", "signature_clothing": "帆布鞋"}],
+                        "scenes_spec": [],
+                        "props_spec": [],
+                        "episodes_outline": [{"episode_num": 1, "title": "第1集"}],
+                        "first_episode_script": "△推门。",
+                        "continuity_ledgers": {},
+                    }
+
+            with patch.object(drama_craft_service, "_get_real_llm", return_value=StubCraftLLM()):
+                out = drama_craft_service.ai_decompose_novel_to_drama("沈栀带怀表去退婚" * 3, total_episodes=3)
+            self.assertGreaterEqual(seen_tokens[0], 8192)
+            self.assertEqual(len(out["episodes_outline"]), 3)
+
+            # 6. GLM-5.3-Flash / Qwen3 思考模型：GLM-5.3 使用 reasoning_effort=low，Qwen3 使用 enable_thinking=False，支持 </think> 与 reasoning_content 提取
+            parsed_unpaired = _extract_and_parse_json('先分析{草案}\n</think>\n{"title": "古董表", "ok": true}')
+            self.assertEqual(parsed_unpaired["title"], "古董表")
+
+            glm_calls = []
+
+            class FakeGlmLLM:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def invoke(self, msgs):
+                    glm_calls.append(dict(self.kw))
+                    return SimpleNamespace(
+                        content="",
+                        additional_kwargs={"reasoning_content": '内部规划 {跳过片段\n{"title": "硅基GLM提取", "characters": []}'},
+                        response_metadata={"finish_reason": "stop"},
+                    )
+
+            with patch("services.llm.deepseek_service.settings", fake_settings), patch(
+                "services.llm.deepseek_service.model_config",
+                return_value={"url": "https://api.siliconflow.cn/v1", "model": "zai-org/GLM-5.3-Flash", "key": "sk-sf"},
+            ), patch("services.llm.deepseek_service.ChatOpenAI", side_effect=lambda **kw: FakeGlmLLM(**kw)):
+                res_glm = svc._call_api("sys", "user", max_tokens=8192)
+            self.assertEqual(res_glm["title"], "硅基GLM提取")
+            self.assertEqual(glm_calls[0].get("extra_body"), {"reasoning_effort": "low"})
+            self.assertNotIn("model_kwargs", glm_calls[0])
+
+            qwen3_calls = []
+
+            class FakeQwen3LLM:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def invoke(self, msgs):
+                    qwen3_calls.append(dict(self.kw))
+                    return SimpleNamespace(content='{"title": "Qwen3直出"}', response_metadata={"finish_reason": "stop"})
+
+            with patch("services.llm.deepseek_service.settings", fake_settings), patch(
+                "services.llm.deepseek_service.model_config",
+                return_value={"url": "https://api.siliconflow.cn/v1", "model": "Qwen/Qwen3-32B", "key": "sk-sf"},
+            ), patch("services.llm.deepseek_service.ChatOpenAI", side_effect=lambda **kw: FakeQwen3LLM(**kw)):
+                res_q3 = svc._call_api("sys", "user", max_tokens=8192)
+            self.assertEqual(res_q3["title"], "Qwen3直出")
+            self.assertEqual(qwen3_calls[0].get("extra_body"), {"enable_thinking": False})
+
+            class FakeReasoningOnlyLLM:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def invoke(self, msgs):
+                    return SimpleNamespace(
+                        content="",
+                        additional_kwargs={"reasoning_content": "全程在分析剧情结构但没有输出任何JSON"},
+                        response_metadata={"finish_reason": "length"},
+                    )
+
+            with patch("services.llm.deepseek_service.settings", fake_settings), patch(
+                "services.llm.deepseek_service.model_config",
+                return_value={"url": "https://api.siliconflow.cn/v1", "model": "zai-org/GLM-5.3-Flash", "key": "sk-sf"},
+            ), patch("services.llm.deepseek_service.ChatOpenAI", side_effect=lambda **kw: FakeReasoningOnlyLLM(**kw)):
+                with self.assertRaises(ValueError) as ctx:
+                    svc._call_api("sys", "user", max_tokens=8192)
+            self.assertIn("zai-org/GLM-5.3-Flash", str(ctx.exception))
+            self.assertIn("推理过程", str(ctx.exception))
+
     def test_script_segment_accepts_auto_director_variable_durations(self):
         with patch.dict(sys.modules, _runtime_stubs()):
             from models.script_model import Script, ScriptSegment
@@ -1304,6 +1460,23 @@ class ShotContinuityTests(unittest.TestCase):
             )
             self.assertNotIn("SLOW_OPENING", judged["story_judge"]["deterministic_flags"])
 
+            # 2b. ScriptSegment / Script 允许 storyboard_flow 静默分镜，非流模式仍校验旁白文本
+            from agents.story_judge_agent import normalize_segments_for_mode
+            from models.script_model import Script, ScriptSegment
+
+            silent_norm = normalize_segments_for_mode(
+                [{"plot": "全景：椅子刮地乱响", "voiceover": None, "dialogue_lines": []}],
+                mode=STORYBOARD_FLOW_MODE,
+                min_sec=5,
+                max_sec=12,
+            )
+            self.assertTrue(silent_norm[0]["allow_silent"])
+            silent_seg = ScriptSegment(**silent_norm[0])
+            silent_seg.validate_speech()
+            Script(script_id="sc_flow", task_id="t_flow", segments=silent_norm)
+            with self.assertRaises(ValueError):
+                ScriptSegment(duration=5, plot="无旁白普通段落", voice_start=0.0, voiceover="").validate_speech()
+
             # 3. PromptAgent passes per_second=False & accepts single continuous motion_beat
             seen_per_second = []
 
@@ -1628,6 +1801,878 @@ class ShotContinuityTests(unittest.TestCase):
                 conc_svc.calls.clear()
                 asyncio.run(VideoAgent().run("t_vid_conc", trial_scene_id="vs_1"))
                 self.assertEqual(conc_svc.calls[0][1], "720p")
+
+    def test_siliconflow_image_video_routing_bounds_and_catalog(self):
+        import asyncio
+        import io
+        import json
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from routes.settings_routes import ModelInput, query_model_catalog, test_model
+            from services import provider_factory
+            from services.generation_contract import STORYBOARD_FLOW_MODE, provider_duration_bounds
+            from services.image.siliconflow_image_service import SiliconFlowImageService
+            from services.model_config import is_siliconflow_url, siliconflow_v1_base
+            from services.video.base import VideoRenderRejected
+            from services.video.siliconflow_video_service import SiliconFlowVideoService
+
+            # 1. URL helpers & provider routing + duration bounds
+            self.assertTrue(is_siliconflow_url("https://api.siliconflow.cn/v1"))
+            self.assertFalse(is_siliconflow_url("https://dashscope.aliyuncs.com"))
+            self.assertEqual(siliconflow_v1_base("https://api.siliconflow.cn/v1/video/submit"), "https://api.siliconflow.cn/v1")
+            self.assertEqual(
+                provider_duration_bounds("siliconflow", "MiniMaxAI/MiniMax-H3", generation_mode=STORYBOARD_FLOW_MODE),
+                (5, 12),
+            )
+
+            sf_saved = {
+                "image": {"url": "https://api.siliconflow.cn/v1", "model": "black-forest-labs/FLUX.1-Kontext-dev", "key": "sf-k"},
+                "video": {"url": "https://api.siliconflow.cn/v1", "model": "MiniMaxAI/MiniMax-H3", "key": "sf-k"},
+            }
+            with patch.object(provider_factory, "saved_models", return_value=sf_saved), patch.object(
+                provider_factory, "model_config", return_value=sf_saved["video"]
+            ), patch(
+                "services.image.siliconflow_image_service.model_config", return_value=sf_saved["image"]
+            ), patch(
+                "services.video.siliconflow_video_service.model_config", return_value=sf_saved["video"]
+            ):
+                img_svc = provider_factory.get_image_service()
+                vid_svc = provider_factory.get_video_service()
+                self.assertIsInstance(img_svc, SiliconFlowImageService)
+                self.assertIsInstance(vid_svc, SiliconFlowVideoService)
+                self.assertTrue(img_svc.supports_reference_images)
+                self.assertEqual(img_svc.max_reference_images, 1)
+                self.assertTrue(vid_svc.supports_last_frame)
+                self.assertEqual(provider_factory.active_video_provider_and_model(), ("siliconflow", "MiniMaxAI/MiniMax-H3"))
+
+            # 2. SiliconFlowImageService generates image & supports 1 reference image on Kontext/Edit
+            tmp_dir = Path(tmp)
+            png_bytes = io.BytesIO()
+            Image.new("RGB", (64, 64), (120, 160, 200)).save(png_bytes, format="PNG")
+            png_raw = png_bytes.getvalue()
+
+            posted_img_payloads = []
+
+            class FakeResp:
+                def __init__(self, status_code=200, body=None, content=b""):
+                    self.status_code = status_code
+                    self.is_success = 200 <= status_code < 300
+                    self._body = body or {}
+                    self.content = content
+                    self.text = json.dumps(self._body)
+                    self.request = SimpleNamespace(url=SimpleNamespace(path="/v1/models"))
+
+                def json(self):
+                    return self._body
+
+                def raise_for_status(self):
+                    if self.status_code >= 400:
+                        raise RuntimeError(f"HTTP {self.status_code}")
+
+            class FakeImgClient:
+                def __init__(self, **kw):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    pass
+
+                def post(self, url, json=None, headers=None):
+                    posted_img_payloads.append((url, json))
+                    return FakeResp(200, {"images": [{"url": "https://cdn.sf.test/img.png"}]})
+
+                def get(self, url, timeout=60):
+                    return FakeResp(200, content=png_raw)
+
+            ref_disk = tmp_dir / "ref.png"
+            ref_disk.write_bytes(png_raw)
+            img_profile = {"url": "https://api.siliconflow.cn", "model": "black-forest-labs/FLUX.1-Kontext-dev", "key": "sf-k"}
+            with patch("services.image.siliconflow_image_service.model_config", return_value=img_profile), patch(
+                "services.image.siliconflow_image_service.settings", SimpleNamespace(enable_paid_api=True)
+            ), patch("services.image.siliconflow_image_service.httpx.Client", FakeImgClient), patch(
+                "services.character_service.local_asset", return_value=ref_disk
+            ), patch("services.character_service.validate_image", return_value=None):
+                img_out = SiliconFlowImageService(storage_root=tmp_dir).generate_image(
+                    "t_sf", "s1", "校园走廊男生回头", ratio="9:16", reference_images=["backend/assets/t_sf/images/ref.png"]
+                )
+            self.assertEqual(img_out["source"], "siliconflow")
+            self.assertEqual(posted_img_payloads[0][0], "https://api.siliconflow.cn/v1/images/generations")
+            self.assertTrue(str(posted_img_payloads[0][1]["image"]).startswith("data:image/png;base64,"))
+            self.assertTrue((tmp_dir / "assets" / "t_sf" / "images" / "s1.png").is_file())
+
+            # 3. SiliconFlowVideoService submits first+last frame & polls POST /v1/video/status
+            vid_posts = []
+
+            class FakeVidClient:
+                def __init__(self, **kw):
+                    self.polls = 0
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    pass
+
+                def post(self, url, json=None, headers=None):
+                    vid_posts.append((url, json))
+                    if url.endswith("/video/submit"):
+                        return FakeResp(200, {"requestId": "req-sf-1"})
+                    self.polls += 1
+                    if self.polls == 1:
+                        return FakeResp(200, {"status": "InProgress"})
+                    return FakeResp(200, {"status": "Succeed", "results": {"videos": [{"url": "https://cdn.sf.test/v.mp4"}]}})
+
+                def get(self, url, timeout=120):
+                    return FakeResp(200, content=b"fake-mp4-bytes")
+
+            first_p = tmp_dir / "first.png"
+            last_p = tmp_dir / "last.png"
+            first_p.write_bytes(png_raw)
+            last_p.write_bytes(png_raw)
+            vid_profile = {"url": "https://api.siliconflow.cn/v1", "model": "MiniMaxAI/MiniMax-H3", "key": "sf-k"}
+            with patch("services.video.siliconflow_video_service.model_config", return_value=vid_profile), patch(
+                "services.video.siliconflow_video_service.settings",
+                SimpleNamespace(enable_paid_api=True, siliconflow_video_resolution="768p"),
+            ), patch("services.video.siliconflow_video_service.httpx.Client", FakeVidClient), patch(
+                "services.video.siliconflow_video_service.time.sleep", return_value=None
+            ):
+                svc = SiliconFlowVideoService(storage_root=tmp_dir)
+                dialect_prompt, dialect_opts = adapt_video_submission(
+                    svc,
+                    {"scene_id": "s1", "last_frame_target_path": str(last_p), "_is_trial": True},
+                    "男生转身微笑",
+                )
+                self.assertEqual(dialect_opts["resolution"], "480p")
+                self.assertEqual(dialect_opts["last_frame_path"], str(last_p))
+                vid_res = svc.generate_video(
+                    "t_sf", "s1", str(first_p), video_prompt=dialect_prompt, duration=4, ratio="9:16", **dialect_opts
+                )
+            self.assertEqual(vid_res["source"], "siliconflow")
+            self.assertEqual(vid_res["duration"], 5)  # clamped cleanly to MiniMax-H3 >=5s minimum
+            submit_url, submit_body = vid_posts[0]
+            self.assertEqual(submit_url, "https://api.siliconflow.cn/v1/video/submit")
+            self.assertEqual([img["role"] for img in submit_body["images"]], ["first_frame", "last_frame"])
+            self.assertEqual(submit_body["resolution"], "480p")
+            self.assertEqual(vid_posts[1][0], "https://api.siliconflow.cn/v1/video/status")
+            self.assertEqual(vid_posts[1][1], {"requestId": "req-sf-1"})
+
+            # 4. SiliconFlow catalog query + test skips /api/v1/files and surfaces Edit/Kontext + MiniMax-H3
+            from pydantic import SecretStr
+            sf_urls_seen = []
+
+            class FakeAsyncCatalog:
+                def __init__(self, **kw):
+                    pass
+
+                async def __aenter__(self):
+                    async def _get(url, headers=None):
+                        sf_urls_seen.append(url)
+                        if "type=video" in url:
+                            return FakeResp(200, {"data": [{"id": "MiniMaxAI/MiniMax-H3"}]})
+                        return FakeResp(200, {"data": [{"id": "black-forest-labs/FLUX.1-Kontext-dev"}, {"id": "Qwen/Qwen-Image-Edit"}]})
+
+                    return SimpleNamespace(get=_get)
+
+                async def __aexit__(self, *a):
+                    pass
+
+            with patch("routes.settings_routes.httpx.AsyncClient", FakeAsyncCatalog):
+                vid_cat = asyncio.run(query_model_catalog("video", ModelInput(url="https://api.siliconflow.cn/v1", model="", key=SecretStr("sf-k"))))
+                img_cat = asyncio.run(query_model_catalog("image", ModelInput(url="https://api.siliconflow.cn/v1", model="", key=SecretStr("sf-k"))))
+                vid_tst = asyncio.run(test_model("video", ModelInput(url="https://api.siliconflow.cn/v1", model="MiniMaxAI/MiniMax-H3", key=SecretStr("sf-k"))))
+            self.assertEqual(vid_cat["data"]["models"], ["MiniMaxAI/MiniMax-H3"])
+            self.assertIn("Qwen/Qwen-Image-Edit", img_cat["data"]["models"])
+            self.assertIn("black-forest-labs/FLUX.1-Kontext-dev", img_cat["data"]["models"])
+            self.assertEqual(vid_tst["data"]["result"], "model_listed")
+            self.assertTrue(all("/api/v1/files" not in u for u in sf_urls_seen))
+
+    def test_dynamic_generation_limits_web_override_and_unlimited(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from routes.settings_routes import LimitsInput, get_limits, reset_limits, update_limits
+            from services import model_config
+
+            tmp_limits = Path(tmp) / ".env.limits.local"
+            with patch.object(model_config, "LIMITS_PATH", tmp_limits):
+                initial = asyncio.run(get_limits())
+                self.assertEqual(initial["data"]["source"], "env")
+
+                saved = asyncio.run(
+                    update_limits(
+                        LimitsInput(
+                            max_images_per_task=0,
+                            max_video_seconds_per_task=0,
+                            max_dynamic_scenes_per_task=0,
+                        )
+                    )
+                )
+                self.assertEqual(saved["data"]["source"], "local")
+                self.assertEqual(saved["data"]["max_images_per_task"], 0)
+                self.assertEqual(model_config.generation_limits()["max_images_per_task"], 0)
+
+                # Reset restores env defaults
+                restored = asyncio.run(reset_limits())
+                self.assertEqual(restored["data"]["source"], "env")
+                self.assertFalse(tmp_limits.exists())
+
+            # ImageAgent honors unlimited (0) and task.generation_limit override
+            from agents.image_agent import ImageAgent
+
+            fake_scenes = [
+                {"scene_id": f"s{i}", "scene_index": i, "duration": 5, "need_dynamic_video": True, "transition_type": "cut", "image_prompt": "test"}
+                for i in range(1, 13)
+            ]
+            img_db = Mock()
+            img_db.find_many = AsyncMock(return_value=fake_scenes)
+            img_db.find_one = AsyncMock(return_value={"task_id": "t_lim", "ratio": "9:16", "generation_limit": 20})
+            img_db.replace_one = AsyncMock()
+            img_db.update_one = AsyncMock()
+            stub_img = Mock(supports_reference_images=False, max_reference_images=0)
+            stub_img.generate_image.side_effect = lambda **kw: {"status": "success", "asset_path": f"backend/assets/t_lim/images/{kw['scene_id']}.png", "source": "stub"}
+
+            async def _fake_dispatch(t, o, k, fn):
+                return fn()
+
+            stub_anyio = SimpleNamespace(
+                Semaphore=asyncio.Semaphore,
+                to_thread=SimpleNamespace(run_sync=lambda fn, *a, abandon_on_cancel=None, **k: asyncio.sleep(0, result=fn(*a, **k))),
+            )
+            with patch("agents.image_agent.mongodb", img_db), patch(
+                "agents.image_agent.anyio", stub_anyio
+            ), patch(
+                "agents.image_agent.settings", SimpleNamespace(max_images_per_task=10, video_provider="siliconflow")
+            ), patch("agents.image_agent.get_image_service", return_value=stub_img), patch(
+                "agents.image_agent.dispatch_generation", side_effect=_fake_dispatch
+            ), patch("agents.image_agent.mark_agent_start", new=AsyncMock()), patch(
+                "agents.image_agent.mark_agent_success", new=AsyncMock()
+            ), patch("agents.image_agent.mark_agent_failed", new=AsyncMock()):
+                out = asyncio.run(ImageAgent().run("t_lim"))
+            self.assertEqual(len(out), 12)
+
+            # Unlimited (0) allows >10 scenes even without task.generation_limit
+            img_db.find_one = AsyncMock(return_value={"task_id": "t_unlim", "ratio": "9:16"})
+            with patch("agents.image_agent.mongodb", img_db), patch(
+                "agents.image_agent.anyio", stub_anyio
+            ), patch(
+                "agents.image_agent.settings", SimpleNamespace(max_images_per_task=0, video_provider="siliconflow")
+            ), patch("agents.image_agent.get_image_service", return_value=stub_img), patch(
+                "agents.image_agent.dispatch_generation", side_effect=_fake_dispatch
+            ), patch("agents.image_agent.mark_agent_start", new=AsyncMock()), patch(
+                "agents.image_agent.mark_agent_success", new=AsyncMock()
+            ), patch("agents.image_agent.mark_agent_failed", new=AsyncMock()):
+                out_unlim = asyncio.run(ImageAgent().run("t_unlim"))
+            self.assertEqual(len(out_unlim), 12)
+
+    def test_end_to_end_pipeline_hardening_storyboard_dialogue_prompt_voice(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from agents.dialogue_polish_agent import DialoguePolishAgent
+            from agents.prompt_agent import PromptAgent, _format_visual_bible_brief, _normalize_motion_beats
+            from agents.storyboard_agent import _sanitize_storyboard_draft, validate_storyboard_scenes
+            from agents.voice_agent import synthesize_dialogue
+
+            # 1. Storyboard sanitizer repairs vague terms, unknown transition, missing helper fields & out-of-range cues
+            messy_draft = [
+                {
+                    "scene_id": "",
+                    "duration": 5,
+                    "transition_type": "flash_white",
+                    "visual_description": "电影感氛围感震撼，林晚抬手插进测温针",
+                    "character_state": "",
+                    "scene_continuity": "",
+                    "transition_note": "",
+                    "voiceover": "",
+                    "dialogue_lines": [],
+                    "voice_start": 9.0,
+                    "sound_cues": [{"name": "impact", "start": 8.0}, {"name": "unknown_fx", "start": 1.0}],
+                },
+                {
+                    "scene_id": "scene_02",
+                    "duration": 5,
+                    "transition_type": "continue_action",
+                    "visual_description": "周明哲低头盯住表盘指针滑到86度",
+                    "voiceover": "清汤九十二度，你差六度。",
+                },
+            ]
+            _sanitize_storyboard_draft(messy_draft, allow_silent=True)
+            validate_storyboard_scenes(messy_draft, target_duration=10, enforce_voiceover_density=False, allow_silent=True)
+            self.assertEqual(messy_draft[0]["scene_id"], "scene_01")
+            self.assertEqual(messy_draft[0]["transition_type"], "scene_change")
+            self.assertNotIn("电影感", messy_draft[0]["visual_description"])
+            self.assertEqual(messy_draft[0]["sound_cues"], [{"name": "impact", "start": 4.9}])
+            self.assertLess(messy_draft[0]["voice_start"], 5.0)
+            self.assertTrue(messy_draft[0]["end_state"])
+
+            # 2. DialoguePolishAgent survives missing scene_id / omitted scene without crashing
+            dp_scenes = [
+                {"scene_id": "scene_01", "scene_index": 1, "duration": 5, "transition_type": "cut",
+                 "voiceover": "二十秒后封条贴门。", "visual_description": "林晚站在松鹤楼木雕大门前",
+                 "character_state": "冷静→锋利", "scene_continuity": "开场建立", "transition_note": "切近景"},
+                {"scene_id": "scene_02", "scene_index": 2, "duration": 5, "transition_type": "cut",
+                 "voiceover": "", "visual_description": "全场宾客椅子刮地站起",
+                 "character_state": "骚动→震惊", "scene_continuity": "接上镜", "transition_note": "切特写"},
+            ]
+            dp_db = Mock()
+            dp_db.find_many = AsyncMock(return_value=dp_scenes)
+            dp_db.update_one = AsyncMock()
+            dp_llm = Mock()
+            dp_llm.polish_dialogue.return_value = []  # intentionally omit all scenes to test fallback
+            stub_anyio = SimpleNamespace(
+                Semaphore=asyncio.Semaphore,
+                to_thread=SimpleNamespace(run_sync=lambda fn, *a, abandon_on_cancel=None, **k: asyncio.sleep(0, result=fn(*a, **k))),
+            )
+            with patch("agents.dialogue_polish_agent.mongodb", dp_db), patch(
+                "agents.dialogue_polish_agent.anyio", stub_anyio
+            ), patch(
+                "agents.dialogue_polish_agent.get_required_task",
+                new=AsyncMock(return_value={"task_id": "t_dp", "duration": 10, "generation_mode": "storyboard_flow"}),
+            ), patch("agents.dialogue_polish_agent.get_llm_service", return_value=dp_llm), patch(
+                "agents.dialogue_polish_agent.mark_agent_start", new=AsyncMock()
+            ), patch("agents.dialogue_polish_agent.mark_agent_success", new=AsyncMock()), patch(
+                "agents.dialogue_polish_agent.mark_agent_failed", new=AsyncMock()
+            ):
+                dp_out = asyncio.run(DialoguePolishAgent().run("t_dp"))
+            self.assertEqual(dp_out[0]["voiceover"], "二十秒后封条贴门。")
+            self.assertEqual(dp_out[1]["voiceover"], "")
+
+            # 3. PromptAgent strips raw JSON bible, aligns mismatched scene_id & normalizes motion_beats
+            brief = _format_visual_bible_brief(
+                {
+                    "visual_world": "暖黄吊灯的老字号红木厅堂",
+                    "characters": [{"name": "林晚", "face_dna": "左耳后朱砂痣", "signature_clothing": "白色厨师服", "tts_voice": "zh-CN-XiaoxiaoNeural"}],
+                },
+                {"visual_description": "林晚抽起黄铜测温针"},
+            )
+            self.assertIn("林晚", brief)
+            self.assertNotIn("tts_voice", brief)
+            self.assertNotIn("{", brief)
+
+            beats_ps = _normalize_motion_beats(
+                [{"start": "0", "end": "3", "subject": "林晚", "action": "扎针测温"}],
+                5,
+                {"visual_description": "林晚扎针测温"},
+                per_second=True,
+            )
+            self.assertEqual(len(beats_ps), 5)
+            self.assertEqual([(b["start"], b["end"]) for b in beats_ps], [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)])
+
+            pa_scene = {
+                "scene_id": "scene_01", "scene_index": 1, "duration": 5, "transition_type": "cut",
+                "visual_description": "林晚左手抽出黄铜测温针", "voiceover": "你差六度。",
+            }
+            pa_db = Mock()
+            pa_db.find_many = AsyncMock(return_value=[pa_scene])
+            pa_db.update_one = AsyncMock()
+            pa_llm = Mock()
+            pa_llm.generate_image_prompts.return_value = [{
+                "scene_id": "1",  # mismatched ID format
+                "image_prompt": "林晚手握测温针近景",
+                "video_prompt": "林晚抬手把测温针扎进汤盅",
+                "motion_beats": [{"start": 0, "end": 3, "subject": "林晚", "camera": "近景", "start_state": "握针", "action": "扎针", "end_state": "指针停86"}],
+            }]
+            with patch("agents.prompt_agent.mongodb", pa_db), patch(
+                "agents.prompt_agent.anyio", stub_anyio
+            ), patch(
+                "agents.prompt_agent.get_required_task",
+                new=AsyncMock(return_value={"task_id": "t_pa2", "ratio": "9:16", "style": "短剧", "generation_mode": "storyboard_flow", "metadata": {"task_plan": {"visual_world": "松鹤楼大厅"}}}),
+            ), patch("agents.prompt_agent.get_llm_service", return_value=pa_llm), patch(
+                "agents.prompt_agent.task_service.update_task_fields", new=AsyncMock()
+            ), patch("agents.prompt_agent.mark_agent_start", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_success", new=AsyncMock()
+            ), patch("agents.prompt_agent.mark_agent_failed", new=AsyncMock()):
+                pa_out = asyncio.run(PromptAgent().run("t_pa2"))
+            self.assertEqual(pa_out[0]["scene_id"], "scene_01")
+            self.assertEqual(pa_out[0]["motion_beats"][-1]["end"], 5)
+            self.assertNotIn('{"characters"', pa_out[0]["image_prompt"])
+
+            # 4. VoiceAgent skips stage-direction-only dialogue lines instead of crashing TTS
+            v_scene = {
+                "scene_id": "s_v",
+                "duration": 5,
+                "dialogue_lines": [
+                    {"speaker": "赵鹏", "text": "（冷笑一声）", "start": 0.2},
+                    {"speaker": "林晚", "text": "你差六度。", "start": 1.0},
+                ],
+            }
+            with patch("agents.voice_agent.tts_service.generate_voice", new=AsyncMock(return_value=1.2), create=True):
+                rendered_v = asyncio.run(synthesize_dialogue(v_scene, Path(tmp), "t_v", "s_v"))
+            self.assertEqual(len(rendered_v), 1)
+            self.assertEqual(rendered_v[0]["text"], "你差六度。")
+            self.assertEqual(len(v_scene["dialogue_lines"]), 1)
+
+    def test_prompt_batching_series_duration_range_and_settings_db_sync(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from agents.prompt_agent import PromptAgent, _match_batch_prompts
+            from services.series_service import episode_duration_plan
+
+            # 1. Batch matcher aligns wrong scene_id formats by index / position
+            chunk = [{"scene_id": "scene_01", "scene_index": 1}, {"scene_id": "scene_02", "scene_index": 2}]
+            matched = _match_batch_prompts([{"scene_id": "2"}, {"scene_id": "1"}], chunk)
+            self.assertEqual(set(matched), {"scene_01", "scene_02"})
+            self.assertEqual(matched["scene_02"]["scene_id"], "scene_02")
+
+            # 2. 6 per-second scenes -> 2 batched LLM calls (3 each), context flows across batches
+            calls = []
+
+            class BatchLLM:
+                def generate_image_prompts(self, batch, ratio="9:16", style=None, visual_bible=None):
+                    calls.append([(sc["scene_id"], sc.get("previous_segment_context")) for sc in batch])
+                    out = []
+                    for sc in batch:
+                        dur = int(sc["duration"])
+                        out.append({
+                            "scene_id": sc["scene_id"],
+                            "image_prompt": "首帧", "video_prompt": "动作",
+                            "motion_beats": [
+                                {"start": i, "end": i + 1, "subject": "甲", "camera": "中景", "start_state": "站",
+                                 "action": "动", "end_state": f"{sc['scene_id']}收尾" if i == dur - 1 else "进行"}
+                                for i in range(dur)
+                            ],
+                        })
+                    return out
+
+            scenes = [{"scene_id": f"scene_{i}", "scene_index": i, "duration": 4, "visual_description": f"镜{i}",
+                       "voiceover": "台词"} for i in range(1, 7)]
+            task = {"task_id": "t_batch", "generation_mode": "auto_director", "ratio": "9:16", "style": "短剧",
+                    "metadata": {"task_plan": {}}}
+            db = Mock()
+            db.find_many = AsyncMock(side_effect=lambda *a, **k: [dict(s) for s in scenes])
+            db.update_one = AsyncMock()
+            stub_anyio = SimpleNamespace(
+                Semaphore=asyncio.Semaphore,
+                to_thread=SimpleNamespace(run_sync=lambda fn, *a, abandon_on_cancel=None, **k: asyncio.sleep(0, result=fn(*a, **k))),
+            )
+            with patch("agents.prompt_agent.mongodb", db), patch(
+                "agents.prompt_agent.get_required_task", new=AsyncMock(return_value=task)
+            ), patch("agents.prompt_agent.anyio", stub_anyio), patch(
+                "agents.prompt_agent.get_llm_service", return_value=BatchLLM()
+            ), patch("agents.prompt_agent.task_service.update_task_fields", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_start", new=AsyncMock()
+            ), patch("agents.prompt_agent.mark_agent_success", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_failed", new=AsyncMock()
+            ):
+                out = asyncio.run(PromptAgent().run("t_batch"))
+            self.assertEqual(len(out), 6)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([len(c) for c in calls], [3, 3])
+            self.assertIsNone(calls[0][0][1])
+            self.assertEqual(calls[1][0][1]["scene_index"], 3)
+            self.assertEqual(calls[1][0][1]["final_second"]["end_state"], "scene_3收尾")
+
+            # 3. Series duration plan: native locks multiples of 10, flexible modes give a range
+            self.assertEqual(episode_duration_plan({"episode_duration": 30}), ("native_10s", 30, None, None))
+            self.assertEqual(episode_duration_plan({"generation_mode": "native_10s", "episode_duration": 45})[1], 50)
+            self.assertEqual(
+                episode_duration_plan({"generation_mode": "auto_director", "episode_duration": 68,
+                                       "episode_duration_min": 45, "episode_duration_max": 90}),
+                ("auto_director", None, 45, 90),
+            )
+            mode, dur, lo, hi = episode_duration_plan({"generation_mode": "storyboard_flow", "episode_duration": 60})
+            self.assertEqual((mode, dur, lo, hi), ("storyboard_flow", None, 45, 75))
+
+            # 4. Settings persistence: DB doc hydrates missing local cache; save writes to DB
+            from services import settings_persistence as sp
+
+            store = {}
+
+            class FakeDB:
+                database = object()
+
+                async def find_one(self, coll, query):
+                    return store.get(query["_id"])
+
+                async def replace_one(self, coll, query, doc, upsert=False):
+                    store[query["_id"]] = doc
+                    return 1
+
+                async def delete_one(self, coll, query):
+                    store.pop(query["_id"], None)
+                    return 1
+
+            models_path = Path(tmp) / "models.json"
+            limits_path = Path(tmp) / "limits.json"
+            real_models_path = Path(__file__).resolve().parents[1] / ".env.models.local"
+            existed_before = real_models_path.exists()
+            profile = {"prompt": {"url": "https://api.deepseek.com", "model": "deepseek-chat", "key": "test-placeholder"}}
+            with patch.object(sp.model_config, "PATH", models_path), patch.object(
+                sp.model_config, "LIMITS_PATH", limits_path
+            ), patch.object(sp, "mongodb", FakeDB()):
+                from datetime import UTC as _UTC, datetime as _dt
+                store["model_profiles"] = {"_id": "model_profiles", "models": profile, "updated_at": _dt.now(_UTC)}
+                store["generation_limits"] = {"_id": "generation_limits", "limits": {"max_images_per_task": 0},
+                                              "updated_at": _dt.now(_UTC)}
+                result = asyncio.run(sp.hydrate_settings_from_db())
+                self.assertEqual(result, {"models": True, "limits": True})
+                self.assertEqual(sp.model_config.saved_models()["prompt"]["model"], "deepseek-chat")
+                self.assertEqual(sp.model_config.saved_limits(), {"max_images_per_task": 0})
+
+                new_models = {**profile, "image": {"url": "https://api.siliconflow.cn/v1", "model": "Kwai-Kolors/Kolors", "key": "test-x"}}
+                self.assertTrue(asyncio.run(sp.persist_models_to_db(new_models)))
+                self.assertIn("image", store["model_profiles"]["models"])
+                self.assertTrue(asyncio.run(sp.persist_limits_to_db(None)))
+                self.assertNotIn("generation_limits", store)
+
+            if not existed_before:
+                self.assertFalse(real_models_path.exists())
+
+            # Offline DB: persistence gracefully reports False
+            with patch.object(sp, "mongodb", SimpleNamespace(database=None)):
+                self.assertFalse(asyncio.run(sp.persist_models_to_db(profile)))
+                self.assertEqual(asyncio.run(sp.hydrate_settings_from_db()), {"models": False, "limits": False})
+
+    def test_series_nonref_fallback_and_story_craft_hardening(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from agents.image_agent import ImageAgent
+            from agents.prompt_agent import PromptAgent
+            from agents.storyboard_agent import _sanitize_storyboard_draft
+            from services import drama_craft_service, series_service as ss_mod
+            from services.character_binding import validate_series_scene
+
+            bound_char = {
+                "character_id": "char_linwan",
+                "name": "林晚",
+                "revision": 1,
+                "face_dna": "25岁，高马尾，左耳后朱砂痣",
+                "signature_clothing": "白色立领厨师服配黑防滑鞋",
+                "reference_path": "backend/assets/characters/char_linwan/v1/anchor.png",
+                "reference_images": {"front": "backend/assets/characters/char_linwan/v1/anchor.png"},
+                "tts_voice": "zh-CN-XiaoxiaoNeural",
+            }
+            task = {
+                "_id": "t_nr",
+                "task_id": "t_nr",
+                "ratio": "9:16",
+                "style": "短剧",
+                "generation_mode": "auto_director",
+                "metadata": {
+                    "task_plan": {"visual_world": "松鹤楼大厅"},
+                    "series_context": {"characters": [bound_char]},
+                },
+            }
+
+            # 1. Storyboard sanitizer maps character name -> character_id & drops unknown hallucinated IDs;
+            #    validate_series_scene permits minor non-bound speaker without crashing.
+            draft = [{
+                "scene_id": "scene_01",
+                "duration": 5,
+                "character_ids": ["林晚", "hallucinated_id"],
+                "visual_description": "林晚手持黄铜测温针逼近汤盅",
+                "voiceover": "请退后！",
+                "dialogue_lines": [{"speaker": "保安", "text": "请退后！", "start": 0.2}],
+            }]
+            _sanitize_storyboard_draft(draft, bound_cast=[bound_char])
+            self.assertEqual(draft[0]["character_ids"], ["char_linwan"])
+            validate_series_scene(task, draft[0])
+
+            # 2. PromptAgent + ImageAgent gracefully fall back to text DNA (no ref images sent) for Kolors/FLUX
+            non_ref_img_calls = []
+
+            class NonRefImgSvc:
+                model = "Kwai-Kolors/Kolors"
+                supports_reference_images = False
+                max_reference_images = 0
+
+                def generate_image(self, task_id, scene_id, image_prompt, negative_prompt=None, ratio="9:16", reference_images=None):
+                    non_ref_img_calls.append({"scene_id": scene_id, "reference_images": reference_images})
+                    dest = Path(tmp) / f"{scene_id}.png"
+                    dest.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 1600)
+                    return {"status": "success", "asset_path": str(dest)}
+
+            scene_doc = {
+                "_id": "t_nr_scene_01",
+                "task_id": "t_nr",
+                "scene_id": "scene_01",
+                "scene_index": 1,
+                "duration": 4,
+                "character_ids": ["char_linwan"],
+                "visual_description": "林晚手握测温针",
+                "voiceover": "差六度。",
+                "need_dynamic_video": True,
+                "status": "storyboard_done",
+            }
+            pa_llm = Mock()
+            pa_llm.generate_image_prompts.return_value = [{
+                "scene_id": "scene_01",
+                "image_prompt": "林晚站在餐桌旁",
+                "video_prompt": "林晚抬头质问",
+                "motion_beats": [{"start": 0, "end": 4, "subject": "林晚", "camera": "中景", "start_state": "握针", "action": "抬眼", "end_state": "直视"}],
+            }]
+            db = Mock()
+            db.find_many = AsyncMock(side_effect=lambda *a, **k: [dict(scene_doc)])
+            db.find_one = AsyncMock(return_value=task)
+            db.update_one = AsyncMock()
+            db.replace_one = AsyncMock()
+            stub_anyio = SimpleNamespace(
+                Semaphore=asyncio.Semaphore,
+                to_thread=SimpleNamespace(run_sync=lambda fn, *a, abandon_on_cancel=None, **k: asyncio.sleep(0, result=fn(*a, **k))),
+            )
+            nonref_svc = NonRefImgSvc()
+            with patch("agents.prompt_agent.mongodb", db), patch(
+                "agents.prompt_agent.get_required_task", new=AsyncMock(return_value=task)
+            ), patch("agents.prompt_agent.anyio", stub_anyio), patch(
+                "agents.prompt_agent.get_llm_service", return_value=pa_llm
+            ), patch(
+                "services.provider_factory.get_image_service", return_value=nonref_svc
+            ), patch("agents.prompt_agent.task_service.update_task_fields", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_start", new=AsyncMock()
+            ), patch("agents.prompt_agent.mark_agent_success", new=AsyncMock()), patch(
+                "agents.prompt_agent.mark_agent_failed", new=AsyncMock()
+            ):
+                pa_out = asyncio.run(PromptAgent().run("t_nr"))
+            self.assertFalse(pa_out[0]["three_layer_stripped"])
+            self.assertIn("左耳后朱砂痣", pa_out[0]["image_prompt"])
+            scene_doc.update(pa_out[0])
+
+            async def _fake_dispatch(t, op, sid, fn):
+                return fn()
+
+            with patch("agents.image_agent.mongodb", db), patch("agents.image_agent.anyio", stub_anyio), patch(
+                "agents.image_agent.settings", SimpleNamespace(max_images_per_task=0, video_provider="siliconflow")
+            ), patch("agents.image_agent.get_image_service", return_value=nonref_svc), patch(
+                "agents.image_agent.dispatch_generation", side_effect=_fake_dispatch
+            ), patch("agents.image_agent.mark_agent_start", new=AsyncMock()), patch(
+                "agents.image_agent.mark_agent_success", new=AsyncMock()
+            ), patch("agents.image_agent.mark_agent_failed", new=AsyncMock()):
+                img_out = asyncio.run(ImageAgent().run("t_nr"))
+            self.assertEqual(len(img_out), 1)
+            self.assertIsNone(non_ref_img_calls[0]["reference_images"])
+
+            # 3. SeriesService.start_run allows bound-character series with non-reference image models
+            svc = ss_mod.SeriesService()
+            series_doc = {
+                "_id": "ser_nr",
+                "series_id": "ser_nr",
+                "status": "ready",
+                "outline_confirmed": True,
+                "characters": [bound_char],
+                "episodes": [{"episode_num": 1, "status": "pending", "task_id": None}],
+                "updated_at": "2026-11-19T00:00:00+00:00",
+            }
+            ss_db = Mock()
+            ss_db.find_one = AsyncMock(return_value=series_doc)
+            ss_db.update_one = AsyncMock(return_value=1)
+            with patch.object(ss_mod, "mongodb", ss_db), patch(
+                "services.provider_factory.get_image_service", return_value=nonref_svc
+            ):
+                claimed = asyncio.run(svc.start_run("ser_nr"))
+            self.assertEqual(claimed["series_id"], "ser_nr")
+
+            # 4. StudioCraft ai_decompose_novel_to_drama resolves outline aliases & range fields
+            fake_craft_llm = Mock()
+            fake_craft_llm._call_api.return_value = {
+                "title": "测试剧",
+                "episodes_outline": [{"episode_num": 1, "title": "第一集", "opening_3s_hook": "倒计时十秒", "core_event": "", "cliffhanger_hook": ""}],
+                "first_episode_script": "△林晚拍桌。",
+            }
+            with patch.object(drama_craft_service, "_get_real_llm", return_value=fake_craft_llm):
+                craft = drama_craft_service.ai_decompose_novel_to_drama(
+                    "松鹤楼老字号危机故事正文内容",
+                    total_episodes=2,
+                    episode_duration=60,
+                    episode_duration_min=45,
+                    episode_duration_max=90,
+                )
+            self.assertEqual(craft["episode_duration_min"], 45)
+            self.assertEqual(craft["episode_duration_max"], 90)
+            self.assertEqual(craft["episodes_outline"][0]["opening_hook"], "倒计时十秒")
+            self.assertTrue(craft["episodes_outline"][0]["core_event"])
+            self.assertTrue(craft["episodes_outline"][1]["ending_hook"])
+
+    def test_character_portrait_face_lock_routing_prompts_and_negative_prompts(self):
+        import asyncio
+        import io
+        import json
+        from PIL import Image
+
+        with patch.dict(sys.modules, _runtime_stubs()), tempfile.TemporaryDirectory() as tmp:
+            from services import character_service as cs_mod
+            from services.image.siliconflow_image_service import SiliconFlowImageService
+
+            tmp_dir = Path(tmp)
+            png_bytes = io.BytesIO()
+            Image.new("RGB", (128, 128), (110, 140, 170)).save(png_bytes, format="PNG")
+            png_raw = png_bytes.getvalue()
+
+            posted = []
+
+            class FakeResp:
+                def __init__(self, status_code=200, body=None, content=b""):
+                    self.status_code = status_code
+                    self.is_success = 200 <= status_code < 300
+                    self._body = body or {}
+                    self.content = content
+                    self.text = json.dumps(self._body)
+
+                def json(self):
+                    return self._body
+
+                def raise_for_status(self):
+                    if self.status_code >= 400:
+                        raise RuntimeError(f"HTTP {self.status_code}")
+
+            class FakeClient:
+                def __init__(self, **kw):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    pass
+
+                def post(self, url, json=None, headers=None):
+                    posted.append(json)
+                    return FakeResp(200, {"images": [{"url": "https://cdn.sf.test/out.png"}]})
+
+                def get(self, url, timeout=60):
+                    return FakeResp(200, content=png_raw)
+
+            ref1 = tmp_dir / "ref1.png"
+            ref2 = tmp_dir / "ref2.png"
+            ref1.write_bytes(png_raw)
+            ref2.write_bytes(png_raw)
+
+            # 1. SiliconFlow Qwen-Image-Edit-2509: 3 refs, auto T2I fallback -> Qwen/Qwen-Image (928x1664),
+            #    multi-ref -> image + image2 without image_size; Kolors -> 720x1280 + negative_prompt
+            edit_profile = {"url": "https://api.siliconflow.cn/v1", "model": "Qwen/Qwen-Image-Edit-2509", "key": "test-sf"}
+            with patch("services.image.siliconflow_image_service.model_config", return_value=edit_profile), patch(
+                "services.image.siliconflow_image_service.settings", SimpleNamespace(enable_paid_api=True)
+            ), patch("services.image.siliconflow_image_service.httpx.Client", FakeClient), patch(
+                "services.character_service.local_asset", side_effect=[ref1, ref2]
+            ), patch("services.character_service.validate_image", return_value=None):
+                svc = SiliconFlowImageService(storage_root=tmp_dir)
+                self.assertTrue(svc.supports_reference_images)
+                self.assertEqual(svc.max_reference_images, 3)
+
+                # No refs -> auto Qwen/Qwen-Image with 928x1664
+                svc.generate_image("t1", "front", "正面照", negative_prompt="多张脸", ratio="9:16")
+                # 2 refs -> Qwen/Qwen-Image-Edit-2509 with image + image2 and no image_size
+                svc.generate_image(
+                    "t1", "scene1", "两人同框", negative_prompt="重影", ratio="9:16",
+                    reference_images=["backend/assets/r1.png", "backend/assets/r2.png"],
+                )
+
+            self.assertEqual(posted[0]["model"], "Qwen/Qwen-Image")
+            self.assertEqual(posted[0]["image_size"], "928x1664")
+            self.assertEqual(posted[0]["negative_prompt"], "多张脸")
+            self.assertEqual(posted[1]["model"], "Qwen/Qwen-Image-Edit-2509")
+            self.assertNotIn("image_size", posted[1])
+            self.assertTrue(posted[1]["image"].startswith("data:image/png;base64,"))
+            self.assertTrue(posted[1]["image2"].startswith("data:image/png;base64,"))
+
+            kolors_profile = {"url": "https://api.siliconflow.cn/v1", "model": "Kwai-Kolors/Kolors", "key": "test-sf"}
+            with patch("services.image.siliconflow_image_service.model_config", return_value=kolors_profile), patch(
+                "services.image.siliconflow_image_service.settings", SimpleNamespace(enable_paid_api=True)
+            ), patch("services.image.siliconflow_image_service.httpx.Client", FakeClient):
+                svc_k = SiliconFlowImageService(storage_root=tmp_dir)
+                self.assertFalse(svc_k.supports_reference_images)
+                svc_k.generate_image("t2", "s1", "正面", negative_prompt="多张脸", ratio="9:16")
+            self.assertEqual(posted[2]["image_size"], "720x1280")
+            self.assertEqual(posted[2]["negative_prompt"], "多张脸")
+
+            # 2. CharacterService portrait prompts put framing+identity first, move exclusions to negative_prompt,
+            #    and return consistency_warning on non-reference models
+            svc_c = cs_mod.CharacterService()
+            cid = "char_0123456789ab"
+            profile = {
+                "character_id": cid,
+                "name": "陆沉",
+                "face_dna": "28岁冷峻男性，剑眉星目，左眼尾浅疤",
+                "signature_clothing": "深棕色高领毛衣配风衣",
+                "tts_voice": "zh-CN-YunjianNeural",
+            }
+            whole_p = svc_c._build_portrait_prompt(profile, "whole", style="realistic", has_reference=False)
+            profile_p = svc_c._build_portrait_prompt(profile, "profile", style="realistic", has_reference=True)
+            whole_neg = svc_c._build_portrait_negative_prompt(profile, "whole", style="realistic")
+            profile_neg = svc_c._build_portrait_negative_prompt(profile, "profile", style="realistic")
+            self.assertTrue(whole_p.startswith("角色定妆照（广角全身"))
+            self.assertNotIn("85mm", whole_p)
+            self.assertNotIn("毛孔", whole_p)
+            self.assertNotIn("严禁", whole_p)
+            self.assertIn("same person", profile_p)
+            self.assertIn("大头照", whole_neg)
+            self.assertIn("正脸", profile_neg)
+
+            tmp_backend = tmp_dir / "backend"
+            front_rel = f"backend/assets/characters/{cid}/v1/anchor.png"
+            front_file = tmp_backend / "assets" / "characters" / cid / "v1" / "anchor.png"
+            front_file.parent.mkdir(parents=True, exist_ok=True)
+            front_file.write_bytes(png_raw)
+            out_img = tmp_backend / "assets" / "character_portraits" / "gen.png"
+            out_img.parent.mkdir(parents=True, exist_ok=True)
+            out_img.write_bytes(png_raw)
+
+            char_doc = {
+                "_id": cid,
+                "character_id": cid,
+                "revision": 1,
+                "archived": False,
+                "versions": [{
+                    **profile,
+                    "revision": 1,
+                    "confirmed": False,
+                    "archived": False,
+                    "rate": "+0%",
+                    "pitch": "+0Hz",
+                    "reference_path": front_rel,
+                    "reference_images": {"front": front_rel},
+                }],
+            }
+
+            class CharMemDB:
+                async def find_one(self, coll, query):
+                    return json.loads(json.dumps(char_doc))
+
+                async def replace_one(self, coll, query, doc, upsert=False):
+                    char_doc.clear()
+                    char_doc.update(doc)
+                    return 1
+
+            gen_calls = []
+
+            class RefCapableMock:
+                model = "Qwen/Qwen-Image-Edit-2509"
+                supports_reference_images = True
+                max_reference_images = 3
+
+                def generate_image(self, task_id, scene_id, prompt, negative_prompt=None, ratio="9:16", reference_images=None):
+                    gen_calls.append({"prompt": prompt, "negative_prompt": negative_prompt, "refs": reference_images})
+                    return {"status": "success", "asset_path": "backend/assets/character_portraits/gen.png"}
+
+            class NonRefMock:
+                model = "Kwai-Kolors/Kolors"
+                supports_reference_images = False
+                max_reference_images = 0
+
+                def generate_image(self, task_id, scene_id, prompt, negative_prompt=None, ratio="9:16", reference_images=None):
+                    gen_calls.append({"prompt": prompt, "negative_prompt": negative_prompt, "refs": reference_images})
+                    return {"status": "success", "asset_path": "backend/assets/character_portraits/gen.png"}
+
+            with patch.object(cs_mod, "mongodb", CharMemDB()), patch.object(cs_mod, "BACKEND_DIR", tmp_backend):
+                with patch("services.provider_factory.get_image_service", return_value=RefCapableMock()):
+                    res_ref = asyncio.run(svc_c._generate_single_view(cid, "profile", style="realistic"))
+                self.assertNotIn("consistency_warning", res_ref)
+                self.assertEqual(gen_calls[-1]["refs"], [front_rel])
+                self.assertIn("正脸", gen_calls[-1]["negative_prompt"])
+                self.assertIn("same person", gen_calls[-1]["prompt"])
+
+                with patch("services.provider_factory.get_image_service", return_value=NonRefMock()):
+                    res_warn = asyncio.run(svc_c._generate_single_view(cid, "whole", style="realistic"))
+                self.assertIn("consistency_warning", res_warn)
+                self.assertIn("Kwai-Kolors/Kolors", res_warn["consistency_warning"])
+                self.assertIsNone(gen_calls[-1]["refs"])
 
 
 if __name__ == "__main__":

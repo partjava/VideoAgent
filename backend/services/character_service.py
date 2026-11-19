@@ -14,9 +14,10 @@ from core.database import mongodb
 from models.character_model import CharacterFields, CharacterUpdate, PortraitView, ReferenceView
 from services.drama_craft_service import (
     STYLE_QUALITY_BLOCKS,
+    STYLE_TURNAROUND_BLOCKS,
     build_character_sheet_4grid_prompt,
+    build_portrait_negative_prompt,
     ensure_shoes_in_clothing,
-    infer_anti_drift_negatives,
 )
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -29,20 +30,18 @@ REFERENCE_FILENAMES = {
 }
 VIEW_PROMPTS = {
     "front": (
-        "【角色设定图 - 正面平视锚点图】角色正面半身至胸口上方定妆照，真人正常7头身比例（严禁Q版大头），"
-        "正视镜头，面部五官清晰对称，平静中性表情（neutral expression），双肩端平，双手自然垂放身体两侧，"
-        "空手不持握任何独立道具（no props in hand, no pose），纯白无接缝影棚背景（#FFFFFF），45度柔光箱均匀受光，无文字无水印"
+        "角色定妆照（正面平视半身特写，胸口以上构图），单一人物正视镜头，表情平静自然（neutral expression），"
+        "双肩端平，纯白无接缝影棚背景（#FFFFFF），45度柔光箱均匀受光"
     ),
     "profile": (
-        "【角色设定图 - 90度正侧面定妆图】同一角色标准90度正侧面定妆照（strict 90-degree side profile view），"
-        "鼻梁、下颌线、后脑勺发型层次与肩背侧面轮廓清晰完整，五官特征与服装材质与正面保持完全一致，"
-        "身体自然挺直，双手自然垂放身体两侧，空手不持物，纯白无接缝影棚背景（#FFFFFF），无文字无水印"
+        "角色定妆照（严格90度正侧面轮廓像，strict 90-degree side profile view），"
+        "单人胸口以上中近景，脸部与身体完全朝向画右，仅见单侧鼻梁、下颌线、单侧耳朵与后脑勺发型，视线平视前方不看镜头，"
+        "纯白无接缝影棚背景（#FFFFFF），45度柔光箱均匀受光"
     ),
     "whole": (
-        "【角色设定图 - 正面全身站立标准图】同一角色正面全身直立定妆照（full-body standing front view, head to toe fully visible），"
-        "头顶至鞋底完整入画，画面上下各留5%白边（严禁截断小腿或脚部），真人正常7头身比例（严禁Q版或大头娃娃比例），"
-        "双腿自然直立，双手自然垂放于身体两侧，空手不持握任何独立道具（no props in hand, no pose），"
-        "纯白无接缝影棚背景（#FFFFFF），脚底仅有极淡自然落地投影，无文字无水印"
+        "角色定妆照（广角全身直立正面照，35mm full-body standing front shot, head to toe fully visible），"
+        "单一人物从头顶到脚底鞋尖完整入画，人物占画面高度75%，画面上下各留10%纯白留白，"
+        "双腿自然站直，双手自然垂放身体两侧且空手无持物，纯白无接缝影棚背景（#FFFFFF），脚底极淡自然落地投影"
     ),
 }
 
@@ -215,40 +214,99 @@ class CharacterService:
         view: ReferenceView,
         custom_prompt: str = "",
         style: str = "realistic",
+        has_reference: bool = False,
     ) -> str:
         if view == "sheet":
-            return build_character_sheet_4grid_prompt(profile, style=style, custom_prompt=custom_prompt)
+            return build_character_sheet_4grid_prompt(
+                profile,
+                style=style,
+                custom_prompt=custom_prompt,
+                has_reference=has_reference,
+            )
         if custom_prompt and view == "front" and style == "realistic":
             return custom_prompt
-        style_prefix = STYLE_QUALITY_BLOCKS.get(style, STYLE_QUALITY_BLOCKS["realistic"])
-        base_desc = VIEW_PROMPTS.get(view, VIEW_PROMPTS["front"])
-        face_dna = (profile.get("face_dna") or "").strip()
-        clothing = (profile.get("signature_clothing") or "").strip()
+        name = (profile.get("name") or "").strip()
+        face_dna = (profile.get("face_dna") or "").strip("。 ")
+        clothing = (profile.get("signature_clothing") or "").strip("。 ")
         if view == "whole":
             clothing = ensure_shoes_in_clothing(clothing, face_dna)
-        anti_drift = infer_anti_drift_negatives(face_dna, clothing, profile.get("name") or "")
+
+        if has_reference and view == "profile":
+            ref_header = (
+                "保持参考图中同一人物的五官、性别、年龄、发型发色与服装完全不变"
+                "（same person, identical identity and outfit as reference image），"
+                "仅将人物旋转为严格90度纯正侧面像（strict 90-degree side profile view），"
+                "脸部完全朝向画右，仅见单侧鼻梁、下颌轮廓与单侧耳朵，不看镜头，中近景胸口以上，纯白影棚背景。"
+            )
+        elif has_reference and view == "whole":
+            ref_header = (
+                "保持参考图中同一人物的五官、性别、年龄、发型与上身服装完全不变"
+                "（same person, identical face, hair and outfit as reference image），"
+                "拉远为35mm广角全身直立定妆照（full-body head-to-toe standing front shot），"
+                "头顶至鞋底完整入画，人物占画面高度75%，双腿自然直立，双手自然垂放身体两侧，空手无道具，纯白影棚背景。"
+            )
+        else:
+            ref_header = VIEW_PROMPTS.get(view, VIEW_PROMPTS["front"])
+
+        subject_desc = "，".join(
+            part for part in (
+                f"人物：{name}" if name else "",
+                face_dna,
+                f"身穿{clothing}" if clothing else "",
+            )
+            if part
+        )
+        style_block = (
+            STYLE_QUALITY_BLOCKS.get(style, STYLE_QUALITY_BLOCKS["realistic"])
+            if view == "front"
+            else STYLE_TURNAROUND_BLOCKS.get(style, STYLE_TURNAROUND_BLOCKS["realistic"])
+        )
         parts = [
-            style_prefix,
-            base_desc,
+            ref_header,
+            subject_desc,
             (custom_prompt or "").strip(),
-            f"面部五官锚点：{face_dna}" if face_dna else "",
-            f"标志服装与鞋履：{clothing}" if clothing else "",
-            f"禁止项：{anti_drift}",
+            style_block,
         ]
         return "。".join(p.strip("。 ") for p in parts if p and p.strip("。 "))
 
+    def _build_portrait_negative_prompt(
+        self,
+        profile: dict,
+        view: ReferenceView,
+        style: str = "realistic",
+    ) -> str:
+        return build_portrait_negative_prompt(profile, view=view, style=style)
+
     async def preview_prompts(self, character_id: str, style: str = "realistic") -> dict:
+        from services.provider_factory import get_image_service
+
         profile = await self.get(character_id)
+        try:
+            img_svc = get_image_service()
+            caps = {
+                "model": str(getattr(img_svc, "model", "") or ""),
+                "supports_reference_images": bool(getattr(img_svc, "supports_reference_images", False)),
+                "max_reference_images": int(getattr(img_svc, "max_reference_images", 0) or 0),
+            }
+        except Exception:
+            caps = {"model": "", "supports_reference_images": False, "max_reference_images": 0}
+        has_front = bool((profile.get("reference_images") or {}).get("front") or profile.get("reference_path"))
+        can_ref = caps["supports_reference_images"] and has_front
         return {
             "character_id": character_id,
             "name": profile.get("name"),
             "style": style,
             "prompts": {
-                "front": self._build_portrait_prompt(profile, "front", style=style),
-                "profile": self._build_portrait_prompt(profile, "profile", style=style),
-                "whole": self._build_portrait_prompt(profile, "whole", style=style),
-                "sheet": self._build_portrait_prompt(profile, "sheet", style=style),
+                "front": self._build_portrait_prompt(profile, "front", style=style, has_reference=False),
+                "profile": self._build_portrait_prompt(profile, "profile", style=style, has_reference=can_ref),
+                "whole": self._build_portrait_prompt(profile, "whole", style=style, has_reference=can_ref),
+                "sheet": self._build_portrait_prompt(profile, "sheet", style=style, has_reference=can_ref),
             },
+            "negative_prompts": {
+                v: self._build_portrait_negative_prompt(profile, v, style=style)
+                for v in ("front", "profile", "whole", "sheet")
+            },
+            "image_capabilities": caps,
         }
 
     async def batch_create(self, items: list[CharacterFields]) -> list[dict]:
@@ -269,14 +327,16 @@ class CharacterService:
             raise ValueError("Reference view must be front, profile, whole, or sheet")
         profile = await self.get(character_id)
         image_service = get_image_service()
-        full_prompt = self._build_portrait_prompt(profile, view, prompt, style=style)
         front_path = (profile.get("reference_images") or {}).get("front") or profile.get("reference_path")
+        supports_refs = bool(getattr(image_service, "supports_reference_images", False))
         use_ref = (
             view != "front"
             and bool(front_path)
             and local_asset(front_path).is_file()
-            and bool(getattr(image_service, "supports_reference_images", False))
+            and supports_refs
         )
+        full_prompt = self._build_portrait_prompt(profile, view, prompt, style=style, has_reference=use_ref)
+        negative_prompt = self._build_portrait_negative_prompt(profile, view, style=style)
         target_ratio = "16:9" if view == "sheet" else "9:16"
 
         def _invoke():
@@ -286,31 +346,60 @@ class CharacterService:
                         "character_portraits",
                         f"{uuid4().hex}_{view}",
                         full_prompt,
+                        negative_prompt=negative_prompt,
                         ratio=target_ratio,
                         reference_images=[front_path],
                     )
                 except (TypeError, ValueError):
-                    pass
+                    try:
+                        return image_service.generate_image(
+                            "character_portraits",
+                            f"{uuid4().hex}_{view}",
+                            full_prompt,
+                            ratio=target_ratio,
+                            reference_images=[front_path],
+                        )
+                    except (TypeError, ValueError):
+                        pass
             try:
                 return image_service.generate_image(
                     "character_portraits",
                     f"{uuid4().hex}_{view}",
                     full_prompt,
+                    negative_prompt=negative_prompt,
                     ratio=target_ratio,
                 )
             except TypeError:
-                return image_service.generate_image(
-                    "character_portraits",
-                    f"{uuid4().hex}_{view}",
-                    full_prompt,
-                )
+                try:
+                    return image_service.generate_image(
+                        "character_portraits",
+                        f"{uuid4().hex}_{view}",
+                        full_prompt,
+                        ratio=target_ratio,
+                    )
+                except TypeError:
+                    return image_service.generate_image(
+                        "character_portraits",
+                        f"{uuid4().hex}_{view}",
+                        full_prompt,
+                    )
 
         result = await asyncio.to_thread(_invoke)
         if result.get("status") != "success" or not result.get("asset_path"):
             raise ValueError("Image provider did not return a successful image")
         data = local_asset(result["asset_path"]).read_bytes()
         validate_image(data)
-        return await self.reference(character_id, base64.b64encode(data).decode(), view)
+        saved = await self.reference(character_id, base64.b64encode(data).decode(), view)
+        if view != "front" and not use_ref:
+            cur_model = str(getattr(image_service, "model", "") or "当前图片模型")
+            if not supports_refs:
+                saved["consistency_warning"] = (
+                    f"当前图片模型（{cur_model}）不支持参考图输入，因此无法锁定正面照五官来生成同一人的{view}视图。"
+                    "请前往「API 配置」将图片模型切换为 Qwen/Qwen-Image-Edit-2509 或 black-forest-labs/FLUX.1-Kontext-dev 后重新生成。"
+                )
+            else:
+                saved["consistency_warning"] = "尚未找到可用的正面定妆照，因此未能锁脸生成；建议先生成或上传「正面」照再重绘其他视图。"
+        return saved
 
     async def portrait(
         self,
@@ -322,14 +411,19 @@ class CharacterService:
     ):
         if view == "all":
             latest = None
+            warning = ""
             for v in ("front", "profile", "whole"):
                 latest = await self._generate_single_view(character_id, v, prompt, style=style)
+                if isinstance(latest, dict) and latest.get("consistency_warning"):
+                    warning = latest["consistency_warning"]
             if include_turntable:
                 try:
                     latest = await self.turntable(character_id, duration=5)
                 except Exception as exc:
                     if isinstance(latest, dict):
                         latest = {**latest, "turntable_warning": str(exc)}
+            if isinstance(latest, dict) and warning:
+                latest["consistency_warning"] = warning
             return latest
         return await self._generate_single_view(character_id, view, prompt, style=style)
 

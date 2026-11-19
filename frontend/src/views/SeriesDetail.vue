@@ -16,7 +16,7 @@
             <h1>{{ project.title }}</h1>
             <p>
               {{ project.total_episodes }} 集 · 每集
-              {{ project.episode_duration }} 秒 · {{ project.style }} ·
+              {{ durationText(project) }} · {{ modeText(project.generation_mode) }} · {{ project.style }} ·
               {{ project.ratio }}
               <template v-if="project.pre_shoot_review"> · 已开启每集开拍前预审</template>
             </p>
@@ -493,6 +493,7 @@ import EpisodeMaterials from "../components/EpisodeMaterials.vue";
 import GenerationUsage from "../components/GenerationUsage.vue";
 import { seriesApi } from "../api/series";
 import { statusText } from "../utils/seriesStatus";
+import { durationText, modeText } from "../utils/seriesDuration";
 const route = useRoute(),
   router = useRouter(),
   projectId = route.params.id;
